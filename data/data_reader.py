@@ -11,5 +11,6 @@ class DataReader:
         config = helpers.Config()
         cfg = config.from_json("data")
         df = pd.read_pickle(cfg.data_path + ".pkl", compression="zip")
+
     def load_standardize_data(self):
         pass

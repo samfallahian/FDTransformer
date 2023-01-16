@@ -6,11 +6,11 @@ class CustomLoss(nn.Module):
 
     def __init__(self):
         super(CustomLoss, self).__init__()
-        self.cross_entropy_loss = nn.CrossEntropyLoss()
+        self.loss = nn.MSELoss()
 
     def forward(self, x, x_hat):
-        cross_entropy = self.cross_entropy_loss(x_hat, x)
+        mse_loss = self.loss(x_hat, x)
         # here add custom loss and add it to final loss
-        final_loss = cross_entropy
+        final_loss = mse_loss
 
         return final_loss

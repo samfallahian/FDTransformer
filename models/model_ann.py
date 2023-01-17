@@ -21,7 +21,7 @@ class ANN(nn.Module):
             else:
                 self.layers["output"] = nn.Linear(cfg.nUnits[i], cfg.nOutput)
 
-    def forwards(self, x):
+    def forward(self, x):
         x = self.layers["input"](x)
         for i in range(self.nLayers-1):
             x = F.relu(self.layers[f"hidden{i}"](x))

@@ -25,3 +25,10 @@ class DataModelLoader:
         test_loader = DataLoader(test_data_t, batch_size=test_data_t.tensors[0].shape[0])
 
         return train_loader, test_loader
+
+    def all_data_loader(self):
+        """Convert into PyTorch Datasets"""
+        data = torch.utils.data.TensorDataset(self.data, self.labels)
+        """Convert into dataloader objects"""
+        data_loader = DataLoader(data, batch_size=self.batch_size, shuffle=True)
+        return data_loader

@@ -15,9 +15,10 @@ class DataReader:
         """ Read input file """
         df = pd.read_pickle(self.path + file_name + ".pkl", compression="zip")
         # labels = df.drop(df.columns.difference(["x", "y", "z", "time"]), axis=1).to_numpy()
-        labels = df.drop(df.columns.difference(["distance", "x"]), axis=1).to_numpy()
+        labels = df.drop(df.columns.difference(["x", "y", "z"]), axis=1).to_numpy()
         # data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
-        data = df.drop(df.columns.difference(["y", "z", "vx", "vy", "vz", "px", "py", "pz"]), axis=1).to_numpy()
+        data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
+        print(data[:5,:])
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
         labels = scalar.fit_transform(labels)

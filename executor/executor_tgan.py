@@ -1,5 +1,5 @@
 import torch
-from models import model_cgan, loss
+from models import model_tgan, loss
 from utils import helpers
 import numpy as np
 
@@ -14,15 +14,15 @@ class Training:
         """ Load model configurations """
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print("device: ", self.device)
-        self.generator_model = model_cgan.Generator()
+        self.generator_model = model_tgan.Generator()
         print(self.generator_model)
-        self.discriminator_model = model_cgan.Discriminator()
+        self.discriminator_model = model_tgan.Discriminator()
         print(self.discriminator_model)
         self.loss_function = loss.CustomLoss()
         """ Dynamic optimizer based on config """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
-        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr, weight_decay= self.cfg.weight_decay)
-        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr, weight_decay= self.cfg.weight_decay)
+        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr)
+        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr)
         self.data_loader = data_loader
 
     def forward(self):
@@ -34,15 +34,17 @@ class Training:
         # test_accuracy = torch.zeros(epochs)
 
         for epoch in range(epochs):
-            generator_loss, disc_loss = self.train()
+            # generator_loss, disc_loss = self.train()
+            d_real_loss, d_fake_loss, g_loss = self.train()
 
             # train_accuracy[epoch] = train_acc
             # test_accuracy[epoch] = test_acc
             if (epoch + 1) % 2 == 0:
                 print("--------------------------------------------------------")
                 print(f"Epoch {epoch + 1}: ")
-                print(f"Generator Loss: {generator_loss}")
-                print(f"Discriminator Loss: {disc_loss}")
+                print(f"Generator Loss: {g_loss}")
+                print(f"Discriminator Loss on real data: {d_real_loss}")
+                print(f"Discriminator Loss on fake data: {d_fake_loss}")
                 # print(f"Train Accuracy: {train_acc}")
                 # print(f"Test Accuracy: {test_acc}")
 
@@ -65,49 +67,81 @@ class Training:
         discriminator_precision = 0.0
         discriminator_recall = 0.0
         discriminator_f1 = 0.0
+
+        discriminator_real_loss = 0
+        discriminator_fake_loss = 0
+        generator_loss = 0
+
         # loop over training data batches
         """ Set the range for label for producing fake_label"""
 
-        for X, (data, labels) in enumerate(self.data_loader):
-            # Train the discriminator
-            self.discriminator_model.zero_grad()
-            real_data = data[:self.batch_size]
-            real_labels = labels[:self.batch_size]
-            real_output = self.discriminator_model(real_data, real_labels)
-            real_loss = self.loss_function(real_output, torch.ones(self.batch_size, 1))
-            real_loss.backward()
+        for data, labels in self.data_loader:
+            # Generate fake data
+            fake_data = self.generator_model(data)
 
-            noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
-            fake_labels = torch.rand(self.batch_size, self.cfg.n_classes) * 2 - 1
+            # Train the discriminator on real data
+            d_real = self.discriminator_model(torch.cat((data, labels), 1))
+            d_real_loss = self.loss_function(d_real, torch.ones(d_real.size()))
+            self.discriminator_optimizer.zero_grad()
+            d_real_loss.backward()
+            self.discriminator_optimizer.step()
 
-            fake_data = self.generator_model(noise, fake_labels)
-            fake_output = self.discriminator_model(fake_data, fake_labels)
-            fake_loss = self.loss_function(fake_output, torch.zeros(self.batch_size, 1))
-            fake_loss.backward()
-
-            disc_loss = real_loss + fake_loss
+            # Train the discriminator on fake data
+            d_fake = self.discriminator_model(torch.cat((data, fake_data), 1))
+            d_fake_loss = self.loss_function(d_fake, torch.zeros(d_fake.size()))
+            self.discriminator_optimizer.zero_grad()
+            d_real_loss.backward()
             self.discriminator_optimizer.step()
 
             # Train the generator
-            self.generator_model.zero_grad()
-            noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
-            fake_labels = torch.rand(self.batch_size, self.cfg.n_classes) * 2 - 1
-            fake_data = self.generator_model(noise, fake_labels)
-            fake_output = self.discriminator_model(fake_data, fake_labels)
-            # The generator is trying to generate data that the discriminator will classify as real -> target is 1
-            generator_loss = self.loss_function(fake_output, torch.ones(self.batch_size, 1))
-            generator_loss.backward()
+            g_loss = self.loss_function(d_fake, torch.ones(d_fake.size()))
+            self.generator_optimizer.zero_grad()
+            g_loss.backward()
             self.generator_optimizer.step()
 
+            discriminator_real_loss += d_real_loss.item()
+            discriminator_fake_loss += d_fake_loss.item()
+            generator_loss += g_loss.item()
+
+            # # Train the discriminator
+            # self.discriminator_model.zero_grad()
+            # real_data = data[:self.batch_size]
+            # real_labels = labels[:self.batch_size]
+            # real_output = self.discriminator_model(real_data, real_labels)
+            # real_loss = self.loss_function(real_output, torch.ones(self.batch_size, 1))
+            # real_loss.backward()
+            #
+            # noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
+            # fake_labels = torch.rand(self.batch_size, self.cfg.n_classes) * 2 - 1
+            #
+            # fake_data = self.generator_model(noise, fake_labels)
+            # fake_output = self.discriminator_model(fake_data, fake_labels)
+            # fake_loss = self.loss_function(fake_output, torch.zeros(self.batch_size, 1))
+            # fake_loss.backward()
+            #
+            # disc_loss = real_loss + fake_loss
+            # self.discriminator_optimizer.step()
+            #
+            # # Train the generator
+            # self.generator_model.zero_grad()
+            # noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
+            # fake_labels = torch.rand(self.batch_size, self.cfg.n_classes) * 2 - 1
+            # fake_data = self.generator_model(noise, fake_labels)
+            # fake_output = self.discriminator_model(fake_data, fake_labels)
+            # # The generator is trying to generate data that the discriminator will classify as real -> target is 1
+            # generator_loss = self.loss_function(fake_output, torch.ones(self.batch_size, 1))
+            # generator_loss.backward()
+            # self.generator_optimizer.step()
+
             # compute evaluating metric
-            generator_similarity_score = + 100 * Training.jaccard_similarity(fake_data, real_data)
+            # generator_similarity_score = + 100 * Training.jaccard_similarity(fake_data, real_data)
             # discriminator_acc, discriminator_precision, discriminator_recall, discriminator_f1 = + Training.discriminator_eval_metric(
             #     fake_output, torch.ones(self.batch_size, 1))
 
         # end of batch loop...
 
         # now that we've trained through the batches, get their average training accuracy
-        generator_similarity_score /= len(self.data_loader)
+        # generator_similarity_score /= len(self.data_loader)
         # discriminator_acc /= len(self.data_loader)
         # discriminator_precision /= len(self.data_loader)
         # discriminator_recall /= len(self.data_loader)
@@ -115,8 +149,11 @@ class Training:
         # print(generator_loss.item())
         # print(disc_loss.item())
 
-
-        return generator_loss.item(), disc_loss.item()
+        discriminator_real_loss /= len(self.data_loader)
+        discriminator_fake_loss /= len(self.data_loader)
+        generator_loss /= len(self.data_loader)
+        # return generator_loss.item(), disc_loss.item()
+        return discriminator_real_loss, discriminator_fake_loss, generator_loss
 
     # def test(self):
     #     """ Set model to evaluation mode """

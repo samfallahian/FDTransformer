@@ -1,14 +1,14 @@
 CFG = {
     "data": {
-        "env": "tgan",
+        "env": "cgan",
         "data_path": "dataset/",
         "batch_size": 16
     },
     "model": {
-        # "generatorUnits": [10, 128, 256, 7],
-        # "discriminatorUnits": [10, 256, 128, 1],
-        "generatorUnits": [3, 64, 128, 7],
-        "discriminatorUnits": [10, 64, 128, 1],
+        "generatorUnits": [8, 128, 256, 7],
+        "discriminatorUnits": [8, 256, 128, 1],
+        # "generatorUnits": [3, 64, 128, 7],
+        # "discriminatorUnits": [7, 64, 128, 1],
         "negative_slope": 0.2,
         "nInput": 8,
         "nUnits": [7, 256, 512, 1024, 10],

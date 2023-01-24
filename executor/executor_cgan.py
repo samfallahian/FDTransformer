@@ -70,7 +70,7 @@ class Training:
 
         for X, (data, labels) in enumerate(self.data_loader):
             # Train the discriminator
-            self.discriminator_model.zero_grad()
+            self.discriminator_optimizer.zero_grad()
             real_data = data[:self.batch_size]
             real_labels = labels[:self.batch_size]
             real_output = self.discriminator_model(real_data, real_labels)
@@ -89,7 +89,7 @@ class Training:
             self.discriminator_optimizer.step()
 
             # Train the generator
-            self.generator_model.zero_grad()
+            self.generator_optimizer.zero_grad()
             noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
             fake_labels = torch.rand(self.batch_size, self.cfg.n_classes) * 2 - 1
             fake_data = self.generator_model(noise, fake_labels)

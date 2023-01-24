@@ -14,6 +14,8 @@ class DataModelLoader:
         cfg = config.from_json("data")
         self.batch_size = cfg.batch_size
 
+
+
     def train_test_data_loader(self):
         """Split data into train and test"""
         train_data, test_data, train_labels, test_labels = train_test_split(self.data, self.labels, test_size=.2)

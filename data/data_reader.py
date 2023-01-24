@@ -11,6 +11,7 @@ class DataReader:
         cfg = config.from_json("data")
         self.path = cfg.data_path
 
+
     def load_standardize_data(self, file_name):
         """ Read input file """
         df = pd.read_pickle(self.path + file_name + ".pkl", compression="zip")
@@ -26,7 +27,7 @@ class DataReader:
         data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
-        labels = scalar.fit_transform(labels)
+        # labels = scalar.fit_transform(labels)
         data = scalar.fit_transform(data)
         return data, labels
     @staticmethod

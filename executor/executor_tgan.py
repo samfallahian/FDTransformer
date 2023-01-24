@@ -17,8 +17,8 @@ class Training:
         print("device: ", self.device)
 
         """ Load model configurations """
-        self.generator_model = model_tgan.Generator().to(self.device)
-        self.discriminator_model = model_tgan.Discriminator().to(self.device)
+        self.generator_model = model_tgan.Generator()
+        self.discriminator_model = model_tgan.Discriminator()
         self.loss_function = loss.CustomLoss()
 
         """ Dynamic optimizer based on config """
@@ -76,30 +76,66 @@ class Training:
         """ Set the range for label for producing fake_label"""
 
         for X, (data, labels) in enumerate(self.data_loader):
-            # Train the discriminator
+            """ create minibatches of fake data and labels """
+            fake_data = self.generator_model(torch.randn(self.batch_size, self.cfg.n_generator_input))  # output of generator
+            fake_labels = torch.zeros(self.batch_size, 1)
+            real_labels = torch.ones(self.batch_size,1)
+
+            """Train the discriminator"""
+            # forward pass and loss for real data
             real_output = self.discriminator_model(data)
-            real_loss = self.loss_function(real_output, labels)
+            d_real_loss = self.loss_function(real_output, real_labels)
+            # forward pass and loss for fake data
+            fake_output = self.discriminator_model(fake_data) # FAKE data into discriminator
+            d_fake_loss = self.loss_function(fake_output, fake_labels)  # all labels are 0
+            # collect loss (using combined losses)
+            d_loss = d_real_loss + d_fake_loss
+            discriminator_loss += d_loss
+            # losses[epochi, 0] = d_loss.item()
+            # disDecs[epochi, 0] = torch.mean((pred_real > .5).float()).detach()
 
-
+            # backprop
             self.discriminator_optimizer.zero_grad()
-            # real_output = self.discriminator_model(labels)
-            # real_loss = self.loss_function(real_output, torch.ones(real_output.size()))
-            fake_output = self.discriminator_model(self.generator_model(data))
-            fake_loss = self.loss_function(fake_output, torch.zeros(fake_output.size()))
-            d_loss = (real_loss + fake_loss)/self.batch_size
             d_loss.backward()
             self.discriminator_optimizer.step()
 
-            # Train the generator
+            """Train the generator"""
+            # create fake data and compute loss
+            fake_data = self.generator_model(torch.rand(self.batch_size, self.cfg.n_generator_input))
+            fake_output = self.discriminator_model(fake_data)
+
+            # compute and collect loss and accuracy
+            g_loss = self.loss_function(fake_output, real_output)
+            generator_loss += g_loss
+            # losses[epochi, 1] = g_loss.item()
+            # disDecs[epochi, 1] = torch.mean((pred_fake > .5).float()).detach()
+
+            # backprop
             self.generator_optimizer.zero_grad()
-            fake_output = self.discriminator_model(self.generator_model(data))
-            g_loss = self.loss_function(fake_output, torch.ones(fake_output.size()))
-            g_loss = g_loss/self.batch_size
             g_loss.backward()
             self.generator_optimizer.step()
 
-            discriminator_loss += d_loss.item()
-            generator_loss += g_loss.item()
+
+
+            # self.discriminator_optimizer.zero_grad()
+            # real_output = self.discriminator_model(labels)
+            # real_loss = self.loss_function(real_output, torch.ones(real_output.size()))
+            # fake_output = self.discriminator_model(self.generator_model(data))
+            # fake_loss = self.loss_function(fake_output, torch.zeros(fake_output.size()))
+            # d_loss = (real_loss + fake_loss)/self.batch_size
+            # d_loss.backward()
+            # self.discriminator_optimizer.step()
+
+            # Train the generator
+            # self.generator_optimizer.zero_grad()
+            # fake_output = self.discriminator_model(self.generator_model(data))
+            # g_loss = self.loss_function(fake_output, torch.ones(fake_output.size()))
+            # g_loss = g_loss/self.batch_size
+            # g_loss.backward()
+            # self.generator_optimizer.step()
+            #
+            # discriminator_loss += d_loss.item()
+            # generator_loss += g_loss.item()
 
             # # Train the discriminator
             # self.discriminator_model.zero_grad()

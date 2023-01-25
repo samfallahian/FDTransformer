@@ -5,14 +5,20 @@ from torch.utils.data import DataLoader
 
 
 class DataModelLoader:
-    def __init__(self, data, label):
+    def __init__(self, data, labels):
         """Convert to tensor"""
-        self.labels = torch.tensor(label).float()
-        self.data = torch.tensor(data).float()
+        self.data = torch.tensor(data, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.int64)
         """ Load  configurations """
         config = helpers.Config()
         cfg = config.from_json("data")
         self.batch_size = cfg.batch_size
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
 
 
 
@@ -33,4 +39,9 @@ class DataModelLoader:
         data = torch.utils.data.TensorDataset(self.data, self.labels)
         """Convert into dataloader objects"""
         data_loader = DataLoader(data, batch_size=self.batch_size, shuffle=True)
+
+        # dataset = DataModelLoader(self.data, self.labels)
+        #
+        # # Create a dataloader with a batch size of 32 and shuffle the data
+        # data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         return data_loader

@@ -23,7 +23,7 @@ class Generator(nn.Module):
             if i == (self.nLayers - 1):
                 x = self.layers[f"layer_{i + 1}"](x)
             else:
-                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x), negative_slope=self.cfg.negative_slope)
+                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x))
         return x
 
 
@@ -44,7 +44,7 @@ class Discriminator(nn.Module):
     def forward(self, x):
         for i in range(self.nLayers - 1):
             if i == (self.nLayers - 2):
-                x = F.sigmoid(self.layers[f"layer_{i + 1}"](x))
+                x = torch.sigmoid(self.layers[f"layer_{i + 1}"](x))
             else:
-                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x), negative_slope=self.cfg.negative_slope)
+                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x))
         return x

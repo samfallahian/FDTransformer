@@ -2,11 +2,11 @@ CFG = {
     "data": {
         "env": "tgan",
         "data_path": "dataset/",
-        "batch_size": 16
+        "batch_size": 32
     },
     "model": {
-        "generatorUnits": [7, 128, 256, 7],
-        "discriminatorUnits": [7, 256, 128, 1],
+        "generatorUnits": [12, 64, 128, 256, 512, 11],
+        "discriminatorUnits": [11, 64, 32, 16, 8, 1],
         # "generatorUnits": [3, 64, 128, 7],
         # "discriminatorUnits": [7, 64, 128, 1],
         "negative_slope": 0.2,
@@ -15,7 +15,7 @@ CFG = {
         "nOutput": 2
     },
     "training": {
-        "lr": 0.001,
+        "lr": 0.0001,
         "epoch": 100,
         "optimizer": "Adam",
         "weight_decay": 0.0001,

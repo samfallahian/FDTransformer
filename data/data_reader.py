@@ -23,8 +23,10 @@ class DataReader:
         # data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
         # data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
         # data = df.drop(df.columns.difference(["x", "y", "z"]), axis=1).to_numpy()
-        labels = df.drop(df.columns.difference(["label"]), axis=1).to_numpy()
-        data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
+        # labels = df.drop(df.columns.difference(["label"]), axis=1).to_numpy()
+        # data = df.drop(df.columns.difference(["vx", "vy", "vz", "px", "py", "pz", "distance"]), axis=1).to_numpy()
+        data = df.to_numpy()[:, :11]
+        labels = df.to_numpy()[:, 11:]
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
         # labels = scalar.fit_transform(labels)

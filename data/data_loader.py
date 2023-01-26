@@ -38,10 +38,5 @@ class DataModelLoader:
         """Convert into PyTorch Datasets"""
         data = torch.utils.data.TensorDataset(self.data, self.labels)
         """Convert into dataloader objects"""
-        data_loader = DataLoader(data, batch_size=self.batch_size, shuffle=True)
-
-        # dataset = DataModelLoader(self.data, self.labels)
-        #
-        # # Create a dataloader with a batch size of 32 and shuffle the data
-        # data_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        data_loader = DataLoader(data, batch_size=self.batch_size, shuffle=True, drop_last=True)
         return data_loader

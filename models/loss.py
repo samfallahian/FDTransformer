@@ -8,7 +8,7 @@ class CustomLoss(nn.Module):
         super(CustomLoss, self).__init__()
         self.loss = nn.BCELoss()
 
-    def forward(self, x, x_hat):
+    def forward(self, x_hat,  x):
         loss = self.loss(x_hat, x)
         # here add custom loss and add it to final loss
         final_loss = loss

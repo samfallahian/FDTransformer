@@ -17,8 +17,8 @@ class Training:
         print("device: ", self.device)
 
         """ Load model configurations """
-        self.generator_model = model_tgan.Generator()
-        self.discriminator_model = model_tgan.Discriminator()
+        self.generator_model = model_tgan.Generator().to(self.device)
+        self.discriminator_model = model_tgan.Discriminator().to(self.device)
         self.loss_function = loss.CustomLoss()
         # self.loss_function = nn.BCELoss()
 
@@ -64,27 +64,23 @@ class Training:
         self.generator_model.train()
         self.discriminator_model.train()
         """variables"""
-        generator_similarity_score = 0.0
-        discriminator_acc = 0.0
-        discriminator_precision = 0.0
-        discriminator_recall = 0.0
-        discriminator_f1 = 0.0
-
         discriminator_loss = 0
         generator_loss = 0
 
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
             # Check for the size of last batch
+            data = data.to(self.device)
+            label = label.to(self.device)
             if data.size()[0] < self.batch_size:
                 continue
             """ create minibatches of fake data and labels """
             # noise between -1 , 1
-            noise = torch.rand(self.batch_size, self.cfg.n_input) * 2 - 1
-            fake_labels = torch.zeros(self.batch_size, 1)
-            real_labels = torch.ones(self.batch_size, 1)
-            fake_data = self.generator_model(
-                torch.cat((noise, label), 1))  # concatenate noise and labels as input to generator
+            noise = torch.rand(self.batch_size, self.cfg.n_input).to(self.device) * 2 - 1
+            fake_labels = torch.zeros(self.batch_size, 1).to(self.device)
+            real_labels = torch.ones(self.batch_size, 1).to(self.device)
+            # concatenate noise and labels as input to generator
+            fake_data = self.generator_model(torch.cat((noise, label), 1))
 
             """Train the discriminator"""
             self.discriminator_optimizer.zero_grad()
@@ -95,12 +91,12 @@ class Training:
 
             # forward pass and loss for real data
             real_output = self.discriminator_model(data)
-            real_loss = self.loss_function(real_output, real_labels)
+            real_loss = self.loss_function(real_output, real_labels, fake_data, data)
 
             # forward pass and loss for fake data
             # with torch.no_grad():
             fake_output = self.discriminator_model(fake_data)
-            fake_loss = self.loss_function(fake_output, fake_labels)
+            fake_loss = self.loss_function(fake_output, fake_labels, fake_data, data)
             disc_loss = (real_loss + fake_loss) / self.batch_size
             discriminator_loss += disc_loss.item()
             disc_loss.backward(retain_graph=True)
@@ -109,35 +105,16 @@ class Training:
             """Train the generator"""
             self.generator_optimizer.zero_grad()
             pred_labels = self.discriminator_model(fake_data)
-            gen_loss = self.loss_function(pred_labels, real_labels) / self.batch_size
+            gen_loss = self.loss_function(pred_labels, real_labels, fake_data, data) / self.batch_size
             generator_loss += gen_loss.item()
             gen_loss.backward(retain_graph=True)
             """retain_graph tells the autograd engine to retain the intermediate values of the graph,
             instead of freeing them, so that they can be used in the next backward pass."""
             self.generator_optimizer.step()
 
-            # compute evaluating metric
-            generator_similarity_score += 100 * Training.jaccard_similarity(fake_data.detach(), data.detach())
-            dis_acc, dis_precision, dis_recall, dis_f1 = Training.discriminator_eval_metric(
-                fake_output.detach(), real_labels.detach())
-            discriminator_acc += dis_acc
-            discriminator_precision += dis_precision
-            discriminator_recall += dis_recall
-            discriminator_f1 += dis_f1
-
         # end of batch loop...
 
         # now that we've trained through the batches, get their average training accuracy
-        generator_similarity_score /= len(self.data_loader)
-        discriminator_acc /= len(self.data_loader)
-        discriminator_precision /= len(self.data_loader)
-        discriminator_recall /= len(self.data_loader)
-        discriminator_f1 /= len(self.data_loader)
-        # print(generator_similarity_score.item())
-        # print(discriminator_acc.item())
-        # print(discriminator_precision.item())
-        # print(discriminator_recall.item())
-
         discriminator_loss /= len(self.data_loader)
         generator_loss /= len(self.data_loader)
         return discriminator_loss, generator_loss
@@ -148,12 +125,6 @@ class Training:
         u = ((labels - prediction) ** 2).sum()
         v = ((labels - labels.mean()) ** 2).sum()
         return 1 - u / v
-
-    @staticmethod
-    def jaccard_similarity(real, generated):
-        intersection = (real * generated).sum()
-        union = real.sum() + generated.sum() - intersection
-        return intersection / union
 
     @staticmethod
     def discriminator_eval_metric(output, target):

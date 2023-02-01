@@ -7,7 +7,8 @@ CFG = {
     "model": {
         "generatorUnits": [12, 64, 128, 256, 512, 11],
         "discriminatorUnits": [11, 64, 128, 256, 1],
-        "negative_slope": 0.2
+        "negative_slope": 0.2,
+        "dropout": 0.2
     },
     "training": {
         "lr": 0.0001,
@@ -15,6 +16,7 @@ CFG = {
         "optimizer": "Adam",
         "weight_decay": 0.0001,
         "n_classes": 1,
-        "n_input": 11
+        "n_input": 11,
+        "kd_band_width": 5
     }
 }

@@ -20,7 +20,6 @@ class Training:
         self.generator_model = model_tgan.Generator().to(self.device)
         self.discriminator_model = model_tgan.Discriminator().to(self.device)
         self.loss_function = loss.CustomLoss()
-        # self.loss_function = nn.BCELoss()
 
         """ Dynamic optimizer based on config """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)

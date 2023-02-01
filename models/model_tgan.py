@@ -15,15 +15,23 @@ class Generator(nn.Module):
         self.layers = nn.ModuleDict()
         """ Define layers """
         self.nLayers = len(cfg.generatorUnits)
-        for i in range(len(cfg.generatorUnits)-1):
-            self.layers[f"layer_{i + 1}"] = nn.Linear(cfg.generatorUnits[i], cfg.generatorUnits[i + 1])
+        """Define input layer"""
+        self.layers["input_layer"] = nn.Linear(cfg.generatorUnits[0], cfg.generatorUnits[1])
+        """Define hidden layers and batch normalization"""
+        for i in range(1, len(cfg.generatorUnits) - 2):
+            self.layers[f"hidden_{i}"] = nn.Linear(cfg.generatorUnits[i], cfg.generatorUnits[i + 1])
+            self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
+        """Define output layer"""
+        self.layers["output_layer"] = nn.Linear(cfg.generatorUnits[-2], cfg.generatorUnits[-1])
 
     def forward(self, x):
-        for i in range(self.nLayers - 1):
-            if i == (self.nLayers - 2):
-                x = self.layers[f"layer_{i + 1}"](x)
-            else:
-                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x), negative_slope=self.cfg.negative_slope)
+        x = F.leaky_relu(self.layers["input_layer"](x), negative_slope=self.cfg.negative_slope)
+        x = F.dropout(x, p=self.cfg.dropout)
+        for i in range(1, self.nLayers - 2):
+            x = self.layers[f"batch_norm_{i}"](x)
+            x = F.dropout(x, p=self.cfg.dropout)
+            x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
+        x = self.layers[f"output_layer"](x)
         return x
 
 
@@ -38,13 +46,21 @@ class Discriminator(nn.Module):
         self.layers = nn.ModuleDict()
         """ Define layers by reversing generator layer"""
         self.nLayers = len(cfg.discriminatorUnits)
-        for i in range(len(cfg.discriminatorUnits) - 1):
-            self.layers[f"layer_{i + 1}"] = nn.Linear(cfg.discriminatorUnits[i], cfg.discriminatorUnits[i + 1])
+        """Define input layer"""
+        self.layers["input_layer"] = nn.Linear(cfg.discriminatorUnits[0], cfg.discriminatorUnits[1])
+        """Define hidden layers and batch normalization"""
+        for i in range(1, len(cfg.discriminatorUnits) - 2):
+            self.layers[f"hidden_{i}"] = nn.Linear(cfg.discriminatorUnits[i], cfg.discriminatorUnits[i + 1])
+            self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
+        """Define output layer"""
+        self.layers["output_layer"] = nn.Linear(cfg.discriminatorUnits[-2], cfg.discriminatorUnits[-1])
 
     def forward(self, x):
-        for i in range(self.nLayers - 1):
-            if i == (self.nLayers - 2):
-                x = torch.sigmoid(self.layers[f"layer_{i + 1}"](x))
-            else:
-                x = F.leaky_relu(self.layers[f"layer_{i + 1}"](x), negative_slope=self.cfg.negative_slope)
+        x = F.leaky_relu(self.layers["input_layer"](x), negative_slope=self.cfg.negative_slope)
+        x = F.dropout(x, p=self.cfg.dropout)
+        for i in range(1, self.nLayers - 2):
+            x = self.layers[f"batch_norm_{i}"](x)
+            x = F.dropout(x, p=self.cfg.dropout)
+            x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
+        x = torch.sigmoid(self.layers["output_layer"](x))
         return x

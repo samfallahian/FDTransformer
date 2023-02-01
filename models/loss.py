@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from sklearn.neighbors import KernelDensity
 from scipy.stats import wasserstein_distance
+from utils import helpers
 
 
 class CustomLoss(nn.Module):
@@ -9,17 +10,18 @@ class CustomLoss(nn.Module):
     def __init__(self):
         super(CustomLoss, self).__init__()
         self.loss = nn.BCELoss()
+        config = helpers.Config()
+        self.cfg = config.from_json("training")
 
     def forward(self, generated_label,  real_label, generated_data, real_data):
         loss = self.loss(generated_label, real_label)
         # here add custom loss and add it to final loss
-        wass_loss = CustomLoss.wass_distance(real_data, generated_data)
+        wass_loss = self.wass_distance(real_data, generated_data)
         final_loss = loss+wass_loss
 
         return final_loss
 
-    @staticmethod
-    def wass_distance(real, generated):
+    def wass_distance(self, real, generated):
         """Use KernelDensity to estimate the probability density function (PDF) of the real and generated data. Then,
         we can use the wasserstein_distance function from the to calculate the Wasserstein distance between the two
         estimated PDFs."""
@@ -29,8 +31,8 @@ class CustomLoss(nn.Module):
         generated = generated.detach().numpy()
 
         # Estimate PDFs of real and generated data
-        kde_real = KernelDensity(kernel='gaussian', bandwidth=0.2).fit(real)
-        kde_fake = KernelDensity(kernel='gaussian', bandwidth=0.2).fit(generated)
+        kde_real = KernelDensity(kernel='gaussian', bandwidth=self.cfg.kd_band_width).fit(real)
+        kde_fake = KernelDensity(kernel='gaussian', bandwidth=self.cfg.kd_band_width).fit(generated)
         # Calculate Wasserstein distance between real and generated data
         real_pdf = kde_real.score_samples(real)
         fake_pdf = kde_fake.score_samples(generated)

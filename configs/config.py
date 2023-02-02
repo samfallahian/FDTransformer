@@ -11,10 +11,12 @@ CFG = {
         "dropout": 0.2
     },
     "training": {
-        "lr": 0.0001,
-        "epoch": 6,
+        "lr": 0.0005,
+        "epoch": 50,
         "optimizer": "Adam",
         "weight_decay": 0.01,
+        "has_lr_decay": True,
+        "lr_decay_gamma": 0.8,
         "n_classes": 1,
         "n_input": 11,
         "kd_band_width": 5,

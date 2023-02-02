@@ -18,13 +18,16 @@ class Training:
 
         """ Load model configurations """
         self.generator_model = model_tgan.Generator().to(self.device)
+        print(self.generator_model)
+        for i in self.generator_model.named_parameters():
+            print(i[0],i[1].shape, i[1].numel())
         self.discriminator_model = model_tgan.Discriminator().to(self.device)
         self.loss_function = loss.CustomLoss()
 
         """ Dynamic optimizer based on config """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
-        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr)
-        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr)
+        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
         self.data_loader = data_loader
 
     def forward(self):

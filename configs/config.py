@@ -14,9 +14,9 @@ CFG = {
         "lr": 0.0001,
         "epoch": 6,
         "optimizer": "Adam",
-        "weight_decay": 0.0001,
+        "weight_decay": 0.01,
         "n_classes": 1,
         "n_input": 11,
-        "kd_band_width": 5
+        "kd_band_width": 5,
     }
 }

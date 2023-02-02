@@ -18,16 +18,28 @@ class Training:
 
         """ Load model configurations """
         self.generator_model = model_tgan.Generator().to(self.device)
-        print(self.generator_model)
-        for i in self.generator_model.named_parameters():
-            print(i[0],i[1].shape, i[1].numel())
         self.discriminator_model = model_tgan.Discriminator().to(self.device)
         self.loss_function = loss.CustomLoss()
 
-        """ Dynamic optimizer based on config """
+        """ printing model details """
+        # print(self.generator_model)
+        # for i in self.generator_model.named_parameters():
+        #     print(i[0], i[1].shape, i[1].numel())
+
+        """ Dynamic optimizer """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
-        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
-        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        step_size = self.batch_size * len(data_loader) * 0.5
+        self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr,
+                                                      weight_decay=self.cfg.weight_decay)
+        self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr,
+                                                          weight_decay=self.cfg.weight_decay)
+        """ lr decay scheduler """
+        if self.cfg.has_lr_decay:
+            self.generator_scheduler = torch.optim.lr_scheduler.StepLR(self.generator_optimizer, step_size=step_size,
+                                                                       gamma=self.cfg.lr_decay_gamma)
+            self.discriminator_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optimizer,
+                                                                           step_size=step_size,
+                                                                           gamma=self.cfg.lr_decay_gamma)
         self.data_loader = data_loader
 
     def forward(self):
@@ -59,15 +71,21 @@ class Training:
         #     f"Final Testing Accuracy: epoch {torch.argmax(test_accuracy) + 1} with accuracy: {test_accuracy[torch.argmax(test_accuracy)]}")
         train_accuracy = 0
         test_accuracy = 0
+
         return train_accuracy, test_accuracy
 
     def train(self):
         """Set model to training mode"""
+
         self.generator_model.train()
         self.discriminator_model.train()
         """variables"""
         discriminator_loss = 0
         generator_loss = 0
+        epoch_real_output = 0
+        epoch_fake_output = 0
+        epoch_real_data = 0
+        epoch_fake_data = 0
 
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
@@ -103,6 +121,8 @@ class Training:
             discriminator_loss += disc_loss.item()
             disc_loss.backward(retain_graph=True)
             self.discriminator_optimizer.step()
+            if self.cfg.has_lr_decay:
+                self.discriminator_scheduler.step()
 
             """Train the generator"""
             self.generator_optimizer.zero_grad()
@@ -113,10 +133,53 @@ class Training:
             """retain_graph tells the autograd engine to retain the intermediate values of the graph,
             instead of freeing them, so that they can be used in the next backward pass."""
             self.generator_optimizer.step()
+            if self.cfg.has_lr_decay:
+                self.generator_scheduler.step()
 
+            epoch_real_output = real_output
+            epoch_fake_output = fake_output
+            epoch_real_data = data
+            epoch_fake_data = fake_data
         # end of batch loop...
 
         # now that we've trained through the batches, get their average training accuracy
+        # print(self.generator_scheduler.get_last_lr()[0])
+
+        total = 0
+        TP = 0
+        FP = 0
+        FN = 0
+        TN = 0
+        MSE = 0
+        for j in range(epoch_real_output.size()[0]):
+            if epoch_real_output[j].item() > 0.5:
+                if epoch_fake_output[j].item() < 0.5:
+                    TP += 1
+                else:
+                    FN += 1
+            elif epoch_real_output[j].item() <= 0.5:
+                if epoch_fake_output[j].item() >= 0.5:
+                    TP += 1
+                else:
+                    FP += 1
+            else:
+                TN+=1
+            total += 1
+            MSE += sum((epoch_real_data[j] - epoch_fake_data[j]) ** 2) / epoch_real_output.size()[0]
+
+        if TP ==0:
+            accuracy = 0.0
+            recall = 0.0
+            precision = 0.0
+        else:
+            accuracy = (TP+TN) / total
+            recall = TP / (TP + FN)
+            precision = TP / (TP + FP)
+            MSE = MSE / epoch_real_output.size()[0]
+        print("Accuracy: {:.2f}%".format(accuracy * 100))
+        print("Recall: {:.2f}%".format(recall * 100))
+        print("Precision: {:.2f}%".format(precision * 100))
+        print("Mean Squared Error: {:.2f}".format(MSE))
         discriminator_loss /= len(self.data_loader)
         generator_loss /= len(self.data_loader)
         return discriminator_loss, generator_loss

@@ -87,6 +87,11 @@ class Training:
         epoch_real_data = 0
         epoch_fake_data = 0
 
+        accuracy = 0
+        recall = 0
+        precision = 0
+        MSE = 0
+
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
             # Check for the size of last batch
@@ -136,46 +141,22 @@ class Training:
             if self.cfg.has_lr_decay:
                 self.generator_scheduler.step()
 
-            epoch_real_output = real_output
-            epoch_fake_output = fake_output
-            epoch_real_data = data
-            epoch_fake_data = fake_data
-        # end of batch loop...
+            accuracy_t, recall_t, precision_t, MSE_t = Training.eval_metric(real_output, fake_output,
+                                                                    data, fake_data)
+            accuracy += accuracy_t
+            recall += recall_t
+            precision += precision_t
+            MSE += MSE_t
+            # end of batch loop...
 
         # now that we've trained through the batches, get their average training accuracy
         # print(self.generator_scheduler.get_last_lr()[0])
+        accuracy /= len(self.data_loader)
+        recall /= len(self.data_loader)
+        precision /= len(self.data_loader)
+        MSE /= len(self.data_loader)
 
-        total = 0
-        TP = 0
-        FP = 0
-        FN = 0
-        TN = 0
-        MSE = 0
-        for j in range(epoch_real_output.size()[0]):
-            if epoch_real_output[j].item() > 0.5:
-                if epoch_fake_output[j].item() < 0.5:
-                    TP += 1
-                else:
-                    FN += 1
-            elif epoch_real_output[j].item() <= 0.5:
-                if epoch_fake_output[j].item() >= 0.5:
-                    TP += 1
-                else:
-                    FP += 1
-            else:
-                TN+=1
-            total += 1
-            MSE += sum((epoch_real_data[j] - epoch_fake_data[j]) ** 2) / epoch_real_output.size()[0]
-
-        if TP ==0:
-            accuracy = 0.0
-            recall = 0.0
-            precision = 0.0
-        else:
-            accuracy = (TP+TN) / total
-            recall = TP / (TP + FN)
-            precision = TP / (TP + FP)
-            MSE = MSE / epoch_real_output.size()[0]
+        # accuracy, recall, precision, MSE = Training.eval_metric(epoch_real_output, epoch_fake_output, epoch_real_data, epoch_fake_data)
         print("Accuracy: {:.2f}%".format(accuracy * 100))
         print("Recall: {:.2f}%".format(recall * 100))
         print("Precision: {:.2f}%".format(precision * 100))
@@ -192,15 +173,36 @@ class Training:
         return 1 - u / v
 
     @staticmethod
-    def discriminator_eval_metric(output, target):
-        predictions = (output > 0.5).float()
-        true_positives = (predictions * target).sum()
-        false_positives = (predictions * (1 - target)).sum()
-        true_negatives = ((1 - predictions) * (1 - target)).sum()
-        false_negatives = ((1 - predictions) * target).sum()
-        precision = true_positives / (true_positives + false_positives)
-        recall = true_positives / (true_positives + false_negatives)
-        accuracy = (true_positives + true_negatives) / (
-                true_positives + true_negatives + false_positives + false_negatives)
-        f1 = 2 * precision * recall / (precision + recall)
-        return accuracy, precision, recall, f1
+    def eval_metric(real_output, fake_output, real_data, fake_data):
+        total = 0
+        TP = 0
+        FP = 0
+        FN = 0
+        TN = 0
+        MSE = 0
+        for j in range(real_output.size()[0]):
+            if real_output[j].item() > 0.5:
+                if fake_output[j].item() < 0.5:
+                    TP += 1
+                else:
+                    FN += 1
+            elif real_output[j].item() <= 0.5:
+                if fake_output[j].item() >= 0.5:
+                    TP += 1
+                else:
+                    FP += 1
+            else:
+                TN += 1
+            total += 1
+            MSE += sum((real_data[j] - fake_data[j]) ** 2) / real_output.size()[0]
+
+        if TP == 0:
+            accuracy = 0.0
+            recall = 0.0
+            precision = 0.0
+        else:
+            accuracy = (TP + TN) / total
+            recall = TP / (TP + FN)
+            precision = TP / (TP + FP)
+        MSE = MSE / real_output.size()[0]
+        return accuracy, precision, recall, MSE

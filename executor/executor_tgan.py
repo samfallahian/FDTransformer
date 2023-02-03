@@ -1,7 +1,6 @@
 import torch
 from models import model_tgan, loss
 from utils import helpers
-import numpy as np
 
 
 class Training:
@@ -51,24 +50,29 @@ class Training:
         # test_accuracy = torch.zeros(epochs)
 
         for epoch in range(epochs):
-            # generator_loss, disc_loss = self.train()
-            d_loss, g_loss = self.train()
+            d_loss, g_loss, accuracy, recall, precision, mse = self.train()
 
             # train_accuracy[epoch] = train_acc
             # test_accuracy[epoch] = test_acc
             if (epoch + 1) % 2 == 0:
                 print("--------------------------------------------------------")
                 print(f"Epoch {epoch + 1}: ")
-                print(f"Generator Loss: {g_loss}")
-                print(f"Discriminator Loss : {d_loss}")
+                print("Generator Loss : {:.4f}".format(g_loss))
+                print("Discriminator Loss : {:.4f}".format(d_loss))
+                print("Discriminator Accuracy: {:.2f}%".format(accuracy * 100))
+                print("Discriminator Recall: {:.2f}%".format(recall * 100))
+                print("Discriminator Precision: {:.2f}%".format(precision * 100))
+                print("Genrator Mean Squared Error: {:.2f}".format(mse))
                 # print(f"Train Accuracy: {train_acc}")
                 # print(f"Test Accuracy: {test_acc}")
 
         print("--------------------------------------------------------")
-        # print(
-        #     f"Final Training Accuracy: epoch {torch.argmax(train_accuracy) + 1} with accuracy: {train_accuracy[torch.argmax(train_accuracy)]}")
-        # print(
-        #     f"Final Testing Accuracy: epoch {torch.argmax(test_accuracy) + 1} with accuracy: {test_accuracy[torch.argmax(test_accuracy)]}")
+
+        # print( f"Final Training Accuracy: epoch {torch.argmax(train_accuracy) + 1} with accuracy: {train_accuracy[
+        # torch.argmax(train_accuracy)]}")
+
+        # print( f"Final Testing Accuracy: epoch {torch.argmax(test_accuracy) + 1} with accuracy: {test_accuracy[
+        # torch.argmax(test_accuracy)]}")
         train_accuracy = 0
         test_accuracy = 0
 
@@ -82,15 +86,11 @@ class Training:
         """variables"""
         discriminator_loss = 0
         generator_loss = 0
-        epoch_real_output = 0
-        epoch_fake_output = 0
-        epoch_real_data = 0
-        epoch_fake_data = 0
-
         accuracy = 0
         recall = 0
         precision = 0
-        MSE = 0
+        mse = 0
+        PCC = 0
 
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
@@ -141,68 +141,57 @@ class Training:
             if self.cfg.has_lr_decay:
                 self.generator_scheduler.step()
 
-            accuracy_t, recall_t, precision_t, MSE_t = Training.eval_metric(real_output, fake_output,
-                                                                    data, fake_data)
+            accuracy_t, recall_t, precision_t, mse_t = Training.eval_metric(real_output, fake_output,
+                                                                            data, fake_data)
             accuracy += accuracy_t
             recall += recall_t
             precision += precision_t
-            MSE += MSE_t
+            mse += mse_t
             # end of batch loop...
 
-        # now that we've trained through the batches, get their average training accuracy
+        # tracking learning rate
         # print(self.generator_scheduler.get_last_lr()[0])
+        # get their average training eval metrics and losses
         accuracy /= len(self.data_loader)
         recall /= len(self.data_loader)
         precision /= len(self.data_loader)
-        MSE /= len(self.data_loader)
-
-        # accuracy, recall, precision, MSE = Training.eval_metric(epoch_real_output, epoch_fake_output, epoch_real_data, epoch_fake_data)
-        print("Accuracy: {:.2f}%".format(accuracy * 100))
-        print("Recall: {:.2f}%".format(recall * 100))
-        print("Precision: {:.2f}%".format(precision * 100))
-        print("Mean Squared Error: {:.2f}".format(MSE))
+        mse /= len(self.data_loader)
         discriminator_loss /= len(self.data_loader)
         generator_loss /= len(self.data_loader)
-        return discriminator_loss, generator_loss
 
-    @staticmethod
-    def accuracy(prediction, labels):
-        """ R^2 score"""
-        u = ((labels - prediction) ** 2).sum()
-        v = ((labels - labels.mean()) ** 2).sum()
-        return 1 - u / v
+        return discriminator_loss, generator_loss, accuracy, recall, precision, mse
 
     @staticmethod
     def eval_metric(real_output, fake_output, real_data, fake_data):
         total = 0
-        TP = 0
-        FP = 0
-        FN = 0
-        TN = 0
-        MSE = 0
+        tp = 0
+        fp = 0
+        fn = 0
+        tn = 0
+        mse = 0
         for j in range(real_output.size()[0]):
             if real_output[j].item() > 0.5:
                 if fake_output[j].item() < 0.5:
-                    TP += 1
+                    tp += 1
                 else:
-                    FN += 1
+                    fn += 1
             elif real_output[j].item() <= 0.5:
                 if fake_output[j].item() >= 0.5:
-                    TP += 1
+                    tp += 1
                 else:
-                    FP += 1
+                    fp += 1
             else:
-                TN += 1
+                tn += 1
             total += 1
-            MSE += sum((real_data[j] - fake_data[j]) ** 2) / real_output.size()[0]
+            mse += sum((real_data[j] - fake_data[j]) ** 2) / real_output.size()[0]
 
-        if TP == 0:
+        if tp == 0:
             accuracy = 0.0
             recall = 0.0
             precision = 0.0
         else:
-            accuracy = (TP + TN) / total
-            recall = TP / (TP + FN)
-            precision = TP / (TP + FP)
-        MSE = MSE / real_output.size()[0]
-        return accuracy, precision, recall, MSE
+            accuracy = (tp + tn) / total
+            recall = tp / (tp + fn)
+            precision = tp / (tp + fp)
+        mse = mse / real_output.size()[0]
+        return accuracy, precision, recall, mse

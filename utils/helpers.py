@@ -1,5 +1,8 @@
 import json
 from configs import config as cfg
+from datetime import datetime
+import os.path
+import pandas as pd
 
 
 class Config:
@@ -22,3 +25,16 @@ class PythonObject(object):
 
     def __init__(self, dict_):
         self.__dict__.update(dict_)
+
+
+class Log:
+
+    def __init__(self, file_name):
+        self.file_name = file_name
+
+    def write_file(self, data):
+        with open(os.path.join("logs", f"{datetime.now()}-{self.file_name}.json"), "w") as f:
+            json.dump(data, f, indent=4)
+
+    def save_result(self, df):
+        df.to_csv(f"logs/{datetime.now()}-{self.file_name}.csv", index=False)

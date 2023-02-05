@@ -1,6 +1,8 @@
 import torch
 from models import model_tgan, loss
 from utils import helpers
+from datetime import datetime
+import pandas as pd
 
 
 class Training:
@@ -10,6 +12,7 @@ class Training:
         config = helpers.Config()
         self.cfg = config.from_json("training")
         self.batch_size = config.from_json("data").batch_size
+        self.logger = helpers.Log(self.cfg.model_file_name)
 
         """ Find if GPU is available"""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,44 +42,42 @@ class Training:
             self.discriminator_scheduler = torch.optim.lr_scheduler.StepLR(self.discriminator_optimizer,
                                                                            step_size=step_size,
                                                                            gamma=self.cfg.lr_decay_gamma)
+        """ Defining Data Loader"""
         self.data_loader = data_loader
+
+        """ Creating dataframe fo saving logs"""
+        self.df_result = pd.DataFrame(
+            columns=["epoch", "dis_loss", "gen_loss", "dis_accuracy", "dis_recall", "dis_precision", "gen_mse", "time"])
 
     def forward(self):
         """Set model to training mode"""
         # self.model.train()
         """variables"""
         epochs = self.cfg.epoch
-        # train_accuracy = torch.zeros(epochs)
-        # test_accuracy = torch.zeros(epochs)
 
         for epoch in range(epochs):
             d_loss, g_loss, accuracy, recall, precision, mse = self.train()
+            self.df_result.loc[len(self.df_result.index)] = [epoch + 1, round(d_loss, 4), round(g_loss, 4),
+                                                             round(accuracy, 4), round(recall, 4),
+                                                             round(precision, 4), round(mse, 4),
+                                                             datetime.now().strftime("%m/%d/%Y, %H:%M:%S")]
 
-            # train_accuracy[epoch] = train_acc
-            # test_accuracy[epoch] = test_acc
             if (epoch + 1) % 2 == 0:
                 print("--------------------------------------------------------")
                 print(f"Epoch {epoch + 1}: ")
+                print(f"Time : {datetime.now().strftime('%m/%d/%Y, %H:%M:%S')}")
                 print("Generator Loss : {:.4f}".format(g_loss))
                 print("Discriminator Loss : {:.4f}".format(d_loss))
                 print("Discriminator Accuracy: {:.2f}%".format(accuracy * 100))
                 print("Discriminator Recall: {:.2f}%".format(recall * 100))
                 print("Discriminator Precision: {:.2f}%".format(precision * 100))
-                print("Genrator Mean Squared Error: {:.2f}".format(mse))
-                # print(f"Train Accuracy: {train_acc}")
-                # print(f"Test Accuracy: {test_acc}")
+                print("Genrator Mean Squared Error: {:.3f}".format(mse))
 
         print("--------------------------------------------------------")
+        # Saving Results
+        self.logger.save_result(self.df_result)
 
-        # print( f"Final Training Accuracy: epoch {torch.argmax(train_accuracy) + 1} with accuracy: {train_accuracy[
-        # torch.argmax(train_accuracy)]}")
-
-        # print( f"Final Testing Accuracy: epoch {torch.argmax(test_accuracy) + 1} with accuracy: {test_accuracy[
-        # torch.argmax(test_accuracy)]}")
-        train_accuracy = 0
-        test_accuracy = 0
-
-        return train_accuracy, test_accuracy
+        return self.discriminator_model, self.generator_model
 
     def train(self):
         """Set model to training mode"""
@@ -90,7 +91,6 @@ class Training:
         recall = 0
         precision = 0
         mse = 0
-        PCC = 0
 
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
@@ -183,7 +183,7 @@ class Training:
             else:
                 tn += 1
             total += 1
-            mse += sum((real_data[j] - fake_data[j]) ** 2) / real_output.size()[0]
+            mse += sum((real_data[j] - fake_data[j]) ** 2).item() / real_output.size()[0]
 
         if tp == 0:
             accuracy = 0.0

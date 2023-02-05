@@ -1,5 +1,6 @@
-from executor import executor_tgan
+from executor import executor_tgan, model_loader
 from data import data_reader, data_loader
+from models import model_tgan
 from utils import helpers
 
 def main():
@@ -10,8 +11,18 @@ def main():
     data_load = data_loader.DataModelLoader(X, y)
     train_loader = data_load.all_data_loader()
     model_training = executor_tgan.Training(train_loader)
+    model_handeling = model_loader.ModelLoader()
 
-    model_training.forward()
+
+    discriminator_model, generator_model = model_training.forward()
+    model_handeling.save_model(discriminator_model, generator_model)
+
+    """Generating new data"""
+    # generator = model_tgan.Generator()
+    # load_saved_generator = model_handeling.load_model(generator, "2023-02-05 15:05:24.747473-cgan-generator_model")
+    # generated_data = model_handeling.generate_data(load_saved_generator)
+    # print(generated_data)
+
 
 
 

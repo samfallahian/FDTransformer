@@ -11,8 +11,9 @@ CFG = {
         "dropout": 0.2
     },
     "training": {
+        "model_file_name": "cgan",
         "lr": 0.0005,
-        "epoch": 50,
+        "epoch": 3,
         "optimizer": "Adam",
         "weight_decay": 0.01,
         "has_lr_decay": True,

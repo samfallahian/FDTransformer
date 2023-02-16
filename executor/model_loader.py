@@ -13,9 +13,9 @@ class ModelLoader:
 
     def save_model(self, dis_model, gen_model):
         torch.save(gen_model.state_dict(),
-                   f"saved_models/{datetime.now()}-{self.cfg.model_file_name}-generator_model.pt")
+                   f"saved_models/{datetime.now().strftime('%Y-%m-%d %H%M%S')}-{self.cfg.model_file_name}-generator_model.pt")
         torch.save(dis_model.state_dict(),
-                   f"saved_models/{datetime.now()}-{self.cfg.model_file_name}-discriminator_model.pt")
+                   f"saved_models/{datetime.now().strftime('%Y-%m-%d %H%M%S')}-{self.cfg.model_file_name}-discriminator_model.pt")
 
     def load_model(self, model, file_name):
         model.load_state_dict(torch.load(f"saved_models/{file_name}.pt"))

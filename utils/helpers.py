@@ -33,8 +33,8 @@ class Log:
         self.file_name = file_name
 
     def write_file(self, data):
-        with open(os.path.join("logs", f"{datetime.now()}-{self.file_name}.json"), "w") as f:
+        with open(os.path.join("logs", f"{datetime.now().strftime('%Y-%m-%d %H%M%S')}-{self.file_name}.json"), "w") as f:
             json.dump(data, f, indent=4)
 
     def save_result(self, df):
-        df.to_csv(f"logs/{datetime.now()}-{self.file_name}.csv", index=False)
+        df.to_csv(f"logs/{datetime.now().strftime('%Y-%m-%d %H%M%S')}-{self.file_name}.csv", index=False)

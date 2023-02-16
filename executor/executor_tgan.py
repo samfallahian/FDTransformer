@@ -115,13 +115,13 @@ class Training:
             become unstable or diverge from the optimal solution."""
 
             # forward pass and loss for real data
-            real_output = self.discriminator_model(data)
-            real_loss = self.loss_function(real_output, real_labels, fake_data, data)
+            real_output = self.discriminator_model(data, label)
+            real_loss = self.loss_function(real_output, real_labels, fake_data, data, is_generator=False)
 
             # forward pass and loss for fake data
             # with torch.no_grad():
-            fake_output = self.discriminator_model(fake_data)
-            fake_loss = self.loss_function(fake_output, fake_labels, fake_data, data)
+            fake_output = self.discriminator_model(fake_data, label)
+            fake_loss = self.loss_function(fake_output, fake_labels, fake_data, data, is_generator=False)
             disc_loss = (real_loss + fake_loss) / self.batch_size
             discriminator_loss += disc_loss.item()
             disc_loss.backward(retain_graph=True)
@@ -131,7 +131,7 @@ class Training:
 
             """Train the generator"""
             self.generator_optimizer.zero_grad()
-            pred_labels = self.discriminator_model(fake_data)
+            pred_labels = self.discriminator_model(fake_data, label)
             gen_loss = self.loss_function(pred_labels, real_labels, fake_data, data) / self.batch_size
             generator_loss += gen_loss.item()
             gen_loss.backward(retain_graph=True)

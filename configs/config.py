@@ -6,7 +6,7 @@ CFG = {
     },
     "model": {
         "generatorUnits": [12, 64, 128, 256, 512, 11],
-        "discriminatorUnits": [11, 64, 128, 256, 1],
+        "discriminatorUnits": [12, 64, 128, 256, 1],
         "negative_slope": 0.2,
         "dropout": 0.2
     },

@@ -13,12 +13,14 @@ class CustomLoss(nn.Module):
         config = helpers.Config()
         self.cfg = config.from_json("training")
 
-    def forward(self, generated_label,  real_label, generated_data, real_data):
+    def forward(self, generated_label,  real_label, generated_data, real_data, is_generator = True):
         loss = self.loss(generated_label, real_label)
         # here add custom loss and add it to final loss
-        wass_loss = self.wass_distance(real_data, generated_data)
-        final_loss = loss+wass_loss
-
+        if is_generator:
+            wass_loss = self.wass_distance(real_data, generated_data)
+            final_loss = loss + wass_loss
+        else:
+            final_loss = loss
         return final_loss
 
     def wass_distance(self, real, generated):

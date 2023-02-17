@@ -63,5 +63,7 @@ class Discriminator(nn.Module):
             x = self.layers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
             x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
-        x = torch.sigmoid(self.layers["output_layer"](x))
+        # x = torch.sigmoid(self.layers["output_layer"](x))
+        # When we are using critic with BCEWithLogitsLoss we don't need the activation here
+        x = self.layers["output_layer"](x)
         return x

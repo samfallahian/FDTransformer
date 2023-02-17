@@ -5,15 +5,16 @@ CFG = {
         "batch_size": 32
     },
     "model": {
-        "generatorUnits": [12, 64, 128, 256, 512, 11],
-        "discriminatorUnits": [12, 64, 128, 256, 1],
+        "generatorUnits": [12, 64, 128, 256,  11],
+        "discriminatorUnits": [12, 64, 128, 1],
         "negative_slope": 0.2,
         "dropout": 0.2
     },
     "training": {
         "model_file_name": "cgan",
         "lr": 0.0005,
-        "epoch": 3,
+        "epoch": 40,
+        "scaled_loss": True,
         "optimizer": "Adam",
         "weight_decay": 0.01,
         "has_lr_decay": True,
@@ -21,5 +22,7 @@ CFG = {
         "n_classes": 1,
         "n_input": 11,
         "kd_band_width": 5,
+        "optim_beta_min": 0.5,
+        "optim_beta_max": 0.999
     }
 }

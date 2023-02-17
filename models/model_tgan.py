@@ -24,7 +24,8 @@ class Generator(nn.Module):
         """Define output layer"""
         self.layers["output_layer"] = nn.Linear(cfg.generatorUnits[-2], cfg.generatorUnits[-1])
 
-    def forward(self, x):
+    def forward(self, x, label):
+        x = torch.cat((x, label), dim=1)
         x = F.leaky_relu(self.layers["input_layer"](x), negative_slope=self.cfg.negative_slope)
         x = F.dropout(x, p=self.cfg.dropout)
         for i in range(1, self.nLayers - 2):

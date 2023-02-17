@@ -105,7 +105,7 @@ class Training:
             fake_labels = torch.zeros(self.batch_size, 1).to(self.device)
             real_labels = torch.ones(self.batch_size, 1).to(self.device)
             # concatenate noise and labels as input to generator
-            fake_data = self.generator_model(torch.cat((noise, label), 1))
+            fake_data = self.generator_model(noise, label)
 
             """Train the discriminator"""
             self.discriminator_optimizer.zero_grad()

@@ -2,11 +2,13 @@ CFG = {
     "data": {
         "env": "tgan",
         "data_path": "dataset/",
-        "batch_size": 32
+        "batch_size": 128
     },
     "model": {
-        "generatorUnits": [12, 64, 128, 256,  11],
-        "discriminatorUnits": [12, 64, 128, 1],
+        # "generatorUnits": [12, 64, 128, 256,  11],
+        # "discriminatorUnits": [12, 64, 128, 1],
+        "generatorUnits": [7, 64, 128, 256,  5],
+        "discriminatorUnits": [7, 64, 128, 1],
         "negative_slope": 0.2,
         "dropout": 0.2
     },
@@ -20,7 +22,7 @@ CFG = {
         "has_lr_decay": True,
         "lr_decay_gamma": 0.8,
         "n_classes": 1,
-        "n_input": 11,
+        "n_input": 5,
         "kd_band_width": 5,
         "optim_beta_min": 0.5,
         "optim_beta_max": 0.999

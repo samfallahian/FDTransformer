@@ -9,7 +9,8 @@ class CustomLoss(nn.Module):
 
     def __init__(self):
         super(CustomLoss, self).__init__()
-        self.loss = nn.BCELoss()
+        # self.loss = nn.BCELoss()
+        self.loss = nn.BCEWithLogitsLoss()
         config = helpers.Config()
         self.cfg = config.from_json("training")
 

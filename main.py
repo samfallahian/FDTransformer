@@ -7,7 +7,7 @@ def main():
     config = helpers.Config()
     cfg = config.from_json("data")
     data_read = data_reader.DataReader()
-    X, y = data_read.load_standardize_data('wind_forecast')
+    X, y = data_read.load_standardize_data('wind_forecast_2009')
     data_load = data_loader.DataModelLoader(X, y)
     train_loader = data_load.all_data_loader()
     model_training = executor_tgan.Training(train_loader)

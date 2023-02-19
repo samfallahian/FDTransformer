@@ -10,7 +10,9 @@ class Generator(nn.Module):
         """ Load model configurations """
         config = helpers.Config()
         cfg = config.from_json("model")
+        cfg_training = config.from_json("training")
         self.cfg = cfg
+        self.cfg_training = cfg_training
         """ Create dictionary to store the layers """
         self.layers = nn.ModuleDict()
         """ Define layers """
@@ -43,6 +45,8 @@ class Discriminator(nn.Module):
         config = helpers.Config()
         cfg = config.from_json("model")
         self.cfg = cfg
+        cfg_training = config.from_json("training")
+        self.cfg_training = cfg_training
         """ Create dictionary to store the layers """
         self.layers = nn.ModuleDict()
         """ Define layers by reversing generator layer"""
@@ -64,7 +68,9 @@ class Discriminator(nn.Module):
             x = self.layers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
             x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
-        # x = torch.sigmoid(self.layers["output_layer"](x))
-        # When we are using critic with BCEWithLogitsLoss we don't need the activation here
-        x = self.layers["output_layer"](x)
+
+        if self.cfg_training.is_critic:
+            x = self.layers["output_layer"](x)
+        else:
+            x = torch.sigmoid(self.layers["output_layer"](x))
         return x

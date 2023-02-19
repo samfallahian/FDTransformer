@@ -9,10 +9,13 @@ class CustomLoss(nn.Module):
 
     def __init__(self):
         super(CustomLoss, self).__init__()
-        # self.loss = nn.BCELoss()
-        self.loss = nn.BCEWithLogitsLoss()
         config = helpers.Config()
         self.cfg = config.from_json("training")
+        if self.cfg.is_critic:
+            self.loss = nn.BCEWithLogitsLoss()
+        else:
+            self.loss = nn.BCELoss()
+        #
 
     def forward(self, generated_label,  real_label, generated_data, real_data, is_generator = True):
         loss = self.loss(generated_label, real_label)

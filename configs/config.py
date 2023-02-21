@@ -9,6 +9,7 @@ CFG = {
         # "discriminatorUnits": [12, 64, 128, 1],
         "generatorUnits": [7, 64, 128, 256, 5],
         "discriminatorUnits": [7, 64, 128, 256, 1],
+        "caeUnits": [7,128,128,7],
         "negative_slope": 0.2,
         "dropout": 0.2
     },

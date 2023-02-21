@@ -22,7 +22,7 @@ class Generator(nn.Module):
         """Define hidden layers and batch normalization"""
         for i in range(1, len(cfg.generatorUnits) - 2):
             self.layers[f"hidden_{i}"] = nn.Linear(cfg.generatorUnits[i], cfg.generatorUnits[i + 1])
-            self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
+            # self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
         """Define output layer"""
         self.layers["output_layer"] = nn.Linear(cfg.generatorUnits[-2], cfg.generatorUnits[-1])
 
@@ -31,7 +31,7 @@ class Generator(nn.Module):
         x = F.leaky_relu(self.layers["input_layer"](x), negative_slope=self.cfg.negative_slope)
         x = F.dropout(x, p=self.cfg.dropout)
         for i in range(1, self.nLayers - 2):
-            x = self.layers[f"batch_norm_{i}"](x)
+            # x = self.layers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
             x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
         x = self.layers[f"output_layer"](x)
@@ -56,7 +56,7 @@ class Discriminator(nn.Module):
         """Define hidden layers and batch normalization"""
         for i in range(1, len(cfg.discriminatorUnits) - 2):
             self.layers[f"hidden_{i}"] = nn.Linear(cfg.discriminatorUnits[i], cfg.discriminatorUnits[i + 1])
-            self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
+            # self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
         """Define output layer"""
         self.layers["output_layer"] = nn.Linear(cfg.discriminatorUnits[-2], cfg.discriminatorUnits[-1])
 
@@ -65,7 +65,7 @@ class Discriminator(nn.Module):
         x = F.leaky_relu(self.layers["input_layer"](x), negative_slope=self.cfg.negative_slope)
         x = F.dropout(x, p=self.cfg.dropout)
         for i in range(1, self.nLayers - 2):
-            x = self.layers[f"batch_norm_{i}"](x)
+            # x = self.layers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
             x = F.leaky_relu(self.layers[f"hidden_{i}"](x), negative_slope=self.cfg.negative_slope)
 

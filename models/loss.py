@@ -45,6 +45,11 @@ class CustomLoss(nn.Module):
         wass_distance = wasserstein_distance(real_pdf, fake_pdf)
         return wass_distance
 
+    # def contractive_loss(self, encoded, x):
+    #     jacobian = torch.autograd.functional.jacobian(self.encoder, x)
+    #     jacobian_norm = torch.norm(jacobian, dim=(0, 2))
+    #     return torch.mean(jacobian_norm ** 2 * encoded ** 2)
+
     # @staticmethod
     # def kl_divergence(real, generated):
     #     real_logprobs = F.log_softmax(discriminator(real), dim=1)

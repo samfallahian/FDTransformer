@@ -20,7 +20,7 @@ CFG = {
         "epoch": 40,
         "scaled_loss": False,
         "optimizer": "Adam",
-        "weight_decay": 0.01,
+        "weight_decay": 0.001,
         "has_lr_decay": True,
         "lr_decay_gamma": 0.8,
         "n_classes": 1,
@@ -28,6 +28,7 @@ CFG = {
         "kd_band_width": 5,
         "optim_beta_min": 0.5,
         "optim_beta_max": 0.999,
-        "is_critic": False
+        "is_critic": False,
+        "contractive_coef": 0.001
     }
 }

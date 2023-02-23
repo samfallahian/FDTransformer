@@ -32,9 +32,11 @@ class Training:
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
         step_size = self.batch_size * len(data_loader) * 0.5
         self.generator_optimizer = optimizer_function(self.generator_model.parameters(), lr=self.cfg.lr,
-                                                      weight_decay=self.cfg.weight_decay, betas=(self.cfg.optim_beta_min, self.cfg.optim_beta_max))
+                                                      weight_decay=self.cfg.weight_decay,
+                                                      betas=(self.cfg.optim_beta_min, self.cfg.optim_beta_max))
         self.discriminator_optimizer = optimizer_function(self.discriminator_model.parameters(), lr=self.cfg.lr,
-                                                          weight_decay=self.cfg.weight_decay, betas=(self.cfg.optim_beta_min, self.cfg.optim_beta_max))
+                                                          weight_decay=self.cfg.weight_decay,
+                                                          betas=(self.cfg.optim_beta_min, self.cfg.optim_beta_max))
         """ lr decay scheduler """
         if self.cfg.has_lr_decay:
             self.generator_scheduler = torch.optim.lr_scheduler.StepLR(self.generator_optimizer, step_size=step_size,
@@ -118,21 +120,20 @@ class Training:
             real_output = self.discriminator_model(data, label)
 
             if self.cfg.is_critic:
-                real_loss = self.loss_function(real_output, torch.ones_like(real_output), fake_data, data,
-                                               is_generator=False)
+                real_loss = self.loss_function.cgan_loss(real_output, torch.ones_like(real_output), fake_data, data,
+                                                         is_generator=False)
             else:
-                real_loss = self.loss_function(real_output, real_labels, fake_data, data, is_generator=False)
-
+                real_loss = self.loss_function.cgan_loss(real_output, real_labels, fake_data, data, is_generator=False)
 
             # forward pass and loss for fake data
             # with torch.no_grad():
             fake_output = self.discriminator_model(fake_data, label)
             if self.cfg.is_critic:
-                fake_loss = self.loss_function(fake_output, torch.zeros_like(fake_output), fake_data, data,
-                                               is_generator=False)
+                fake_loss = self.loss_function.cgan_loss(fake_output, torch.zeros_like(fake_output), fake_data, data,
+                                                         is_generator=False)
             else:
-                fake_loss = self.loss_function(fake_output, fake_labels, fake_data, data,
-                                               is_generator=False)
+                fake_loss = self.loss_function.cgan_loss(fake_output, fake_labels, fake_data, data,
+                                                         is_generator=False)
 
             disc_loss = (real_loss + fake_loss) / (self.batch_size if self.cfg.scaled_loss == True else 1)
             discriminator_loss += disc_loss.item()
@@ -145,10 +146,13 @@ class Training:
             self.generator_optimizer.zero_grad()
             trained_fake_output = self.discriminator_model(fake_data, label)
             if self.cfg.is_critic:
-                gen_loss = self.loss_function(trained_fake_output, torch.ones_like(trained_fake_output), fake_data, data)  / (self.batch_size if self.cfg.scaled_loss == True else 1)
+                gen_loss = self.loss_function.cgan_loss(trained_fake_output, torch.ones_like(trained_fake_output),
+                                                        fake_data, data, is_generator=True) / (
+                               self.batch_size if self.cfg.scaled_loss == True else 1)
             else:
-                gen_loss = self.loss_function(trained_fake_output, real_labels, fake_data,
-                                              data) / (self.batch_size if self.cfg.scaled_loss == True else 1)
+                gen_loss = self.loss_function.cgan_loss(trained_fake_output, real_labels, fake_data,
+                                                        data, is_generator=True) / (
+                               self.batch_size if self.cfg.scaled_loss == True else 1)
             generator_loss += gen_loss.item()
             gen_loss.backward(retain_graph=True)
             """retain_graph tells the autograd engine to retain the intermediate values of the graph,

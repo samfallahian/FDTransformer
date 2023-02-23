@@ -37,9 +37,9 @@ class CAE(nn.Module):
         self.decoderLayers["output_layer"] = nn.Linear(cfg.decoderUnits[-2], cfg.decoderUnits[-1])
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
 
     def encoder(self, x):
         x = F.relu(self.encoderLayers["input_layer"](x))

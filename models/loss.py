@@ -11,14 +11,15 @@ class CustomLoss(nn.Module):
         super(CustomLoss, self).__init__()
         config = helpers.Config()
         self.cfg = config.from_json("training")
-        if self.cfg.is_critic:
-            self.loss = nn.BCEWithLogitsLoss()
-        else:
-            self.loss = nn.BCELoss()
-        #
+        self.bec_log = nn.BCEWithLogitsLoss()
+        self.bec = nn.BCELoss()
+        self.mse = nn.MSELoss()
 
-    def forward(self, generated_label,  real_label, generated_data, real_data, is_generator = True):
-        loss = self.loss(generated_label, real_label)
+    def cgan_loss(self, generated_label, real_label, generated_data, real_data, is_generator=True):
+        if self.cfg.is_critic:
+            loss = self.bec_log(generated_label, real_label)
+        else:
+            loss = self.bec(generated_label, real_label)
         # here add custom loss and add it to final loss
         if is_generator:
             wass_loss = self.wass_distance(real_data, generated_data)
@@ -26,6 +27,15 @@ class CustomLoss(nn.Module):
         else:
             final_loss = loss
         return final_loss
+
+    def cae_loss(self, encoded, decoded, data, encoder_model):
+        mse_loss = self.mse(decoded,data)
+        jacobian = torch.autograd.functional.jacobian(encoder_model, data)
+        jacobian_norm = torch.norm(jacobian, dim=(0, 2))
+        contractive_loss = torch.mean(jacobian_norm ** 2 * encoded ** 2)
+        final_loss = mse_loss + self.cfg.contractive_coef * contractive_loss
+        return final_loss
+
 
     def wass_distance(self, real, generated):
         """Use KernelDensity to estimate the probability density function (PDF) of the real and generated data. Then,
@@ -45,10 +55,7 @@ class CustomLoss(nn.Module):
         wass_distance = wasserstein_distance(real_pdf, fake_pdf)
         return wass_distance
 
-    # def contractive_loss(self, encoded, x):
-    #     jacobian = torch.autograd.functional.jacobian(self.encoder, x)
-    #     jacobian_norm = torch.norm(jacobian, dim=(0, 2))
-    #     return torch.mean(jacobian_norm ** 2 * encoded ** 2)
+
 
     # @staticmethod
     # def kl_divergence(real, generated):
@@ -56,4 +63,3 @@ class CustomLoss(nn.Module):
     #     fake_logprobs = F.log_softmax(discriminator(generated), dim=1)
     #     kl_divergence = F.kl_div(fake_logprobs, real_logprobs, reduction='batchmean')
     #     return intersection / union
-

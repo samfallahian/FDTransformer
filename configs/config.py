@@ -9,8 +9,7 @@ CFG = {
         # "discriminatorUnits": [12, 64, 128, 1],
         "generatorUnits": [7, 64, 128, 256, 5],
         "discriminatorUnits": [7, 64, 128, 256, 1],
-        "encoderUnits": [7,128,64,8],
-        "decoderUnits": [8,64,128,7],
+        "autoencoderUnits": [7, 32, 64, 64, 32, 7],
         "negative_slope": 0.2,
         "dropout": 0.2
     },

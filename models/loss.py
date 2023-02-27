@@ -31,8 +31,10 @@ class CustomLoss(nn.Module):
     def cae_loss(self, encoded, decoded, data, encoder_model):
         mse_loss = self.mse(decoded,data)
         jacobian = torch.autograd.functional.jacobian(encoder_model, data)
-        jacobian_norm = torch.norm(jacobian, dim=(0, 2))
-        contractive_loss = torch.mean(jacobian_norm ** 2 * encoded ** 2)
+        jacobian_norm = torch.norm(jacobian[0], dim=(0, 2))
+        encoded_reshaped = encoded.view(-1, 1, encoded.shape[1])
+        encoded_norm = torch.norm(encoded_reshaped, dim=(2))
+        contractive_loss = torch.mean(jacobian_norm ** 2 * encoded_norm ** 2)
         final_loss = mse_loss + self.cfg.contractive_coef * contractive_loss
         return final_loss
 

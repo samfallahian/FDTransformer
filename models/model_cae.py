@@ -58,6 +58,6 @@ class CAE(nn.Module):
             # x = self.decoderLayers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
             x = F.relu(self.decoderLayers[f"hidden_{i}"](x))
-        x = torch.sigmoid(self.layers["output_layer"](x))
+        x = torch.sigmoid(self.decoderLayers["output_layer"](x))
         return x
 

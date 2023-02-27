@@ -23,9 +23,9 @@ class Training:
         self.loss_function = loss.CustomLoss()
 
         """ printing model details """
-        # print(self.cae)
-        # for i in self.cae.named_parameters():
-        #     print(i[0], i[1].shape, i[1].numel())
+        print(self.cae_model)
+        for i in self.cae_model.named_parameters():
+            print(i[0], i[1].shape, i[1].numel())
 
         """ Dynamic optimizer """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)

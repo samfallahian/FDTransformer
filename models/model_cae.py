@@ -14,50 +14,37 @@ class CAE(nn.Module):
         self.cfg = cfg
         self.cfg_training = cfg_training
 
-        """ Encoder layers """
-        self.encoderLayers = nn.ModuleDict()
-        self.nEncoderLayers = len(cfg.encoderUnits)
-        self.encoderLayers["input_layer"] = nn.Linear(cfg.encoderUnits[0], cfg.encoderUnits[1])
+        """ layers """
+        self.autoencoderLayers = nn.ModuleDict()
+        self.nLayers = len(cfg.autoencoderUnits)
+        self.autoencoderLayers["input_layer"] = nn.Linear(cfg.autoencoderUnits[0], cfg.autoencoderUnits[1])
         # Hidden layers
-        for i in range(1, len(cfg.encoderUnits) - 2):
-            self.encoderLayers[f"hidden_{i}"] = nn.Linear(cfg.encoderUnits[i], cfg.encoderUnits[i + 1])
+        for i in range(1, len(cfg.autoencoderUnits) - 2):
+            self.autoencoderLayers[f"fc_{i}"] = nn.Linear(cfg.autoencoderUnits[i], cfg.autoencoderUnits[i + 1])
             # self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
         # output layer
-        self.encoderLayers["output_layer"] = nn.Linear(cfg.encoderUnits[-2], cfg.encoderUnits[-1])
-
-        """ Decoder layers """
-        self.decoderLayers = nn.ModuleDict()
-        self.nDecoderLayers = len(cfg.decoderUnits)
-        self.decoderLayers["input_layer"] = nn.Linear(cfg.decoderUnits[0], cfg.decoderUnits[1])
-        # Hidden layers
-        for i in range(1, len(cfg.decoderUnits) - 2):
-            self.decoderLayers[f"hidden_{i}"] = nn.Linear(cfg.decoderUnits[i], cfg.decoderUnits[i + 1])
-            # self.layers[f"batch_norm_{i}"] = nn.BatchNorm1d(cfg.discriminatorUnits[i])
-        # output layer
-        self.decoderLayers["output_layer"] = nn.Linear(cfg.decoderUnits[-2], cfg.decoderUnits[-1])
+        self.autoencoderLayers["output_layer"] = nn.Linear(cfg.autoencoderUnits[-2], cfg.autoencoderUnits[-1])
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
+        encoded = self.encode(x)
+        decoded = self.decode(encoded)
         return encoded, decoded
 
-    def encoder(self, x):
-        x = F.relu(self.encoderLayers["input_layer"](x))
+    def encode(self, x):
+        x = F.relu(self.autoencoderLayers["input_layer"](x))
         x = F.dropout(x, p=self.cfg.dropout)
-        for i in range(1, self.nEncoderLayers - 2):
-            # x = self.encoderLayers[f"batch_norm_{i}"](x)
+        print(int(self.nLayers / 2), self.nLayers - 3)
+        for i in range(1, int(self.nLayers / 2) - 1):
+            # x = self.autoencoderLayers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
-            x = F.relu(self.encoderLayers[f"hidden_{i}"](x))
-        x = F.relu(self.encoderLayers["output_layer"](x))
+            x = F.relu(self.autoencoderLayers[f"fc_{i}"](x))
         return x
 
-    def decoder(self, x):
-        x = F.relu(self.decoderLayers["input_layer"](x))
-        x = F.dropout(x, p=self.cfg.dropout)
-        for i in range(1, self.nDecoderLayers - 2):
-            # x = self.decoderLayers[f"batch_norm_{i}"](x)
+    def decode(self, x):
+        for i in range(int(self.nLayers / 2), self.nLayers - 2):
+            # x = self.autoencoderLayers[f"batch_norm_{i}"](x)
             x = F.dropout(x, p=self.cfg.dropout)
-            x = F.relu(self.decoderLayers[f"hidden_{i}"](x))
-        x = torch.sigmoid(self.decoderLayers["output_layer"](x))
+            x = F.relu(self.autoencoderLayers[f"fc_{i}"](x))
+        x = torch.sigmoid(self.autoencoderLayers["output_layer"](x))
+        x = self.autoencoderLayers["output_layer"](x)
         return x
-

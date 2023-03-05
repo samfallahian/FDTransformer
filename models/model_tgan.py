@@ -10,7 +10,7 @@ class Generator(nn.Module):
         """ Load model configurations """
         config = helpers.Config()
         cfg = config.from_json("model")
-        cfg_training = config.from_json("training")
+        cfg_training = config.from_json("training").cgan
         self.cfg = cfg
         self.cfg_training = cfg_training
         """ Create dictionary to store the layers """
@@ -45,7 +45,7 @@ class Discriminator(nn.Module):
         config = helpers.Config()
         cfg = config.from_json("model")
         self.cfg = cfg
-        cfg_training = config.from_json("training")
+        cfg_training = config.from_json("training").cgan
         self.cfg_training = cfg_training
         """ Create dictionary to store the layers """
         self.layers = nn.ModuleDict()

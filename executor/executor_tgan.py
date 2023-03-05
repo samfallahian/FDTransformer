@@ -10,7 +10,7 @@ class Training:
         super(Training, self).__init__()
         """ Load training configurations """
         config = helpers.Config()
-        self.cfg = config.from_json("training")
+        self.cfg = config.from_json("training").cgan
         self.batch_size = config.from_json("data").batch_size
         self.logger = helpers.Log(self.cfg.model_file_name)
 
@@ -24,10 +24,25 @@ class Training:
         self.loss_function = loss.CustomLoss()
 
         """ printing model details """
-        # print(self.generator_model)
-        # for i in self.generator_model.named_parameters():
-        #     print(i[0], i[1].shape, i[1].numel())
-
+        print("--------------------------------------------------------")
+        print(f"Generator Model Architecture: ")
+        print("|||||||||||||||||||||||||||||")
+        print(self.generator_model)
+        print("--------------------------------------------------------")
+        print(f"Generator Model Details: ")
+        print("|||||||||||||||||||||||||")
+        for i in self.generator_model.named_parameters():
+            print(i[0], i[1].shape, i[1].numel())
+        print("--------------------------------------------------------")
+        print(f"Discriminator Model Architecture: ")
+        print("|||||||||||||||||||||||||||||")
+        print(self.discriminator_model)
+        print("--------------------------------------------------------")
+        print(f"Generator Model Details: ")
+        print("|||||||||||||||||||||||||")
+        for i in self.discriminator_model.named_parameters():
+            print(i[0], i[1].shape, i[1].numel())
+        print("--------------------------------------------------------")
         """ Dynamic optimizer """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
         step_size = self.batch_size * len(data_loader) * 0.5

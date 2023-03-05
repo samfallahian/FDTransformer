@@ -10,7 +10,7 @@ class Training:
         super(Training, self).__init__()
         """ Load training configurations """
         config = helpers.Config()
-        self.cfg = config.from_json("training")
+        self.cfg = config.from_json("training").cae
         self.batch_size = config.from_json("data").batch_size
         self.logger = helpers.Log(self.cfg.model_file_name)
 
@@ -23,14 +23,21 @@ class Training:
         self.loss_function = loss.CustomLoss()
 
         """ printing model details """
+        print("--------------------------------------------------------")
+        print(f"Model Architecture: ")
+        print("||||||||||||||||||||")
         print(self.cae_model)
+        print("--------------------------------------------------------")
+        print(f"Model Details: ")
+        print("|||||||||||||||")
         for i in self.cae_model.named_parameters():
             print(i[0], i[1].shape, i[1].numel())
+        print("--------------------------------------------------------")
 
         """ Dynamic optimizer """
         optimizer_function = getattr(torch.optim, self.cfg.optimizer)
         self.cae_optimizer = optimizer_function(self.cae_model.parameters(), lr=self.cfg.lr,
-                                                      weight_decay=self.cfg.weight_decay)
+                                                weight_decay=self.cfg.weight_decay)
         """ Defining Data Loader"""
         self.data_loader = data_loader
 
@@ -77,7 +84,8 @@ class Training:
             """ create minibatches of fake data and labels """
             encoded, decoded = self.cae_model(x)
 
-            loss = self.loss_function.cae_loss(encoded, decoded, x, self.cae_model)
+            W = self.cae_model.state_dict()['input.weight']
+            loss = self.loss_function.cae_loss(W, x, decoded, encoded)
             total_loss += loss.item()
 
             """Train"""

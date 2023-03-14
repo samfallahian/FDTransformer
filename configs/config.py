@@ -2,22 +2,22 @@ CFG = {
     "data": {
         "env": "tgan",
         "data_path": "dataset/",
-        "batch_size": 128
+        "batch_size": 512,
+        "generation_no": 100
     },
     "model": {
-        # "generatorUnits": [12, 64, 128, 256,  11],
-        # "discriminatorUnits": [12, 64, 128, 1],
-        "generatorUnits": [7, 64, 128, 256, 5],
-        "discriminatorUnits": [7, 64, 128, 256, 1],
-        "autoencoderUnits": [7, 64, 4, 64, 7],
-        "negative_slope": 0.2,
-        "dropout": 0.2
+        "cgan": {"generatorUnits": [7, 64, 128, 256, 5],
+                 "discriminatorUnits": [7, 64, 128, 64, 1],
+                 "negative_slope": 0.2,
+                 "dropout": 0.5},
+        "cae": {"autoencoderUnits": [7, 64, 4, 64, 7],
+                "dropout": 0.2}
     },
     "training": {
         "cgan": {
             "model_file_name": "cgan",
             "lr": 0.001,
-            "epoch": 2,
+            "epoch": 40,
             "scaled_loss": False,
             "optimizer": "Adam",
             "weight_decay": 0.001,
@@ -33,7 +33,7 @@ CFG = {
         "cae": {
             "model_file_name": "cae",
             "lr": 0.001,
-            "epoch": 3,
+            "epoch": 100,
             "scaled_loss": False,
             "optimizer": "Adam",
             "weight_decay": 0.001,

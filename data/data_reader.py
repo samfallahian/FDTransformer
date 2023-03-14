@@ -1,6 +1,7 @@
 import pandas as pd
 from sklearn import preprocessing
 from utils import helpers
+import numpy as np
 
 
 class DataReader:
@@ -27,9 +28,4 @@ class DataReader:
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
         # labels = scalar.fit_transform(labels)
         data = scalar.fit_transform(data)
-        return data, labels
-
-    @staticmethod
-    def de_standardize(transformed_values):
-        scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
-        return scalar.inverse_transform(transformed_values)
+        return data, labels, scalar

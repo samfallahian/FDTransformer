@@ -39,7 +39,7 @@ class CustomLoss(nn.Module):
         w_sum = w_sum.unsqueeze(1)  # shape N_hidden x 1
         contractive_loss = torch.sum(torch.mm(dh ** 2, w_sum), 0)
         final_loss = mse + contractive_loss.mul(self.cfg_cae.contractive_coef)
-        return final_loss
+        return final_loss , mse
 
     def wass_distance(self, real, generated):
         """Use KernelDensity to estimate the probability density function (PDF) of the real and generated data. Then,

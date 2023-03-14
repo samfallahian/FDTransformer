@@ -1,6 +1,8 @@
 import torch
 from utils import helpers
 from datetime import datetime
+import numpy as np
+from sklearn import preprocessing
 
 
 class ModelHandler:
@@ -19,9 +21,15 @@ class ModelHandler:
         model.load_state_dict(torch.load(f"saved_models/{file_name}.pt"))
         return model.to(self.device)
 
-    def generate_data(self, generator):
-        noise = torch.rand(self.batch_size, self.cfg_cgan.n_input).to(self.device) * 2 - 1
-        label = torch.ones(self.batch_size, 1).to(self.device)
-        fake_data = generator(torch.cat((noise, label), 1))
-        return fake_data
+    def generate_data(self, generator, sample, scalar):
+        noise = torch.rand(sample, self.cfg_cgan.n_input).to(self.device) * 2 - 1
+        generated_label = np.array([1, 1])
+        label = np.tile(generated_label, (sample, 1))[:, :3]
+        label_tensor= torch.tensor(label).to(self.device)
+
+        # label_tensor = torch.from_numpy(label).to(self.device).unsqueeze(0)
+        # print(label.shape)
+        fake_data = generator(noise, label_tensor)
+        print(fake_data)
+        return scalar.inverse_transform(fake_data.detach().cpu())
 

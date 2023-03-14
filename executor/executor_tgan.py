@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from models import model_tgan, loss
 from utils import helpers
 from datetime import datetime
@@ -66,11 +67,18 @@ class Training:
         self.df_result = pd.DataFrame(
             columns=["epoch", "dis_loss", "gen_loss", "dis_accuracy", "dis_recall", "dis_precision", "gen_mse", "time"])
 
-    def forward(self):
+    def forward(self,pretrained_weight):
+        print("Weight shape: ", self.generator_model.layers["input_layer"].weight.shape[0])
         """Set model to training mode"""
         # self.model.train()
         """variables"""
         epochs = self.cfg.epoch
+        with torch.no_grad():
+            # resized_pretrained_weights = pretrained_weight.t().resize(self.generator_model.layers["input_layer"].weight.shape)
+
+            resized_weight = pretrained_weight.t()
+
+            self.generator_model.layers["input_layer"].weight.data.copy_(resized_weight)
 
         for epoch in range(epochs):
             d_loss, g_loss, accuracy, recall, precision, mse = self.train()

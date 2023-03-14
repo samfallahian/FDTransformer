@@ -9,7 +9,7 @@ class CAE(nn.Module):
         super(CAE, self).__init__()
         """ Load model configurations """
         config = helpers.Config()
-        cfg = config.from_json("model")
+        cfg = config.from_json("model").cae
         cfg_training = config.from_json("training")
         self.cfg = cfg
         self.cfg_training = cfg_training

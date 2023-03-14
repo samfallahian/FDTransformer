@@ -43,7 +43,7 @@ class Training:
 
         """ Creating dataframe fo saving logs"""
         self.df_result = pd.DataFrame(
-            columns=["epoch", "loss", "time"])
+            columns=["epoch", "total_loss", "mse", "time"])
 
     def forward(self):
         """Set model to training mode"""
@@ -52,15 +52,16 @@ class Training:
         epochs = self.cfg.epoch
 
         for epoch in range(epochs):
-            loss = self.train()
-            self.df_result.loc[len(self.df_result.index)] = [epoch + 1, round(loss, 4),
+            loss, mse_loss = self.train()
+            self.df_result.loc[len(self.df_result.index)] = [epoch + 1, round(loss, 4), round(mse_loss, 4),
                                                              datetime.now().strftime("%m/%d/%Y, %H:%M:%S")]
 
             if (epoch + 1) % 2 == 0:
                 print("--------------------------------------------------------")
                 print(f"Epoch {epoch + 1}: ")
                 print(f"Time : {datetime.now().strftime('%m/%d/%Y, %H:%M:%S')}")
-                print("Loss : {:.4f}".format(loss))
+                print("MSE : {:.4f}".format(mse_loss))
+                print("TotalLoss : {:.4f}".format(loss))
 
         print("--------------------------------------------------------")
         # Saving Results
@@ -74,6 +75,7 @@ class Training:
 
         """variables"""
         total_loss = 0
+        mse_loss = 0
 
         # loop over training data batches
         for i, (data, label) in enumerate(self.data_loader):
@@ -85,8 +87,9 @@ class Training:
             encoded, decoded = self.cae_model(x)
 
             W = self.cae_model.state_dict()['input.weight']
-            loss = self.loss_function.cae_loss(W, x, decoded, encoded)
+            loss, mse = self.loss_function.cae_loss(W, x, decoded, encoded)
             total_loss += loss.item()
+            mse_loss += mse.item()
 
             """Train"""
             self.cae_optimizer.zero_grad()
@@ -95,5 +98,6 @@ class Training:
             # end of batch loop...
 
         total_loss /= len(self.data_loader)
+        mse_loss /= len(self.data_loader)
 
-        return total_loss
+        return total_loss, mse_loss

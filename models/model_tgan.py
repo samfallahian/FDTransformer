@@ -9,7 +9,7 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
         """ Load model configurations """
         config = helpers.Config()
-        cfg = config.from_json("model")
+        cfg = config.from_json("model").cgan
         cfg_training = config.from_json("training").cgan
         self.cfg = cfg
         self.cfg_training = cfg_training
@@ -43,7 +43,7 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         """ Load model configurations """
         config = helpers.Config()
-        cfg = config.from_json("model")
+        cfg = config.from_json("model").cgan
         self.cfg = cfg
         cfg_training = config.from_json("training").cgan
         self.cfg_training = cfg_training

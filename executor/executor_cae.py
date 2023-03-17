@@ -11,7 +11,7 @@ class Training:
         """ Load training configurations """
         config = helpers.Config()
         self.cfg = config.from_json("training").cae
-        self.batch_size = config.from_json("data").batch_size
+        self.batch_size = config.from_json("data").cae.batch_size
         self.logger = helpers.Log(self.cfg.model_file_name)
 
         """ Find if GPU is available"""

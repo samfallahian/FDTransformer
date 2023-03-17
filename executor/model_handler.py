@@ -11,7 +11,6 @@ class ModelHandler:
         config = helpers.Config()
         self.cfg_cgan = config.from_json("training").cgan
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.batch_size = config.from_json("data").batch_size
 
     def save_model(self, model, file_name):
         torch.save(model.state_dict(),
@@ -21,15 +20,34 @@ class ModelHandler:
         model.load_state_dict(torch.load(f"saved_models/{file_name}.pt"))
         return model.to(self.device)
 
-    def generate_data(self, generator, sample, scalar):
-        noise = torch.rand(sample, self.cfg_cgan.n_input).to(self.device) * 2 - 1
-        generated_label = np.array([1, 1])
-        label = np.tile(generated_label, (sample, 1))[:, :3]
-        label_tensor= torch.tensor(label).to(self.device)
+    # def generate_data(self, generator, labels, scalar):
+    #     noise = torch.rand(labels.shape[0], self.cfg_cgan.n_input).to(self.device) * 2 - 1
+    #     label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
+    #     # label_tensor = torch.from_numpy(label).to(self.device).unsqueeze(0)
+    #     fake_data = generator(noise, label_tensor)
+    #     # result = torch.cat((label_tensor, scalar.inverse_transform(fake_data.detach())),1)
+    #     return scalar.inverse_transform(fake_data.detach().cpu())
+    #     # return result
 
-        # label_tensor = torch.from_numpy(label).to(self.device).unsqueeze(0)
-        # print(label.shape)
-        fake_data = generator(noise, label_tensor)
-        print(fake_data)
-        return scalar.inverse_transform(fake_data.detach().cpu())
+    # def generate_data(self, generator, labels, scalar):
+    #     for i in range(5):
+    #         noise = torch.rand(1, self.cfg_cgan.n_input).to(self.device) * 2 - 1
+    #         print(labels.to_numpy()[i])
+    #         label_tensor = torch.tensor(labels.to_numpy()[i]).to(self.device)
+    #         label_tensor = torch.reshape(label_tensor, (1,3))
+    #         fake_data = generator(noise, label_tensor)
+    #         # print(fake_data)
+    #
+    #     pass
+        # return scalar.inverse_transform(fake_data.detach().cpu())
 
+    def generate_data(self, generator, labels, scalar):
+        generator.eval()
+        with torch.no_grad():
+            noise = torch.randn(labels.shape[0], self.cfg_cgan.n_input).to(self.device) * 2 - 1
+            label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
+            generated_data = generator(noise, label_tensor)
+            transformed_generated = scalar.inverse_transform(generated_data.cpu().numpy())
+            result = torch.cat((label_tensor, torch.tensor(transformed_generated).to(self.device)), dim=1)
+
+        return result.detach().cpu().numpy()

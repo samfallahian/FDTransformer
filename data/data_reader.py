@@ -21,8 +21,8 @@ class DataReader:
 
         ### Wind data
         df = pd.read_csv(self.path + file_name + ".csv")
-        labels = df.drop(df.columns.difference(["time_frame", "farm"]), axis=1).to_numpy()
-        data = df.drop(["time_frame", "farm", "date"], axis=1).to_numpy()
+        labels = df.drop(df.columns.difference(["time_frame", "hrs", "farm"]), axis=1).to_numpy()
+        data = df.drop(["time_frame", "hrs", "farm", "date"], axis=1).to_numpy()
 
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))

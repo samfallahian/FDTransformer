@@ -5,14 +5,18 @@ from torch.utils.data import DataLoader
 
 
 class DataModelLoader:
-    def __init__(self, data, labels):
+    def __init__(self, data, labels, model):
         """Convert to tensor"""
         self.data = torch.tensor(data, dtype=torch.float32)
         self.labels = torch.tensor(labels, dtype=torch.int64)
         """ Load  configurations """
         config = helpers.Config()
         cfg = config.from_json("data")
-        self.batch_size = cfg.batch_size
+        if model == "cae":
+            self.batch_size = cfg.cae.batch_size
+        else:
+            self.batch_size = cfg.cgan.batch_size
+
 
     def __len__(self):
         return len(self.data)

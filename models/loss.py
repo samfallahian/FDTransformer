@@ -16,6 +16,7 @@ class CustomLoss(nn.Module):
         self.bec_log = nn.BCEWithLogitsLoss()
         self.bec = nn.BCELoss()
         self.mse = nn.MSELoss()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def cgan_loss(self, generated_label, real_label, generated_data, real_data, is_generator=True):
         if self.cfg_cgan.is_critic:
@@ -58,6 +59,31 @@ class CustomLoss(nn.Module):
         fake_pdf = kde_fake.score_samples(generated)
         wass_distance = wasserstein_distance(real_pdf, fake_pdf)
         return wass_distance
+
+    def compute_gradient_penalty(self,discriminator, real_samples, fake_samples, condition):
+        # Create random interpolates between real and fake samples
+        alpha = torch.rand(real_samples.size(0), 1).to(self.device)
+        alpha = alpha.expand(real_samples.size()).to(self.device)
+        interpolates = alpha * real_samples + (1 - alpha) * fake_samples
+        interpolates = interpolates.to(self.device).requires_grad_(True)
+
+        # Calculate the discriminator output for interpolates with the condition
+        d_interpolates = discriminator(interpolates, condition)
+
+        # Compute gradients of the discriminator output with respect to the interpolates
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones(d_interpolates.size()).to(self.device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        # Compute gradient penalty
+        gradients_norm = gradients.view(gradients.size(0), -1).norm(2, dim=1)
+        gradient_penalty = ((gradients_norm - 1) ** 2).mean()
+        return gradient_penalty
 
     # @staticmethod
     # def kl_divergence(real, generated):

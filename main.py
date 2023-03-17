@@ -2,13 +2,14 @@ from executor import executor_tgan, model_handler, executor_cae
 from data import data_reader, data_loader
 from models import model_cae, model_tgan
 from utils import helpers
+import pandas as pd
 
 def main():
     config = helpers.Config()
     cfg = config.from_json("data")
     data_read = data_reader.DataReader()
     X, y, scalar = data_read.load_standardize_data('wind_forecast_2009')
-    data_load = data_loader.DataModelLoader(X, y)
+    data_load = data_loader.DataModelLoader(X, y, "cgan")
     train_loader = data_load.all_data_loader()
 
     # Creating instance of training class
@@ -23,22 +24,29 @@ def main():
     # model_handeling.save_model(cae_model, "cae_model_final_wind")
 
     """Load CAe saved models for transferring weights"""
-    model = model_cae.CAE()
-    cae_pretrained = model_handeling.load_model(model, "1-cae_model_2_labels_final_wind")
-    cae_pretrained.eval()
-    pretrained_weight = cae_pretrained.decoding.weight.data
+    # model = model_cae.CAE()
+    # cae_pretrained = model_handeling.load_model(model, "2_cae_model_final_wind")
+    # cae_pretrained.eval()
+    # pretrained_weight = cae_pretrained.decoding.weight.data
 
     """CGAN training process"""
     # discriminator_model, generator_model = trained_cgan_model.forward(pretrained_weight)
+    # # discriminator_model, generator_model = trained_cgan_model.forward()
     # model_handeling.save_model(discriminator_model, "discriminator_model")
     # model_handeling.save_model(generator_model, "generator_model")
 
 
     """Generating new data"""
     generator = model_tgan.Generator()
-    load_saved_generator = model_handeling.load_model(generator, "2-2labels_generator_model")
-    generated_data = model_handeling.generate_data(load_saved_generator, 100, scalar)
-    print(generated_data)
+    load_saved_generator = model_handeling.load_model(generator, "5_gen_model")
+    labels = pd.read_csv("dataset/wind_forecast_2009_labels.csv", index_col=False)
+    generated_data = model_handeling.generate_data(load_saved_generator, labels, scalar)
+
+    df_result = pd.DataFrame(generated_data, columns=["time_frame","hrs","farm","u","v","ws","wd"])
+    logger = helpers.Log()
+    logger.save_result(df_result)
+
+    print(df_result.head())
 
 
     pass

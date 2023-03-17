@@ -12,7 +12,7 @@ class Training:
         """ Load training configurations """
         config = helpers.Config()
         self.cfg = config.from_json("training").cgan
-        self.batch_size = config.from_json("data").batch_size
+        self.batch_size = config.from_json("data").cgan.batch_size
         self.logger = helpers.Log(self.cfg.model_file_name)
 
         """ Find if GPU is available"""
@@ -67,18 +67,16 @@ class Training:
         self.df_result = pd.DataFrame(
             columns=["epoch", "dis_loss", "gen_loss", "dis_accuracy", "dis_recall", "dis_precision", "gen_mse", "time"])
 
-    def forward(self,pretrained_weight):
-        print("Weight shape: ", self.generator_model.layers["input_layer"].weight.shape[0])
+    def forward(self, pretrained_weight = None):
         """Set model to training mode"""
         # self.model.train()
         """variables"""
         epochs = self.cfg.epoch
-        with torch.no_grad():
-            # resized_pretrained_weights = pretrained_weight.t().resize(self.generator_model.layers["input_layer"].weight.shape)
 
-            resized_weight = pretrained_weight.t()
-
-            self.generator_model.layers["input_layer"].weight.data.copy_(resized_weight)
+        if self.cfg.is_transferred:
+            with torch.no_grad():
+                resized_weight = pretrained_weight.t()
+                self.generator_model.layers["input_layer"].weight.data.copy_(resized_weight)
 
         for epoch in range(epochs):
             d_loss, g_loss, accuracy, recall, precision, mse = self.train()
@@ -96,7 +94,7 @@ class Training:
                 print("Discriminator Accuracy: {:.2f}%".format(accuracy * 100))
                 print("Discriminator Recall: {:.2f}%".format(recall * 100))
                 print("Discriminator Precision: {:.2f}%".format(precision * 100))
-                print("Genrator Mean Squared Error: {:.3f}".format(mse))
+                print("Genrator Mean Squared Error: {:.4f}".format(mse))
 
         print("--------------------------------------------------------")
         # Saving Results

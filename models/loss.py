@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+import torch.autograd as autograd
 from sklearn.neighbors import KernelDensity
 from scipy.stats import wasserstein_distance
 from utils import helpers
@@ -12,6 +13,7 @@ class CustomLoss(nn.Module):
         super(CustomLoss, self).__init__()
         config = helpers.Config()
         self.cfg_cgan = config.from_json("training").cgan
+        self.cfg_data_cgan = config.from_json("data").cgan
         self.cfg_cae = config.from_json("training").cae
         self.bec_log = nn.BCEWithLogitsLoss()
         self.bec = nn.BCELoss()
@@ -83,6 +85,52 @@ class CustomLoss(nn.Module):
         # Compute gradient penalty
         gradients_norm = gradients.view(gradients.size(0), -1).norm(2, dim=1)
         gradient_penalty = ((gradients_norm - 1) ** 2).mean()
+        return gradient_penalty
+
+    def gradient_penalty(self, discriminator_model, real_data, fake_data, labels):
+        """
+        Calculate the gradient penalty for the Wasserstein GAN.
+
+        Args:
+        - discriminator_model: The Discriminator model
+        - real_data: Real data samples
+        - fake_data: Generated fake data samples
+        - conditions: The conditioning variables
+        - device: The device on which to perform the computation (CPU or GPU)
+
+        Returns:
+        - Gradient penalty
+        """
+
+        # gp_lambda: The gradient penalty weight
+
+        # Generate random epsilon for interpolation
+        epsilon = torch.rand(self.cfg_data_cgan.batch_size, 1, device=self.device)
+        epsilon = epsilon.expand_as(real_data)
+        # epsilon = epsilon.expand(real_data.size()).to(self.device)
+
+        # Interpolate between real and fake data
+        interpolated_data = epsilon * real_data + (1 - epsilon) * fake_data
+        interpolated_data = interpolated_data.to(self.device)
+        interpolated_data.requires_grad_(True)
+
+        # Concatenate interpolated data with conditions
+        # conditions_expanded = conditions.unsqueeze(1).expand(-1, real_data.size(1))
+        conditions_expanded = labels.expand(self.cfg_data_cgan.batch_size, -1)
+
+        # Calculate the discriminator's output for interpolated data
+        d_interpolated_output = discriminator_model(interpolated_data, conditions_expanded)
+
+        # Calculate the gradients of the output with respect to the input data
+        gradients = autograd.grad(outputs=d_interpolated_output, inputs=interpolated_data,
+                                  grad_outputs=torch.ones_like(d_interpolated_output, device=self.device),
+                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+        # Calculate the gradient penalty
+        gradients = gradients.view(self.cfg_data_cgan.batch_size, -1)
+        gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+        gradient_penalty = self.cfg_cgan.gp_lambda * ((gradients_norm - 1) ** 2).mean()
+
         return gradient_penalty
 
     # @staticmethod

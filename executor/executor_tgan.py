@@ -156,7 +156,9 @@ class Training:
                 fake_loss = self.loss_function.cgan_loss(fake_output, fake_labels, fake_data, data,
                                                          is_generator=False)
 
-            disc_loss = (real_loss + fake_loss) / (self.batch_size if self.cfg.scaled_loss == True else 1)
+            # disc_loss = (real_loss + fake_loss) / (self.batch_size if self.cfg.scaled_loss == True else 1)
+            gp_loss = self.loss_function.gradient_penalty(self.discriminator_model,data, fake_data, label)
+            disc_loss = (abs(fake_loss - real_loss) + gp_loss) / (self.batch_size if self.cfg.scaled_loss == True else 1)
             discriminator_loss += disc_loss.item()
             disc_loss.backward(retain_graph=True)
             self.discriminator_optimizer.step()

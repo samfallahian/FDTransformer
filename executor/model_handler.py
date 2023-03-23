@@ -10,6 +10,7 @@ class ModelHandler:
         super(ModelHandler, self).__init__()
         config = helpers.Config()
         self.cfg_cgan = config.from_json("training").cgan
+        self.n_input = config.from_json("model").cgan.generatorUnits[-1]
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def save_model(self, model, file_name):
@@ -21,7 +22,7 @@ class ModelHandler:
         return model.to(self.device)
 
     # def generate_data(self, generator, labels, scalar):
-    #     noise = torch.rand(labels.shape[0], self.cfg_cgan.n_input).to(self.device) * 2 - 1
+    #     noise = torch.rand(labels.shape[0], self.n_input).to(self.device) * 2 - 1
     #     label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
     #     # label_tensor = torch.from_numpy(label).to(self.device).unsqueeze(0)
     #     fake_data = generator(noise, label_tensor)
@@ -31,7 +32,7 @@ class ModelHandler:
 
     # def generate_data(self, generator, labels, scalar):
     #     for i in range(5):
-    #         noise = torch.rand(1, self.cfg_cgan.n_input).to(self.device) * 2 - 1
+    #         noise = torch.rand(1, self.n_input).to(self.device) * 2 - 1
     #         print(labels.to_numpy()[i])
     #         label_tensor = torch.tensor(labels.to_numpy()[i]).to(self.device)
     #         label_tensor = torch.reshape(label_tensor, (1,3))
@@ -44,7 +45,7 @@ class ModelHandler:
     def generate_data(self, generator, labels, scalar):
         generator.eval()
         with torch.no_grad():
-            noise = torch.randn(labels.shape[0], self.cfg_cgan.n_input).to(self.device) * 2 - 1
+            noise = torch.randn(labels.shape[0], self.n_input).to(self.device) * 2 - 1
             label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
             generated_data = generator(noise, label_tensor)
             transformed_generated = scalar.inverse_transform(generated_data.cpu().numpy())

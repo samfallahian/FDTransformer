@@ -14,6 +14,7 @@ class Training:
         self.cfg = config.from_json("training").cgan
         self.batch_size = config.from_json("data").cgan.batch_size
         self.logger = helpers.Log(self.cfg.model_file_name)
+        self.n_input = config.from_json("model").cgan.generatorUnits[-1]
 
         """ Find if GPU is available"""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -124,7 +125,7 @@ class Training:
                 continue
             """ create minibatches of fake data and labels """
             # noise between -1 , 1
-            noise = torch.rand(self.batch_size, self.cfg.n_input).to(self.device) * 2 - 1
+            noise = torch.rand(self.batch_size, self.n_input).to(self.device) * 2 - 1
             fake_labels = torch.zeros(self.batch_size, 1).to(self.device)
             real_labels = torch.ones(self.batch_size, 1).to(self.device)
             # concatenate noise and labels as input to generator

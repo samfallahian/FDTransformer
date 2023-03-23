@@ -3,24 +3,24 @@ CFG = {
         "data_path": "dataset/",
         "generation_no": 100,
         "cgan": {
-            "batch_size": 512
+            "batch_size": 2048
         },
         "cae": {
             "batch_size": 128},
     },
     "model": {
-        "cgan": {"generatorUnits": [7, 64, 64, 4],
-                 "discriminatorUnits": [7, 64, 64, 1],
+        "cgan": {"generatorUnits": [11, 64, 64, 9],
+                 "discriminatorUnits": [11, 64, 64, 1],
                  "negative_slope": 0.2,
                  "dropout": 0.3},
-        "cae": {"autoencoderUnits": [7, 64, 4, 64, 7],
+        "cae": {"autoencoderUnits": [11, 64, 4, 64, 11],
                 "dropout": 0.2}
     },
     "training": {
         "cgan": {
             "model_file_name": "cgan",
             "lr": 0.001,
-            "epoch": 100,
+            "epoch": 50,
             "scaled_loss": False,
             "optimizer": "Adam",
             "weight_decay": 0.001,

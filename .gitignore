@@ -131,3 +131,5 @@ dmypy.json
 .idea
 
 temp
+
+dataset/3p6.pkl

@@ -9,7 +9,7 @@ def main():
     config = helpers.Config()
     cfg = config.from_json("data")
     data_read = data_reader.DataReader()
-    X, y, scalar = data_read.load_standardize_data('wind_forecast_2009')
+    X, y, scalar = data_read.load_standardize_data('3p6-relative')
     data_load = data_loader.DataModelLoader(X, y, "cgan")
     train_loader = data_load.all_data_loader()
 
@@ -26,7 +26,7 @@ def main():
 
     """Load CAe saved models for transferring weights"""
     model = model_cae.CAE()
-    cae_pretrained = model_handeling.load_model(model, "2_cae_model_final_wind")
+    cae_pretrained = model_handeling.load_model(model, "4_cae_model_ptv_without")
     cae_pretrained.eval()
     pretrained_weight = cae_pretrained.decoding.weight.data
 

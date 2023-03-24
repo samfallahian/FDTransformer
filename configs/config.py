@@ -6,21 +6,21 @@ CFG = {
             "batch_size": 2048
         },
         "cae": {
-            "batch_size": 128},
+            "batch_size": 512},
     },
     "model": {
-        "cgan": {"generatorUnits": [11, 64, 64, 9],
-                 "discriminatorUnits": [11, 64, 64, 1],
+        "cgan": {"generatorUnits": [8, 64, 64, 6],
+                 "discriminatorUnits": [8, 64, 64, 1],
                  "negative_slope": 0.2,
                  "dropout": 0.3},
-        "cae": {"autoencoderUnits": [11, 64, 4, 64, 11],
+        "cae": {"autoencoderUnits": [8, 64, 4, 64, 8],
                 "dropout": 0.2}
     },
     "training": {
         "cgan": {
             "model_file_name": "cgan",
             "lr": 0.001,
-            "epoch": 50,
+            "epoch": 40,
             "scaled_loss": False,
             "optimizer": "Adam",
             "weight_decay": 0.001,

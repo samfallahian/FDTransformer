@@ -25,26 +25,28 @@ def main():
     # model_handeling.save_model(cae_model, "cae_model_final_wind")
 
     """Load CAe saved models for transferring weights"""
-    model = model_cae.CAE()
-    cae_pretrained = model_handeling.load_model(model, "4_cae_model_ptv_without")
-    cae_pretrained.eval()
-    pretrained_weight = cae_pretrained.decoding.weight.data
+    # model = model_cae.CAE()
+    # cae_pretrained = model_handeling.load_model(model, "4_cae_model_ptv_without")
+    # cae_pretrained.eval()
+    # pretrained_weight = cae_pretrained.decoding.weight.data
 
     """CGAN training process"""
-    discriminator_model, generator_model = trained_cgan_model.forward(pretrained_weight)
-    # discriminator_model, generator_model = trained_cgan_model.forward()
-    model_handeling.save_model(discriminator_model, "discriminator_model")
-    model_handeling.save_model(generator_model, "generator_model")
+    # discriminator_model, generator_model = trained_cgan_model.forward(pretrained_weight)
+    # # discriminator_model, generator_model = trained_cgan_model.forward()
+    # model_handeling.save_model(discriminator_model, "discriminator_model")
+    # model_handeling.save_model(generator_model, "generator_model")
 
     """Generating new data"""
-    # generator = model_tgan.Generator()
-    # load_saved_generator = model_handeling.load_model(generator, "5_gen_model")
+    generator = model_tgan.Generator()
+    load_saved_generator = model_handeling.load_model(generator, "7_gen_ptv_without")
     # labels = pd.read_csv("dataset/wind_forecast_2009_labels.csv", index_col=False)
-    # generated_data = model_handeling.generate_data(load_saved_generator, labels, scalar)
+    labels = pd.read_pickle("dataset/3p6-relative_labels.pkl", compression="zip")
+    generated_data = model_handeling.generate_data(load_saved_generator, labels, scalar)
     # df_result = pd.DataFrame(generated_data, columns=["time_frame", "hrs", "farm", "u", "v", "ws", "wd"])
-    # logger = helpers.Log()
-    # logger.save_result(df_result)
-    # print(df_result.head())
+    df_result = pd.DataFrame(generated_data, columns=['time', 'distance', 'vx', 'vy', 'vz', 'px', 'py', 'pz'])
+    logger = helpers.Log()
+    logger.save_result(df_result)
+    print(df_result.head())
     pass
 
 

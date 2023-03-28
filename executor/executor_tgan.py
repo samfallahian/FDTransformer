@@ -17,7 +17,7 @@ class Training:
         self.n_input = config.from_json("model").cgan.generatorUnits[-1]
 
         """ Find if GPU is available"""
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "mps")
         print("device: ", self.device)
 
         """ Load model configurations """

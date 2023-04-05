@@ -22,15 +22,6 @@ class ModelHandler:
         return model.to(self.device)
 
     # def generate_data(self, generator, labels, scalar):
-    #     noise = torch.rand(labels.shape[0], self.n_input).to(self.device) * 2 - 1
-    #     label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
-    #     # label_tensor = torch.from_numpy(label).to(self.device).unsqueeze(0)
-    #     fake_data = generator(noise, label_tensor)
-    #     # result = torch.cat((label_tensor, scalar.inverse_transform(fake_data.detach())),1)
-    #     return scalar.inverse_transform(fake_data.detach().cpu())
-    #     # return result
-
-    # def generate_data(self, generator, labels, scalar):
     #     for i in range(5):
     #         noise = torch.rand(1, self.n_input).to(self.device) * 2 - 1
     #         print(labels.to_numpy()[i])
@@ -40,15 +31,24 @@ class ModelHandler:
     #         # print(fake_data)
     #
     #     pass
-        # return scalar.inverse_transform(fake_data.detach().cpu())
+    # return scalar.inverse_transform(fake_data.detach().cpu())
+
+    # def generate_data(self, generator, labels, scalar):
+    #     generator.eval()
+    #     with torch.no_grad():
+    #         noise = torch.randn(labels.shape[0], self.n_input, dtype=torch.float32).to(self.device) * 2 - 1
+    #         label_tensor = torch.tensor(labels.to_numpy(), dtype=torch.float32).to(self.device)
+    #         generated_data = generator(noise, label_tensor)
+    #         transformed_generated = scalar.inverse_transform(generated_data.cpu().numpy())
+    #         result = torch.cat((label_tensor, torch.tensor(transformed_generated).to(self.device)), dim=1)
+    #     return result.detach().cpu().numpy()
 
     def generate_data(self, generator, labels, scalar):
         generator.eval()
         with torch.no_grad():
-            noise = torch.randn(labels.shape[0], self.n_input).to(self.device) * 2 - 1
-            label_tensor = torch.tensor(labels.to_numpy()).to(self.device)
+            noise = torch.randn(labels.shape[0], self.n_input, dtype=torch.float32).to(self.device) * 2 - 1
+            label_tensor = torch.tensor(labels.to_numpy(), dtype=torch.float32).to(self.device)
             generated_data = generator(noise, label_tensor)
-            transformed_generated = scalar.inverse_transform(generated_data.cpu().numpy())
-            result = torch.cat((label_tensor, torch.tensor(transformed_generated).to(self.device)), dim=1)
-
+            # transformed_generated = scalar.inverse_transform(generated_data.cpu().numpy())
+            result = torch.cat((label_tensor, generated_data), dim=1)
         return result.detach().cpu().numpy()

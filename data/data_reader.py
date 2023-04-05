@@ -16,13 +16,26 @@ class DataReader:
         """ Read input file """
         ### PTV DATA
         df = pd.read_pickle(self.path + file_name + ".pkl", compression="zip")
-        labels = df.drop(df.columns.difference(["time", "distance"]), axis=1).to_numpy()
-        data = df.drop(["time", "distance"], axis=1).to_numpy()
+        labels = df.drop(df.columns.difference(["x", "y", "z", "time"]), axis=1).to_numpy()
+        data = df.drop(["x", "y", "z", "time"], axis=1).to_numpy()
 
         ### Wind data
         # df = pd.read_csv(self.path + file_name + ".csv")
         # labels = df.drop(df.columns.difference(["time_frame", "hrs", "farm"]), axis=1).to_numpy()
         # data = df.drop(["time_frame", "hrs", "farm", "date"], axis=1).to_numpy()
+
+        """ Standardize data """
+        scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
+        # labels = scalar.fit_transform(labels)
+        data = scalar.fit_transform(data)
+        return data, labels, scalar
+
+    def load_standardize_data_test(self, file_name):
+        """ Read input file """
+        ### PTV DATA
+        df = pd.read_pickle(self.path + file_name + ".pkl", compression="zip")
+        labels = df.drop(df.columns.difference(["x", "y", "z", "time"]), axis=1).to_numpy()
+        data = df.drop(["x", "y", "z", "time"], axis=1).to_numpy()
 
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))

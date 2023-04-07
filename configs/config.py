@@ -9,11 +9,11 @@ CFG = {
             "batch_size": 512},
     },
     "model": {
-        "cgan": {"generatorUnits": [8, 64, 64, 6],
-                 "discriminatorUnits": [8, 64, 64, 1],
+        "cgan": {"generatorUnits": [11, 64, 64, 7],
+                 "discriminatorUnits": [11, 64, 64, 1],
                  "negative_slope": 0.2,
                  "dropout": 0.3},
-        "cae": {"autoencoderUnits": [8, 64, 4, 64, 8],
+        "cae": {"autoencoderUnits": [11, 64, 4, 64, 11],
                 "dropout": 0.2}
     },
     "training": {
@@ -26,7 +26,6 @@ CFG = {
             "weight_decay": 0.001,
             "has_lr_decay": True,
             "lr_decay_gamma": 0.8,
-            "n_input": 4,
             "kd_band_width": 5,
             "optim_beta_min": 0.5,
             "optim_beta_max": 0.999,

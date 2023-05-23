@@ -26,7 +26,7 @@ class DataReader:
 
         """ Standardize data """
         scalar = preprocessing.MinMaxScaler(feature_range=(-1, 1))
-        # labels = scalar.fit_transform(labels)
+        labels = scalar.fit_transform(labels)
         data = scalar.fit_transform(data)
         return data, labels, scalar
 

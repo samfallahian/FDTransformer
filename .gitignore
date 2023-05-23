@@ -139,3 +139,5 @@ dataset/3p6.pkl
 /dataset/3p6_with_normalized_values.json
 
 playground/data
+
+wandb

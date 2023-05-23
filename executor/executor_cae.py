@@ -3,6 +3,7 @@ from models import model_cae, loss
 from utils import helpers
 from datetime import datetime
 import pandas as pd
+import wandb
 
 
 class Training:
@@ -46,6 +47,15 @@ class Training:
             columns=["epoch", "total_loss", "mse", "time"])
 
     def forward(self):
+
+        # start a new wandb run to track this script
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="cgan",
+
+            # track hyperparameters and run metadata
+            config=self.cfg
+        )
         """Set model to training mode"""
         # self.model.train()
         """variables"""
@@ -56,6 +66,7 @@ class Training:
             self.df_result.loc[len(self.df_result.index)] = [epoch + 1, round(loss, 4), round(mse_loss, 4),
                                                              datetime.now().strftime("%m/%d/%Y, %H:%M:%S")]
 
+            wandb.log({"MSE": mse_loss, "loss": loss})
             if (epoch + 1) % 2 == 0:
                 print("--------------------------------------------------------")
                 print(f"Epoch {epoch + 1}: ")

@@ -19,90 +19,42 @@ df = pd.read_pickle('/Users/kkreth/PycharmProjects/cgan/dataset/3p6_with_normali
 latent_size = 10
 
 
-# Define the encoder architecture
-class Encoder(nn.Module):
-    def __init__(self):
-        super(Encoder, self).__init__()
-        self.conv1 = nn.Conv1d(3, 16, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(16, 32, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(125 * 64, latent_size)
-
-    def forward(self, x):
-        x = nn.functional.relu(self.conv1(x))
-        x = nn.functional.relu(self.conv2(x))
-        x = nn.functional.relu(self.conv3(x))
-        x = self.flatten(x)
-        x = self.fc1(x)
-        return x
-
-
-# Define the decoder architecture
-class Decoder(nn.Module):
-    def __init__(self):
-        super(Decoder, self).__init__()
-        self.fc1 = nn.Linear(latent_size, 125 * 64)
-        self.unflatten = nn.Unflatten(1, (64, 125))
-        self.conv1 = nn.Conv1d(64, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(32, 16, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv1d(16, 3, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.unflatten(x)
-        x = nn.functional.relu(self.conv1(x))
-        x = nn.functional.relu(self.conv2(x))
-        x = nn.functional.relu(self.conv3(x))
-        return x
-
-
-# Define the autoencoder architecture
 class Autoencoder(nn.Module):
     def __init__(self):
         super(Autoencoder, self).__init__()
-        self.encoder = Encoder()
-        self.decoder = Decoder()
+        # Encoder layers
+        self.encoder = nn.Sequential(
+            nn.Linear(375, 200),
+            nn.ReLU(),
+            nn.Linear(200, 100),
+            nn.ReLU(),
+            nn.Linear(100, 50),
+            nn.ReLU(),
+            nn.Linear(50, 10),
+            nn.ReLU()
+        )
+        # Decoder layers
+        self.decoder = nn.Sequential(
+            nn.Linear(10, 50),
+            nn.ReLU(),
+            nn.Linear(50, 100),
+            nn.ReLU(),
+            nn.Linear(100, 200),
+            nn.ReLU(),
+            nn.Linear(200, 375),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = self.encoder(x)
-        x = self.decoder(x)
-        return x
-
-
-# Define the training loop
-def train(model, data_loader, num_epochs, learning_rate, device):
-    # Set up the loss function and optimizer
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-    # Move the model to the device
-    model = model.to(device)
-
-    # Train the model for the specified number of epochs
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        for data in data_loader:
-            # Move the data to the device
-            #Clearly pretty dangerous
-            #TODO Find out what a list was even here to begin with
-            data = data[0].to(device)
-            # Zero the parameter gradients
-            optimizer.zero_grad()
-            # Forward pass
-            outputs = model(data)
-            loss = criterion(outputs, data)
-            # Backward pass and optimization
-            loss.backward()
-            optimizer.step()
-            # Update the running loss
-            running_loss += loss.item()
-        # Print the epoch loss
-        epoch_loss = running_loss / len(data_loader)
-        print("Epoch {} loss: {:.4f}".format(epoch + 1, epoch_loss))
-        # Save the model every 100 epochs
-        if (epoch + 1) % 100 == 0:
-            model.save("model_epoch{}.pt".format(epoch + 1))
+        # Flatten the input tensor
+        x = x.view(-1, 375)
+        # Encode the input tensor
+        encoded = self.encoder(x)
+        # Decode the encoded tensor
+        decoded = self.decoder(encoded)
+        # Reshape the decoded tensor to match the original input shape
+        decoded = decoded.view(-1, 1, 375)
+        return decoded
 
 # Define a sample input tensor
 
@@ -298,17 +250,21 @@ while True:
         input_tensor = torch.tensor(result[['vx_norm','vy_norm','vz_norm']].values)
         print("input tensor shape:")
         print(input_tensor.shape)
-        #input_tensor = input_tensor.reshape(1, 375)
+        input_tensor = input_tensor.reshape(1, 375)
         print("NEW input tensor shape:")
         print(input_tensor.shape)
         dataset = TensorDataset(input_tensor)
 
         data_loader = DataLoader(dataset, batch_size=1)
 
+        # Create a new instance of the autoencoder
+        autoencoder = Autoencoder()
 
+        # Encode the input tensor
+        encoded_tensor = autoencoder.encoder(input_tensor)#data_loader)
 
-        # Train one epoch of the autoencoder
-        train(autoencoder, data_loader, num_epochs=1, learning_rate=0.001, device='mps')
+        # Print the shape of the encoded tensor
+        print(encoded_tensor.shape)
 
         print("result df length is: ")
         print(len(result))
@@ -320,7 +276,7 @@ while True:
         with_error += 1
         print(e)
     # Break out of the loop after a certain number of iterations
-    if with_error + without_error == 10:
+    if with_error + without_error == 100:
         break
 
 # Print the final counts of iterations with and without errors

@@ -64,4 +64,7 @@ Max values: tensor([2.6400, 2.2000, 1.1000], device='cuda:0', dtype=torch.float6
 For the above, that should be for roughly 60M rows per file. ~10 files, so 600M rows.
 There are 3 values per row, so 1.8B rows were scanned approximatly. 
 
+High of 2.6400
+Low of -1.9800
+
 '''

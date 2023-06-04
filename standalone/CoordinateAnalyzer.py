@@ -23,10 +23,13 @@ class CoordinateAnalyzer:
             (self.dataframe['z'].isin(z_values[z_range]))
             ]
 
-        if (selected_rows.shape[0]) != 125:
+        if selected_rows.shape[0] != 125:
             raise Exception("Failed to find 125 nearest values. Instead, we only found " + str(len(selected_rows)))
 
-        return selected_rows
+        # Sort the selected rows based on x, y, and z values
+        sorted_rows = selected_rows.sort_values(by=['x', 'y', 'z'])
+
+        return sorted_rows
 
     def get_all_combinations(self):
         unique_xyz = self.dataframe[['x', 'y', 'z']].drop_duplicates()

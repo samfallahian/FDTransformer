@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 class CoordinateAnalyzer:
     def __init__(self, dataframe):
@@ -28,6 +29,14 @@ class CoordinateAnalyzer:
 
         # Sort the selected rows based on x, y, and z values
         sorted_rows = selected_rows.sort_values(by=['x', 'y', 'z'])
+
+        # Convert `vx`, `vy`, and `vz` to 16-bit floats
+        sorted_rows['vx'] = sorted_rows['vx'].astype(np.float16)
+        sorted_rows['vy'] = sorted_rows['vy'].astype(np.float16)
+        sorted_rows['vz'] = sorted_rows['vz'].astype(np.float16)
+
+        # Convert `distance` to uint8
+        sorted_rows['distance'] = sorted_rows['distance'].astype(np.uint8)
 
         return sorted_rows
 

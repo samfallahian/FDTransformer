@@ -2,6 +2,7 @@ import os
 import pickle
 
 from CoordinateAnalyzer import CoordinateAnalyzer
+from standalone import TransformLatent
 
 '''
 OK, at least for the file: /Users/kkreth/PycharmProjects/cgan/dataset/3p6
@@ -99,5 +100,13 @@ analyzer = CoordinateAnalyzer(df_subset)
 result = analyzer.get_nearest_values(arandomx, arandomy, arandomz)
 #also_result = analyzer.get_all_combinations()
 
+print("The size of the resulting array:")
 print(len(result))
+
+result_vxVYvz = result.loc[:, ['vx', 'vy', 'vz']]
+
+converter = TransformLatent.FloatConverter()
+converted_values = converter.convert(result_vxVYvz)
+
+
 

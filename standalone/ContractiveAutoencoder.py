@@ -6,7 +6,8 @@ class ContractiveAutoencoder(nn.Module):
         super(ContractiveAutoencoder, self).__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_size, latent_size),
-            nn.ReLU()
+            nn.ReLU(),
+            nn.Dropout(0.1)
         )
         self.decoder = nn.Sequential(
             nn.Linear(latent_size, input_size),

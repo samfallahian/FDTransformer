@@ -28,8 +28,8 @@ class Driver:
         self.scaler = GradScaler()  # For mixed precision training
         self.train_data, self.val_data = self.split_data(self.data)
         self.epochs = 10000
-        self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=1, shuffle=True)  # data loader for training set
-        self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=1, shuffle=True)  # data loader for validation set
+        self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=1000, shuffle=True)  # data loader for training set
+        self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=1000, shuffle=True)  # data loader for validation set
         self.model.to(self.device)
         print("Model moved to the selected device.")
 
@@ -59,9 +59,9 @@ class Driver:
                 running_loss += loss.item()
                 running_error += torch.mean((outputs - batch) ** 2).item()
                 if i % 1000 == 9:  # print every 10 mini-batches
-                    print('[%d, %5d] loss: %.3f' %
+                    print('[%d, %5d] loss: %.8f' %
                           (epoch + 1, i + 1, running_loss / 1000))
-                    print('[%d, %5d] error: %.3f' %
+                    print('[%d, %5d] error: %.8f' %
                           (epoch + 1, i + 1, running_error / 1000))
                     running_loss = 0.0
                     running_error = 0.0

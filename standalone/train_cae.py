@@ -1,97 +1,84 @@
-import torch
-import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
 import pickle
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler  # For mixed precision training
 from ContractiveAutoencoder import ContractiveAutoencoder
-device = torch.device("mps:0")
-
-
-class MyDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, index):
-        item = self.data[index]
-        item = item.reshape(-1).float()  # Flatten and convert to 32-bit float
-        return item
-
-
-# Define your ContractiveAutoencoder class here (including the model architecture and training-related methods)
-
-# Define the path to your data file
-data_file = '_data_train_autoencoder_flat.pickle'
-
-# Load the data from the pickle file
-with open(data_file, 'rb') as f:
-    data = pickle.load(f)
-
-# Print shapes of the first few tensors
-for i, tensor in enumerate(data[:5]):
-    print(f"Tensor {i}: shape {tensor.shape}")
-
-# Create a dataset and data loader
-dataset = MyDataset(data)
-
-
-def collate_fn(batch):
-    data = [item.to(device) for item in batch]  # Move each tensor to the target device
-    data = torch.stack(data, dim=0)  # Now all tensors are on the same device
-    return data
 
 
 
 
+class Driver:
+    def split_data(self, data, split_ratio=0.8):
+        train_len = int(len(data) * split_ratio)
+        val_len = len(data) - train_len
+        train_data, val_data = random_split(data, [train_len, val_len])
+        return train_data, val_data
+    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=32, lr=0.001):
+        self.model = model
+        print("Model initialized.")
+        self.device = device
+        self.data = pickle.load(open(data_path, "rb"))
+        print(f"Data loaded. Total samples: {len(self.data)}")
 
-# Set up the training parameters
-num_epochs = 1000
-save_interval = 10
-print_interval = 1
-learning_rate = 0.001
+        self.batch_size = batch_size
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.scaler = GradScaler()  # For mixed precision training
+        self.train_data, self.val_data = self.split_data(self.data)
+        self.epochs = 10000
+        self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=1, shuffle=True)  # data loader for training set
+        self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=1, shuffle=True)  # data loader for validation set
+        self.model.to(self.device)
+        print("Model moved to the selected device.")
 
-# Initialize the contractive autoencoder
-input_size = 375
-hidden_size = 64
-batch_size = 64
-contraction_coefficient = 1e-3
-autoencoder = ContractiveAutoencoder(input_size, hidden_size, contraction_coefficient)
-autoencoder = autoencoder.to(device)
+    def train(self):
+        # Use automatic mixed precision if available
+        scaler = torch.cuda.amp.GradScaler(enabled=self.device == 'cuda')
 
-dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+        for epoch in range(self.epochs):
+            running_loss = 0.0
+            running_error = 0.0
+            for i, batch in enumerate(self.train_loader, 0):
+                # Ensure the data is float
+                batch = batch.float().to(self.device)
 
-# Define the optimizer
-optimizer = optim.Adam(autoencoder.parameters(), lr=learning_rate)
+                # zero the parameter gradients
+                self.optimizer.zero_grad()
 
-# Training loop
-total_steps = 0
-for epoch in range(num_epochs):
-    for i, data_batch in enumerate(dataloader):
-        #data_batch = data_batch.reshape(data.size(0), -1)
-        #data_batch = data_batch.reshape(data_batch.size(0), -1)
-        #data_batch = data_batch.reshape(375)
-        # Forward pass
-        encoded, decoded = autoencoder(data_batch)
+                # forward + backward + optimize with automatic mixed precision
+                with torch.cuda.amp.autocast(enabled=self.device == 'cuda'):
+                    outputs, encoded = self.model(batch)
+                    loss = self.model.loss_function(batch, outputs, encoded)
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
 
-        # Calculate the loss
-        loss = autoencoder.loss_function(data_batch, decoded, encoded)
+                # print statistics
+                running_loss += loss.item()
+                running_error += torch.mean((outputs - batch) ** 2).item()
+                if i % 1000 == 9:  # print every 10 mini-batches
+                    print('[%d, %5d] loss: %.3f' %
+                          (epoch + 1, i + 1, running_loss / 1000))
+                    print('[%d, %5d] error: %.3f' %
+                          (epoch + 1, i + 1, running_error / 1000))
+                    running_loss = 0.0
+                    running_error = 0.0
 
-        # Backward pass and optimization step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # save model every 10 epochs
+            if epoch % 1000 == 9:
+                torch.save(self.model.state_dict(), f'model_epoch_{epoch + 1}.pth')
+        print('Finished Training')
 
-        total_steps += 1
 
-    # Print the loss and error every print_interval epochs
-    if (epoch + 1) % print_interval == 0:
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item()}")
+if __name__ == "__main__":
+    # Define your model
+    model = ContractiveAutoencoder(input_size=375, latent_size=17)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    device = torch.device("cpu")
+    # Create the driver
+    driver = Driver(data_path="_data_train_autoencoder_flat.pickle", device=device, model=model)
 
-    # Save the model every save_interval epochs
-    if (epoch + 1) % save_interval == 0:
-        torch.save(autoencoder.state_dict(), f'autoencoder_epoch_{epoch + 1}.pt')
-
-# Save the final model
-torch.save(autoencoder.state_dict(), 'autoencoder_final.pt')
+    # Start training
+    driver.train()

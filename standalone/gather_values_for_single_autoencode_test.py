@@ -1,6 +1,8 @@
 import os
 import pickle
 
+import torch
+
 from CoordinateAnalyzer import CoordinateAnalyzer
 from standalone import TransformLatent
 
@@ -55,58 +57,99 @@ the below is for z iterable
 
 '''
 
-#TODO Make these not hard-coded if this works at all
-x_bound_lower = -113
-x_bound_upper = 113
-y_bound_lower = -72
-y_bound_upper = 75
-z_bound_lower = -21
-z_bound_upper = 22
+# Set the desired number of iterations
+num_iterations = 2_000_000
+
+# Loop for the desired number of iterations
+for iteration in range(num_iterations):
+
+    #TODO Make these not hard-coded if this works at all
+    x_bound_lower = -113
+    x_bound_upper = 113
+    y_bound_lower = -72
+    y_bound_upper = 75
+    z_bound_lower = -21
+    z_bound_upper = 22
 
 
-#First read in the data
-import pandas as pd
-import numpy as np
-### PTV DATA
+    #First read in the data
+    import pandas as pd
+    import numpy as np
+    ### PTV DATA
 
-# Check if pickle file exists
-pickle_file = 'df_subset.pickle'
-if os.path.exists(pickle_file):
-    with open(pickle_file, 'rb') as f:
-        df_subset = pickle.load(f)
-else:
-    exit()
-
-
-randomSingleton = df_subset.sample()
-# Subset the DataFrame based on the target values
-target_x = -85
-target_y = -68
-target_z = -17
-randomSingleton = df_subset[(df_subset['x'] == target_x) & (df_subset['y'] == target_y) & (df_subset['z'] == target_z)]
-randomTimeHappenedToB = randomSingleton.time
+    # Check if pickle file exists
+    pickle_file = 'df_subset.pickle'
+    if os.path.exists(pickle_file):
+        with open(pickle_file, 'rb') as f:
+            df_subset = pickle.load(f)
+    else:
+        exit()
 
 
+    randomSingleton = df_subset.sample()
+    # Subset the DataFrame based on the target values
+    target_x = -85
+    target_y = -68
+    target_z = -17
+    randomSingleton = df_subset[(df_subset['x'] == target_x) & (df_subset['y'] == target_y) & (df_subset['z'] == target_z)]
+    randomTimeHappenedToB = randomSingleton.time
 
-randomx = randomSingleton.x
-randomy = randomSingleton.y
-randomz = randomSingleton.z
-arandomx = randomx.iloc[0]
-arandomy = randomy.iloc[0]
-arandomz = randomz.iloc[0]
 
 
-analyzer = CoordinateAnalyzer(df_subset)
-result = analyzer.get_nearest_values(arandomx, arandomy, arandomz)
-#also_result = analyzer.get_all_combinations()
+    randomx = randomSingleton.x
+    randomy = randomSingleton.y
+    randomz = randomSingleton.z
+    arandomx = randomx.iloc[0]
+    arandomy = randomy.iloc[0]
+    arandomz = randomz.iloc[0]
 
-print("The size of the resulting array:")
-print(len(result))
 
-result_vxVYvz = result.loc[:, ['vx', 'vy', 'vz']]
+    analyzer = CoordinateAnalyzer(df_subset)
+    result = analyzer.get_nearest_values(arandomx, arandomy, arandomz)
+    #also_result = analyzer.get_all_combinations()
 
-converter = TransformLatent.FloatConverter()
-converted_values = converter.convert(result_vxVYvz)
+ #   print("The size of the resulting array:")
+ #   print(len(result))
+
+    result_vxVYvz = result.loc[:, ['vx', 'vy', 'vz']]
+
+    converter = TransformLatent.FloatConverter()
+    converted_values = converter.convert(result_vxVYvz)
+
+    # Convert result_vxVYvz DataFrame to a NumPy array
+    converted_values = result_vxVYvz.to_numpy()
+
+    # Reshape converted_values to [1, 125, 3]
+    converted_values_tensor = torch.from_numpy(converted_values).unsqueeze(0)
+
+    pickle_file = '_data_train_autoencoder.pickle'
+
+    # Check if the pickle file exists
+    if os.path.exists(pickle_file):
+        # Load existing data from the pickle file
+        with open(pickle_file, 'rb') as f:
+            existing_data = pickle.load(f)
+    else:
+        # Create a new empty list for data
+        existing_data = []
+
+    # Append the converted_values_tensor to the existing_data list
+    existing_data.append(converted_values_tensor)
+
+    # Check if the number of entries in the pickle file reaches 2 million
+    if len(existing_data) >= 2_000_000:
+        print("Reached 2 million entries. Stopping the code.")
+        # You can add any necessary code here to handle the stopping condition
+        # For example, you might want to break out of a loop or return from a function
+    # Check if the number of entries in the pickle file reaches a multiple of 100
+    if len(existing_data) % 100 == 0:
+        print(f"Progress: {len(existing_data)} entries reached")
+
+
+
+# Save the updated data by appending to the existing file
+with open(pickle_file, 'ab') as f:
+    pickle.dump(existing_data, f)
 
 
 

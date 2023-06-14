@@ -11,7 +11,7 @@ def create_json_object(driver_source, model_source, std_out):
                 "driver_source": driver_source,
                 "model_source": model_source,
                 "std_out": std_out,
-                "query": "Please modify this code to use wandb.ai, calling this project ConvolutionalAEv1 and track all hyperparameters."
+                "query": "Given this context, why is there this error on std_out?"
             }
         ]
     }

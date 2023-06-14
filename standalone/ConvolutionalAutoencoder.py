@@ -1,7 +1,6 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class ConvolutionalAutoencoder(nn.Module):
     def __init__(self):
         super(ConvolutionalAutoencoder, self).__init__()

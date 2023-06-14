@@ -7,6 +7,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tensorflow import keras
 import wandb
 from wandb.keras import WandbCallback
+import os
 
 from ConvolutionalAutoencoder import ConvolutionalAutoencoder
 
@@ -31,8 +32,8 @@ class Train_Conv:
         train_data, val_data = random_split(data, [train_len, val_len])
         return train_data, val_data
 
-    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=1000, lr=0.0001):
-        wandb.init(project='ConvolutionalAEv1')
+    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=1000, lr=0.00001):
+        wandb.init(project='ConvolutionalAEv2')
         config = wandb.config
         config.batch_size = batch_size
         config.lr = lr
@@ -50,6 +51,9 @@ class Train_Conv:
         self.epochs = 10000
         self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=self.batch_size, shuffle=True)
         self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=self.batch_size, shuffle=False)
+        self.save_interval = 100  # Save the model every 100 epochs
+        self.save_directory = "saved_models"  # Directory to save the models
+        os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
 
     def train(self):
         train_loss = []
@@ -104,6 +108,12 @@ class Train_Conv:
             if epoch % 100 == 99:
                 print(f"Validation Loss: {running_val_loss / len(self.val_loader)} "
                       f"Validation Error: {running_val_error / len(self.val_loader)}")
+
+            # Save the model every 100 epochs
+            if epoch % self.save_interval == 0:
+                model_path = os.path.join(self.save_directory, f"model_epoch_{epoch}.pt")
+                torch.save(self.model.state_dict(), model_path)
+                print(f"Model saved at {model_path}")
 
         print('Finished Training')
         return train_loss, val_loss

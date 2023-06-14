@@ -1,0 +1,115 @@
+import torch.optim as optim
+import pickle
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, random_split
+from torch.cuda.amp import autocast, GradScaler
+import wandb
+from wandb.keras import WandbCallback
+
+from ConvolutionalAutoencoder import ConvolutionalAutoencoder
+
+
+class CustomDataset(torch.utils.data.Dataset):
+    def __init__(self, data):
+        self.data = data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        sample = self.data[idx]
+        sample = sample.view(3, 125)
+        return sample
+
+
+class Train_Conv:
+    def split_data(self, data, split_ratio=0.8):
+        train_len = int(len(data) * split_ratio)
+        val_len = len(data) - train_len
+        train_data, val_data = random_split(data, [train_len, val_len])
+        return train_data, val_data
+
+    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=1000, lr=0.0001):
+        wandb.init(project='ConvolutionalAEv1')
+        config = wandb.config
+        config.batch_size = batch_size
+        config.lr = lr
+
+        self.model = model
+        print("Model initialized.")
+        self.device = device
+        self.data = CustomDataset(pickle.load(open(data_path, "rb")))
+        print(f"Data loaded. Total samples: {len(self.data)}")
+
+        self.batch_size = batch_size
+        self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
+        self.scaler = GradScaler()  # For mixed precision training
+        self.train_data, self.val_data = self.split_data(self.data)
+        self.epochs = 10000
+        self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=self.batch_size, shuffle=True)
+        self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=self.batch_size, shuffle=False)
+
+    def train(self):
+        train_loss = []
+        val_loss = []
+
+        for epoch in range(self.epochs):
+            self.model.train()
+            running_loss = 0.0
+            running_error = 0.0
+
+            for i, data in enumerate(self.train_loader):
+                inputs = data.float().to(self.device)
+                self.optimizer.zero_grad()
+
+                with autocast():
+                    outputs = self.model(inputs)
+                    loss = self.model.loss_function(inputs, outputs)
+
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+                running_loss += loss.item()
+                # Placeholder error calculation
+                running_error += torch.mean(torch.abs(inputs - outputs)).item()
+
+            wandb.log({"loss": running_loss / 1000, "error": running_error / 1000})
+
+            if epoch % 100 == 99:
+                print(f"Epoch: {epoch + 1} Loss: {running_loss / 1000} Error: {running_error / 1000}")
+
+            train_loss.append(running_loss / 1000)
+
+            # Validation
+            self.model.eval()
+            running_val_loss = 0.0
+            running_val_error = 0.0
+
+            with torch.no_grad():
+                for i, data in enumerate(self.val_loader):
+                    inputs = data.float().to(self.device)
+                    outputs = self.model(inputs)
+                    loss = self.model.loss_function(inputs, outputs)
+                    running_val_loss += loss.item()
+                    # Placeholder error calculation
+                    running_val_error += torch.mean(torch.abs(inputs - outputs)).item()
+
+            val_loss.append(running_val_loss / len(self.val_loader))
+            wandb.log({"val_loss": running_val_loss / len(self.val_loader),
+                       "val_error": running_val_error / len(self.val_loader)})
+
+            if epoch % 100 == 99:
+                print(f"Validation Loss: {running_val_loss / len(self.val_loader)} "
+                      f"Validation Error: {running_val_error / len(self.val_loader)}")
+
+        print('Finished Training')
+        return train_loss, val_loss
+
+
+if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    model = ConvolutionalAutoencoder().to(device)
+    trainer = Train_Conv(model, device)
+    train_loss, val_loss = trainer.train()

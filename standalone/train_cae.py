@@ -15,7 +15,7 @@ class Driver:
         val_len = len(data) - train_len
         train_data, val_data = random_split(data, [train_len, val_len])
         return train_data, val_data
-    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=32, lr=0.001):
+    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=10000, lr=0.0001):
         self.model = model
         print("Model initialized.")
         self.device = device
@@ -23,7 +23,7 @@ class Driver:
         print(f"Data loaded. Total samples: {len(self.data)}")
 
         self.batch_size = batch_size
-        self.criterion = nn.MSELoss()
+        #self.criterion = nn.MSELoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.scaler = GradScaler()  # For mixed precision training
         self.train_data, self.val_data = self.split_data(self.data)
@@ -74,9 +74,9 @@ class Driver:
 
 if __name__ == "__main__":
     # Define your model
-    model = ContractiveAutoencoder(input_size=375, latent_size=17)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    device = torch.device("cpu")
+    model = ContractiveAutoencoder(input_size=375, latent_size=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.00001)
+    device = torch.device("mps")
     # Create the driver
     driver = Driver(data_path="_data_train_autoencoder_flat.pickle", device=device, model=model)
 

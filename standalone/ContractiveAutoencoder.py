@@ -4,13 +4,29 @@ import torch.nn as nn
 class ContractiveAutoencoder(nn.Module):
     def __init__(self, input_size=375, latent_size=17):
         super(ContractiveAutoencoder, self).__init__()
+
         self.encoder = nn.Sequential(
-            nn.Linear(input_size, latent_size),
+            nn.Linear(input_size, 256),
             nn.ReLU(),
-            nn.Dropout(0.1)
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.Dropout(0.1),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.Dropout(0.1),
+            nn.ReLU(),
+            nn.Linear(64, latent_size),
+            nn.ReLU()
         )
+
         self.decoder = nn.Sequential(
-            nn.Linear(latent_size, input_size),
+            nn.Linear(latent_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_size),
             nn.ReLU()
         )
 

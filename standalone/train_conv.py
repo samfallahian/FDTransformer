@@ -8,6 +8,8 @@ from tensorflow import keras
 import wandb
 from wandb.keras import WandbCallback
 import os
+import numpy as np
+import matplotlib.pyplot as plt
 
 from ConvolutionalAutoencoder import ConvolutionalAutoencoder
 
@@ -33,7 +35,7 @@ class Train_Conv:
         return train_data, val_data
 
     def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=1000, lr=0.00001):
-        wandb.init(project='ConvolutionalAEv2')
+        wandb.init(project='ConvolutionalAEv3')
         config = wandb.config
         config.batch_size = batch_size
         config.lr = lr
@@ -70,7 +72,7 @@ class Train_Conv:
 
                 with autocast():
                     outputs = self.model(inputs)
-                    loss = self.model.loss_function(inputs, outputs)
+                    loss = self.model.criterion(inputs, outputs)
 
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
@@ -78,7 +80,7 @@ class Train_Conv:
 
                 running_loss += loss.item()
                 # Placeholder error calculation
-                running_error += torch.mean(torch.abs(inputs - outputs)).item()
+                running_error += torch.mean(torch.abs(inputs - outputs[0])).item()
 
             wandb.log({"loss": running_loss / 1000, "error": running_error / 1000})
 
@@ -99,7 +101,7 @@ class Train_Conv:
                     loss = self.model.loss_function(inputs, outputs)
                     running_val_loss += loss.item()
                     # Placeholder error calculation
-                    running_val_error += torch.mean(torch.abs(inputs - outputs)).item()
+                    running_val_error += torch.mean(torch.abs(inputs - outputs[0])).item()
 
             val_loss.append(running_val_loss / len(self.val_loader))
             wandb.log({"val_loss": running_val_loss / len(self.val_loader),
@@ -114,6 +116,30 @@ class Train_Conv:
                 model_path = os.path.join(self.save_directory, f"model_epoch_{epoch}.pt")
                 torch.save(self.model.state_dict(), model_path)
                 print(f"Model saved at {model_path}")
+
+                # Generate a heat map for an arbitrary input
+                # Generate a heat map for an arbitrary input
+                arbitrary_input = torch.randn(1, 3, 125).to(self.device)
+                _, encoded = self.model(arbitrary_input)
+
+                encoded = encoded.view(8, 125)  # Reshape the encoded tensor
+
+                encoded = encoded.detach().cpu().numpy()
+
+                # Rest of the code for logging and plotting the heatmap
+                # ...
+
+                # Log the encoded portion of the auto-encoder to wandb
+                wandb.log({"encoded": wandb.Histogram(np.histogram(encoded, bins='auto')[0].tolist())})
+
+                # Plot the heat map
+                plt.imshow(encoded, cmap='hot', interpolation='nearest')
+                plt.colorbar()
+                plt.title(f"Epoch: {epoch + 1}")
+                plt.xlabel("Encoded Dimension")
+                plt.ylabel("Sample")
+                plt.savefig(f"heatmap_epoch_{epoch}.png")
+                plt.close()
 
         print('Finished Training')
         return train_loss, val_loss

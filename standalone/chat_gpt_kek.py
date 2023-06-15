@@ -11,7 +11,7 @@ def create_json_object(driver_source, model_source, std_out):
                 "driver_source": driver_source,
                 "model_source": model_source,
                 "std_out": std_out,
-                "query": "Given this context, why is there this error on std_out?"
+                "query": "What do you think is going on?"
             }
         ]
     }

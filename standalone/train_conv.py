@@ -4,9 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 from torch.cuda.amp import autocast, GradScaler
-from tensorflow import keras
 import wandb
-from wandb.keras import WandbCallback
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -34,7 +32,8 @@ class Train_Conv:
         train_data, val_data = random_split(data, [train_len, val_len])
         return train_data, val_data
 
-    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle", batch_size=1000, lr=0.00001):
+    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle",
+                 batch_size=1000, lr=0.00001):
         wandb.init(project='ConvolutionalAEv3')
         config = wandb.config
         config.batch_size = batch_size
@@ -50,9 +49,11 @@ class Train_Conv:
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
         self.scaler = GradScaler()  # For mixed precision training
         self.train_data, self.val_data = self.split_data(self.data)
-        self.epochs = 10000
-        self.train_loader = torch.utils.data.DataLoader(self.train_data, batch_size=self.batch_size, shuffle=True)
-        self.val_loader = torch.utils.data.DataLoader(self.val_data, batch_size=self.batch_size, shuffle=False)
+        self.epochs = 400
+        self.train_loader = torch.utils.data.DataLoader(self.train_data,
+                                                        batch_size=self.batch_size, shuffle=True)
+        self.val_loader = torch.utils.data.DataLoader(self.val_data,
+                                                      batch_size=self.batch_size, shuffle=False)
         self.save_interval = 100  # Save the model every 100 epochs
         self.save_directory = "saved_models"  # Directory to save the models
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
@@ -60,6 +61,7 @@ class Train_Conv:
     def train(self):
         train_loss = []
         val_loss = []
+        encoded_shape = None  # Variable to store the shape of the encoded tensor
 
         for epoch in range(self.epochs):
             self.model.train()
@@ -71,7 +73,7 @@ class Train_Conv:
                 self.optimizer.zero_grad()
 
                 with autocast():
-                    outputs = self.model(inputs)
+                    outputs, _ = self.model(inputs)
                     loss = self.model.criterion(inputs, outputs)
 
                 self.scaler.scale(loss).backward()
@@ -79,8 +81,7 @@ class Train_Conv:
                 self.scaler.update()
 
                 running_loss += loss.item()
-                # Placeholder error calculation
-                running_error += torch.mean(torch.abs(inputs - outputs[0])).item()
+                running_error += torch.mean(torch.abs(inputs - outputs)).item()
 
             wandb.log({"loss": running_loss / 1000, "error": running_error / 1000})
 
@@ -97,11 +98,10 @@ class Train_Conv:
             with torch.no_grad():
                 for i, data in enumerate(self.val_loader):
                     inputs = data.float().to(self.device)
-                    outputs = self.model(inputs)
-                    loss = self.model.loss_function(inputs, outputs)
+                    outputs, _ = self.model(inputs)
+                    loss = self.model.criterion(inputs, outputs)
                     running_val_loss += loss.item()
-                    # Placeholder error calculation
-                    running_val_error += torch.mean(torch.abs(inputs - outputs[0])).item()
+                    running_val_error += torch.mean(torch.abs(inputs - outputs)).item()
 
             val_loss.append(running_val_loss / len(self.val_loader))
             wandb.log({"val_loss": running_val_loss / len(self.val_loader),
@@ -118,27 +118,40 @@ class Train_Conv:
                 print(f"Model saved at {model_path}")
 
                 # Generate a heat map for an arbitrary input
-                # Generate a heat map for an arbitrary input
                 arbitrary_input = torch.randn(1, 3, 125).to(self.device)
                 _, encoded = self.model(arbitrary_input)
 
-                encoded = encoded.view(8, 125)  # Reshape the encoded tensor
+                # Determine the shape of the encoded tensor
+                if encoded_shape is None:
+                    encoded_shape = encoded.shape[-2:]  # Store the shape of the encoded tensor
 
-                encoded = encoded.detach().cpu().numpy()
+                encoded = encoded.view(*encoded_shape)  # Reshape the encoded tensor
 
-                # Rest of the code for logging and plotting the heatmap
-                # ...
+                # Move the arbitrary_input tensor to the CPU before computing histogram
+                arbitrary_input = arbitrary_input.squeeze().cpu().detach().numpy()
 
                 # Log the encoded portion of the auto-encoder to wandb
-                wandb.log({"encoded": wandb.Histogram(np.histogram(encoded, bins='auto')[0].tolist())})
+                wandb.log({"original": wandb.Histogram(np.histogram(arbitrary_input, bins='auto')[0].tolist())})
 
-                # Plot the heat map
-                plt.imshow(encoded, cmap='hot', interpolation='nearest')
+                # Log the encoded portion of the auto-encoder to wandb
+                wandb.log({"encoded": wandb.Histogram(np.histogram(encoded.cpu().detach().numpy(), bins='auto')[0].tolist())})
+
+                # Plot the heat map for what is encoded
+                plt.imshow(encoded.cpu().detach().numpy(), cmap='hot', interpolation='nearest')
                 plt.colorbar()
                 plt.title(f"Epoch: {epoch + 1}")
                 plt.xlabel("Encoded Dimension")
-                plt.ylabel("Sample")
-                plt.savefig(f"heatmap_epoch_{epoch}.png")
+                plt.ylabel("Arbitrary")
+                plt.savefig(f"heatmap_epoch_{epoch}_once_encoded.png")
+                plt.close()
+
+                # Plot the heat map for what is the original
+                plt.imshow(arbitrary_input, cmap='hot', interpolation='nearest')
+                plt.colorbar()
+                plt.title(f"Epoch: {epoch + 1}")
+                plt.xlabel("arbitrary_input Dimension")
+                plt.ylabel("Arbitrary")
+                plt.savefig(f"heatmap_epoch_{epoch}_arbitrary_input.png")
                 plt.close()
 
         print('Finished Training')

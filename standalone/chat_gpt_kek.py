@@ -11,7 +11,7 @@ def create_json_object(driver_source, model_source, std_out):
                 "driver_source": driver_source,
                 "model_source": model_source,
                 "std_out": std_out,
-                "query": "What do you think is going on?"
+                "query": "Simple, I think, but please provide the entire file to update with a note on the line(s) in question."
             }
         ]
     }

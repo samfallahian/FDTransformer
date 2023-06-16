@@ -33,12 +33,12 @@ class Train_Conv:
         return train_data, val_data
 
     def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle",
-                 batch_size=1000, lr=0.00001):
-        wandb.init(project='ConvolutionalAEv3')
+                 batch_size=100, lr=0.0001):
+        wandb.init(project='ConvolutionalAEv4')
         config = wandb.config
         config.batch_size = batch_size
         config.lr = lr
-
+        self.debug = True
         self.model = model
         print("Model initialized.")
         self.device = device
@@ -73,15 +73,20 @@ class Train_Conv:
                 self.optimizer.zero_grad()
 
                 with autocast():
-                    outputs, _ = self.model(inputs)
-                    loss = self.model.criterion(inputs, outputs)
+                    # Print the shapes of input and output tensors
+                    reconstruction, encoded = self.model(inputs)
+                    #Here reconstruction is the decoded information from the encoded information.... Yea!!!
+                    #print(f"Input shape: {inputs.shape}")
+                    #print(f"Output shape: {reconstruction.shape}")
+                    loss = self.model.criterion(inputs, reconstruction)
 
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
                 running_loss += loss.item()
-                running_error += torch.mean(torch.abs(inputs - outputs)).item()
+                running_error += torch.mean(torch.abs(inputs - reconstruction)).item()
+
 
             wandb.log({"loss": running_loss / 1000, "error": running_error / 1000})
 
@@ -120,12 +125,18 @@ class Train_Conv:
                 # Generate a heat map for an arbitrary input
                 arbitrary_input = torch.randn(1, 3, 125).to(self.device)
                 _, encoded = self.model(arbitrary_input)
-
+                encoded = encoded.view(-1, *encoded_shape)  # Reshape the encoded tensor
                 # Determine the shape of the encoded tensor
                 if encoded_shape is None:
                     encoded_shape = encoded.shape[-2:]  # Store the shape of the encoded tensor
 
-                encoded = encoded.view(*encoded_shape)  # Reshape the encoded tensor
+                    # Determine the shape of the encoded tensor
+                    if encoded_shape is None:
+                        encoded_shape = (6, 8)  # Store the shape of the encoded tensor
+
+
+
+                encoded = encoded.view(1, *encoded_shape)  # Reshape the encoded tensor
 
                 # Move the arbitrary_input tensor to the CPU before computing histogram
                 arbitrary_input = arbitrary_input.squeeze().cpu().detach().numpy()
@@ -160,6 +171,7 @@ class Train_Conv:
 
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "mps")
-    model = ConvolutionalAutoencoder().to(device)
+    target_latent_size = (8, 6)
+    model = ConvolutionalAutoencoder(batch_size=100,latent_size=target_latent_size).to(device)
     trainer = Train_Conv(model, device)
     train_loss, val_loss = trainer.train()

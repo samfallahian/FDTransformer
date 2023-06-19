@@ -46,7 +46,9 @@ class ConvolutionalAutoencoder(nn.Module):
 
     def forward(self, x):
         encoded = self.encoder(x)
+        # print(encoded)
         encoded = encoded.view(x.size(0), *self.latent_size)  # Reshape the tensor to desired latent size
+        # print(encoded)
 
         assert encoded.size()[
                1:] == self.latent_size, f"Encoder output size {encoded.size()[1:]} does not match the specified latent size {self.latent_size}."

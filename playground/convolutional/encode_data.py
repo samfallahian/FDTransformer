@@ -31,188 +31,44 @@ class CustomDataset(torch.utils.data.Dataset):
 class Encode_Data:
     # Encode data using the Convolutional Autoencoder pre-trained model
 
-    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle",
-                 batch_size=1, lr=0.0001):
+    def __init__(self, model, device, saved_model_path="saved_models/checkpoint_300.pth",
+                 data_path="_data_train_autoencoder_flat.pickle",
+                 batch_size=1):
         self.model = model
         print("Model initialized.")
         self.device = device
         self.data = CustomDataset(pickle.load(open(data_path, "rb")))  # Loads the dataset
-        # self.data = CustomDataset(pickle.load(open(r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle", "rb")))  # Loads the dataset
+        self.saved_model_path = saved_model_path
 
         print(f"Data loaded. Total samples: {len(self.data)}")
 
         self.batch_size = batch_size
-        # self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.scaler = GradScaler()  # For mixed precision training
-        # self.train_data, self.val_data, self.orig_data = self.split_data(self.data)
-        # self.epochs = 2
 
         self.orig_data_loader = torch.utils.data.DataLoader(self.data,
-                                                        batch_size=self.batch_size)
-        self.save_interval = 100  # Save the model every 100 epochs
-        self.save_directory = "saved_models"  # Directory to save the models
-        os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
+                                                            batch_size=self.batch_size)
 
-    def train(self):
-        # Function to perform the training of the model
-        train_loss = []
-        val_loss = []
-        encoded_shape = None  # Variable to store the shape of the encoded tensor
+        self.save_directory = "dataset"  # Directory to save the encoded
+        os.makedirs(self.save_directory, exist_ok=True)  # Create the directory if it doesn't exist
 
-        for epoch in range(self.epochs):
-            self.model.train()
-            running_loss = 0.0
-            running_error = 0.0
-
-            for i, data in enumerate(self.train_loader):
-                inputs = data.float().to(self.device)
-                print(inputs.shape)
-                self.optimizer.zero_grad()
-
-                with autocast():
-                    # Forward pass through the model
-                    reconstruction, encoded = self.model(inputs)
-                    # Compute the loss
-                    loss = self.model.criterion(inputs, reconstruction)
-
-                # Backward pass and optimization
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-
-                # Store the shape of the encoded tensor after the first forward pass
-                if encoded_shape is None:
-                    encoded_shape = encoded.shape[1:]
-
-                running_loss += loss.item()
-
-            # Compute and log the average training loss
-            train_loss.append(running_loss / len(self.train_loader))
-            # wandb.log({"Train Loss": train_loss[-1]})
-
-            # Validate the model
-            self.model.eval()
-            running_loss = 0.0
-            for i, data in enumerate(self.val_loader):
-                inputs = data.float().to(self.device)
-                with torch.no_grad():
-                    reconstruction, encoded = self.model(inputs)
-                    loss = self.model.criterion(inputs, reconstruction)
-                running_loss += loss.item()
-
-            # Compute and log the average validation loss
-            val_loss.append(running_loss / len(self.val_loader))
-            # wandb.log({"Validation Loss": val_loss[-1]})
-
-            # Save the model
-            if epoch % self.save_interval == 0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'loss': train_loss[-1],
-                    'encoded_shape': encoded_shape
-                }, os.path.join(self.save_directory, f"checkpoint_{epoch}.pth"))
-        print('Finished Training')
-        return train_loss, val_loss
-
-    def plot_loss(self, train_loss, val_loss):
-        # Plots the training and validation losses
-        epochs = range(len(train_loss))
-        plt.figure()
-        plt.plot(epochs, train_loss, 'bo', label='Training loss')
-        plt.plot(epochs, val_loss, 'b', label='Validation loss')
-        plt.title('Training and validation loss')
-        plt.legend()
-        plt.show()
-
-    def train1(self):
-        self.model.load_state_dict(torch.load(r"/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_300.pth")["model_state_dict"])
-
-        # appended_tensor = torch.empty(0, 3, 125).float().to(self.device)
-        # appended_tensor = torch.empty(0, 8, 6).float().to(self.device)  # encoded
+    def create_encoded_tensor(self):
+        self.model.load_state_dict(torch.load(self.saved_model_path)["model_state_dict"])
         appended_tensor = torch.empty(0, 8, 6).float().to(self.device)
 
         for i, data in enumerate(self.orig_data_loader):
             reconstruction, encoded = self.model(data.float().to(self.device))
-
             appended_tensor = torch.cat((appended_tensor, encoded), dim=0)
+        print(f"Encoded tensor shape: {appended_tensor.shape}")
+        # Save the tensor using pickle
+        with open(f"{self.save_directory}/appended_tensor.pickle", 'wb') as f:
+            pickle.dump(appended_tensor, f)
+        return appended_tensor
 
-            # if i == 50:
-            #     inputs = data.float().to(self.device)
-            #     print(inputs.shape)
-            #     reconstruction, encoded = self.model(inputs)
-            #     print(encoded.shape)
-        print(appended_tensor.shape)
-        # # Assuming you have a tensor with data
-        # tensor = torch.tensor([1, 2, 3, 4, 5])
-        #
-        # # Save the tensor data as a pickle file
-        # with open('data.pickle', 'wb') as file:
-        #     pickle.dump(tensor, file)
-        #
-        # pass
 
-        # for epoch in range(self.epochs):
-        #     self.model.train()
-        #     running_loss = 0.0
-        #     running_error = 0.0
-        #
-        #     for i, data in enumerate(self.train_loader):
-        #         inputs = data.float().to(self.device)
-        #         print(inputs.shape)
-        #         self.optimizer.zero_grad()
-        #
-        #         with autocast():
-        #             # Forward pass through the model
-        #             reconstruction, encoded = self.model(inputs)
-        #             # Compute the loss
-        #             loss = self.model.criterion(inputs, reconstruction)
-        #
-        #         # Backward pass and optimization
-        #         self.scaler.scale(loss).backward()
-        #         self.scaler.step(self.optimizer)
-        #         self.scaler.update()
-        #
-        #         # Store the shape of the encoded tensor after the first forward pass
-        #         if encoded_shape is None:
-        #             encoded_shape = encoded.shape[1:]
-        #
-        #         running_loss += loss.item()
-        #
-        #     # Compute and log the average training loss
-        #     train_loss.append(running_loss / len(self.train_loader))
-        #     # wandb.log({"Train Loss": train_loss[-1]})
-        #
-        #     # Validate the model
-        #     self.model.eval()
-        #     running_loss = 0.0
-        #     for i, data in enumerate(self.val_loader):
-        #         inputs = data.float().to(self.device)
-        #         with torch.no_grad():
-        #             reconstruction, encoded = self.model(inputs)
-        #             loss = self.model.criterion(inputs, reconstruction)
-        #         running_loss += loss.item()
-        #
-        #     # Compute and log the average validation loss
-        #     val_loss.append(running_loss / len(self.val_loader))
-        #     # wandb.log({"Validation Loss": val_loss[-1]})
-        #
-        #     # Save the model
-        #     if epoch % self.save_interval == 0:
-        #         torch.save({
-        #             'epoch': epoch,
-        #             'model_state_dict': self.model.state_dict(),
-        #             'optimizer_state_dict': self.optimizer.state_dict(),
-        #             'loss': train_loss[-1],
-        #             'encoded_shape': encoded_shape
-        #         }, os.path.join(self.save_directory, f"checkpoint_{epoch}.pth"))
-        # print('Finished Training')
-        # return train_loss, val_loss
-
+# saved_model_path = r"/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_300.pth"
+# data_path = r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle"
+saved_model_path = "saved_models/checkpoint_300.pth"
+data_path = "_data_train_autoencoder_flat.pickle"
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 model = ConvolutionalAutoencoder().to(device)
-trainer = Encode_Data(model, device)
-# train_loss, val_loss = trainer.train1()
-trainer.train1()
-# trainer.plot_loss(train_loss, val_loss)
+encoding = Encode_Data(model=model, device=device, saved_model_path=saved_model_path, data_path= data_path)
+encoding.create_encoded_tensor()

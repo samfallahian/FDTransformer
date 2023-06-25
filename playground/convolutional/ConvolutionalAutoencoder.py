@@ -2,10 +2,9 @@ import torch
 import torch.nn as nn
 
 class ConvolutionalAutoencoder(nn.Module):
-    def __init__(self, batch_size, latent_size=(8, 6)):
+    def __init__(self, latent_size=(8, 6)):
         super(ConvolutionalAutoencoder, self).__init__()
 
-        #self.batch_size = batch_size
         self.latent_size = latent_size
 
         # Encoder layers

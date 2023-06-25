@@ -28,42 +28,27 @@ class CustomDataset(torch.utils.data.Dataset):
         return sample
 
 
-class Train_Conv:
-    # Trainer class for the Convolutional Autoencoder model
-    def split_data(self, data, split_ratio=0.8):
-        # Splits the dataset into training and validation sets
-        train_len = int(len(data) * split_ratio)
-        val_len = len(data) - train_len
-        train_data, val_data = random_split(data, [train_len, val_len])
-        return train_data, val_data, data
+class Encode_Data:
+    # Encode data using the Convolutional Autoencoder pre-trained model
 
     def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle",
                  batch_size=1, lr=0.0001):
-        # Initializes the model and the necessary parameters for training
-        # wandb.init(project='ConvolutionalAEv4')  # Starts a new run on Weights & Biases
-        # config = wandb.config
-        # config.batch_size = batch_size
-        # config.lr = lr
-        self.debug = True
         self.model = model
         print("Model initialized.")
         self.device = device
-        self.data = CustomDataset(pickle.load(open(r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle", "rb")))  # Loads the dataset
+        self.data = CustomDataset(pickle.load(open(data_path, "rb")))  # Loads the dataset
+        # self.data = CustomDataset(pickle.load(open(r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle", "rb")))  # Loads the dataset
 
         print(f"Data loaded. Total samples: {len(self.data)}")
 
         self.batch_size = batch_size
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        # self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.scaler = GradScaler()  # For mixed precision training
-        self.train_data, self.val_data, self.orig_data = self.split_data(self.data)
-        self.epochs = 2
+        # self.train_data, self.val_data, self.orig_data = self.split_data(self.data)
+        # self.epochs = 2
 
-        self.orig_data_loader = torch.utils.data.DataLoader(self.orig_data,
+        self.orig_data_loader = torch.utils.data.DataLoader(self.data,
                                                         batch_size=self.batch_size)
-        self.train_loader = torch.utils.data.DataLoader(self.train_data,
-                                                        batch_size=self.batch_size, shuffle=True)
-        self.val_loader = torch.utils.data.DataLoader(self.val_data,
-                                                      batch_size=self.batch_size, shuffle=False)
         self.save_interval = 100  # Save the model every 100 epochs
         self.save_directory = "saved_models"  # Directory to save the models
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
@@ -227,7 +212,7 @@ class Train_Conv:
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 model = ConvolutionalAutoencoder().to(device)
-trainer = Train_Conv(model, device)
+trainer = Encode_Data(model, device)
 # train_loss, val_loss = trainer.train1()
 trainer.train1()
 # trainer.plot_loss(train_loss, val_loss)

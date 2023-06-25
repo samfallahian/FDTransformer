@@ -138,7 +138,7 @@ class Train_Conv:
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
-model = ConvolutionalAutoencoder(batch_size=100).to(device)
+model = ConvolutionalAutoencoder().to(device)
 trainer = Train_Conv(model, device)
 train_loss, val_loss = trainer.train()
 trainer.plot_loss(train_loss, val_loss)

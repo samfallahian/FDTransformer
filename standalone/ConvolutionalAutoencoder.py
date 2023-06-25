@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class ConvolutionalAutoencoder(nn.Module):
-    def __init__(self, batch_size, latent_size=(8, 6)):
+    def __init__(self, latent_size=(8, 6)):
         super(ConvolutionalAutoencoder, self).__init__()
 
         #self.batch_size = batch_size
@@ -60,7 +60,7 @@ class ConvolutionalAutoencoder(nn.Module):
 
 
 def print_model_architecture():
-    model = ConvolutionalAutoencoder(batch_size=1)
+    model = ConvolutionalAutoencoder()
     print(model)
 
 if __name__ == '__main__':
@@ -70,7 +70,7 @@ if __name__ == '__main__':
     print("Model architecture:")
     print_model_architecture()
 
-    model = ConvolutionalAutoencoder(batch_size=1, latent_size=target_latent_size)
+    model = ConvolutionalAutoencoder(latent_size=target_latent_size)
     encoder_output = torch.zeros(target_input_size)
     decoded_output = model(encoder_output)
 

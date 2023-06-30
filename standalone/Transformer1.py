@@ -56,7 +56,7 @@ train_inputs, val_inputs = inputs[:split_idx], inputs[split_idx:]
 train_targets, val_targets = targets[:split_idx], targets[split_idx:]
 
 # Create DataLoaders
-batch_size = 32
+batch_size = 528
 train_data = TensorDataset(train_inputs, train_targets)
 train_loader = DataLoader(train_data, shuffle=True, batch_size=batch_size)
 val_data = TensorDataset(val_inputs, val_targets)
@@ -109,3 +109,5 @@ for epoch in range(num_epochs):
 
     print(
         f'Epoch {epoch + 1}/{num_epochs}: train loss {train_loss / len(train_loader)}, val loss {val_loss / len(val_loader)}')
+
+# https://github.com/KasperGroesLudvigsen/influenza_transformer/tree/main

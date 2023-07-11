@@ -1,72 +1,68 @@
-# Import necessary libraries
 import os
+import json
 import pandas as pd
 import torch
-import concurrent.futures
-import json
+from threading import Thread
 
-
-# Define the function to get the desired values
-def get_desired_values(tensor):
-    # Sort the tensor
-    sorted_tensor = torch.sort(tensor.unique())[0]  # use unique() to get unique values
-
-    # Get the smallest and largest values
-    smallest = sorted_tensor[0].item()
-    largest = sorted_tensor[-1].item()
-
-    # Get the fourth smallest and fourth largest values
-    fourth_smallest = sorted_tensor[3].item() if sorted_tensor.size(0) > 3 else None
-    fourth_largest = sorted_tensor[-4].item() if sorted_tensor.size(0) > 3 else None
-
-    return smallest, largest, fourth_smallest, fourth_largest
-
-
-# Define the function to process a file
-def process_file(filename):
-    # Construct the full file path
-    file_path = os.path.join(read_dir, filename)
-
+# Function to read pickle file into a dataframe
+def read_file(file_path):
     # Open the pickle file and load into a pandas DataFrame
     with open(file_path, 'rb') as f:
         df = pd.read_pickle(f, compression="zip")
+    return df
 
-    # Create an empty dictionary for this file's metadata
-    file_metadata = {}
+# Function to get the smallest, largest, 4th smallest and 4th largest values
+def get_values(df, column):
+    # Convert the pandas series to a PyTorch tensor
+    tensor = torch.from_numpy(df[column].values)
+    # Sort the tensor
+    sorted_tensor, indices = torch.sort(tensor)
+    # Get the smallest, largest, 4th smallest and 4th largest values
+    smallest = sorted_tensor[0].item()
+    largest = sorted_tensor[-1].item()
+    fourth_smallest = sorted_tensor[3].item() if len(sorted_tensor) > 3 else None
+    fourth_largest = sorted_tensor[-4].item() if len(sorted_tensor) > 3 else None
+    # Get the enumerated list of unique sorted values
+    enumerated = list(set(sorted_tensor.tolist()))
+    enumerated.sort() # Sort the list after converting to set
+    return smallest, largest, fourth_smallest, fourth_largest, enumerated
 
-    # Iterate over the columns of interest
-    for col in cols_of_interest:
-        # Check if the column exists in the dataframe
-        if col in df.columns:
-            # Convert the column to a PyTorch tensor
-            tensor = torch.from_numpy(df[col].values)
+# Function to process each file
+def process_file(file_path, result_dict):
+    # Read the file into a dataframe
+    df = read_file(file_path)
+    # Store results for each required column in the result dictionary
+    for column in ["x", "y", "z", "time", "distance"]:
+        values = get_values(df, column)
+        # Store the results in the dictionary, indexed by the filename and column
+        result_dict[file_path][f"{column}_min"] = values[0]
+        result_dict[file_path][f"{column}_max"] = values[1]
+        result_dict[file_path][f"{column}_fourth_min"] = values[2]
+        result_dict[file_path][f"{column}_fourth_max"] = values[3]
+        result_dict[file_path][f"{column}_enumerated"] = values[4]
 
-            # Get the desired values and store them in the file's metadata
-            file_metadata[col] = get_desired_values(tensor)
+# Main function to loop through all files in the directory
+def process_all_files(directory):
+    # Initialize result dictionary
+    result_dict = {}
+    # Get all files in the directory
+    files = [os.path.join(directory, file) for file in os.listdir(directory) if file.endswith('.pkl')]
+    # Start a thread for each file
+    threads = []
+    for file_path in files:
+        # Initialize subdictionary for each file
+        result_dict[file_path] = {}
+        thread = Thread(target=process_file, args=(file_path, result_dict))
+        threads.append(thread)
+        thread.start()
+    # Wait for all threads to finish
+    for thread in threads:
+        thread.join()
+    return result_dict
 
-    return filename, file_metadata
+# Start processing files
+result = process_all_files("/Users/kkreth/PycharmProjects/data/DL-PTV/")
 
-
-# Define the directory to read from
-read_dir = '/Users/kkreth/PycharmProjects/data/DL-PTV/'
-
-# Define the output file
-output_file = '/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt'
-
-# Define the columns of interest and sort them alphabetically
-cols_of_interest = sorted(['x', 'y', 'z', 'time', 'distance'])
-
-# Get all .pkl files in the directory
-files = [file for file in os.listdir(read_dir) if file.endswith('.pkl')]
-
-# Create a ThreadPoolExecutor
-with concurrent.futures.ThreadPoolExecutor() as executor:
-    # Use the executor to map the process_file function to the files
-    results = executor.map(process_file, files)
-
-    # Create an empty dictionary to store the metadata
-    metadata = dict(results)
-
-# Write the metadata to the output file as JSON
-with open(output_file, 'w') as f:
-    json.dump(metadata, f)
+# Save the results into a json file
+with open("/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt", 'w') as f:
+    json.dump(result, f)

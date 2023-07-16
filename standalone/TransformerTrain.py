@@ -11,7 +11,8 @@ from torch.optim.lr_scheduler import StepLR
 import wandb
 from TransformersDataLoader import CustomDataset
 from TransformerModel import TransformerModel
-
+import pandas as pd
+from utils import helpers
 
 class Train_Transformer:
     # Trainer class for the Transformer model
@@ -39,6 +40,7 @@ class Train_Transformer:
         print(f"Data Shape {self.data.shape}")
         self.dataset = CustomDataset(self.data, seq_len, batch_src_seq, batch_tgt_seq)
         self.dataloader = DataLoader(self.dataset, batch_size=seq_len, shuffle=False)
+        self.logger = helpers.Log("transformer")
 
         self.epochs = epochs
         self.seq_len = seq_len
@@ -46,7 +48,7 @@ class Train_Transformer:
         self.batch_src_seq = batch_src_seq
         self.batch_tgt_seq = batch_tgt_seq
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
         self.scaler = GradScaler()  # For mixed precision training
         self.criterion = nn.MSELoss() # Define loss and optimizer
         self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma) # initialize the scheduler
@@ -54,9 +56,12 @@ class Train_Transformer:
         self.save_interval = 100  # Save the model every 100 epochs
         self.save_directory = "saved_models"  # Directory to save the models
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
+        self.df_result = pd.DataFrame(
+            columns=["epoch", "batch", "batch_data_point", "data_point", "loss", "time"])
 
     def train(self):
         # Function to perform the training of the model
+        data_point_count = 0
         for epoch in range(self.epochs):
             self.model.train()
             total_loss = 0.
@@ -64,43 +69,47 @@ class Train_Transformer:
             start_time = time.time()
             print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
             src_mask = self.model.generate_square_subsequent_mask(self.seq_len).to(self.device)
+            batch_data_point_count = 0
             for batch, (src_batch, tgt) in enumerate(self.dataloader):
                 # print("batch no ", batch, " len src", len(src_batch), " * ",len(src_batch[0]), " len target", len(tgt))
                 tgt = tgt.to(self.device)
                 self.optimizer.zero_grad()
 
-                # with autocast():
-                #     if src.size(0) != seq_len:
-                #         src_mask = model.generate_square_subsequent_mask(src.size(0)).to(device)
-                #     output = model(src, src_mask)
-                #     loss = criterion(output, tgt)
-                # # Backward pass and optimization
-                # scaler.scale(loss).backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                # # Unscales the gradients of optimizer's assigned params in-place
-                # scaler.unscale_(optimizer)
-                # # Since the gradients of optimizer's assigned params are unscaled, clips as usual:
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                # # Unscales gradients and calls or skips optimizer.step()
-                # scaler.step(optimizer)
-                # # Updates the scale for next iteration
-                # scaler.update()
-                # scheduler.step()
 
-                # if src.size(0) != seq_len:
-                #     src_mask = model.generate_square_subsequent_mask(src.size(0)).to(device)
-                # output = model(src, src_mask)
-                # loss = criterion(output, tgt)
-                # loss.backward()
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                # with autocast():
+                #     for src in src_batch:
+                #         src = src.to(self.device)
+                #         if src.size(0) != self.seq_len:
+                #             src_mask = self.model.generate_square_subsequent_mask(src.size(0)).to(self.device)
+                #         output = self.model(src, src_mask)
+                #         loss = self.criterion(output, tgt)
+                # # Backward pass and optimization
+                # self.scaler.scale(loss).backward()
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                # # Unscales the gradients of optimizer's assigned params in-place
+                # self.scaler.unscale_(self.optimizer)
+                # # Since the gradients of optimizer's assigned params are unscaled, clips as usual:
+                # torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                # # Unscales gradients and calls or skips optimizer.step()
+                # self.scaler.step(self.optimizer)
+                # # Updates the scale for next iteration
+                # self.scaler.update()
+                # self.scheduler.step()
+
                 for src in src_batch:
                     src = src.to(self.device)
                     if src.size(0) != self.seq_len:
                         src_mask = self.model.generate_square_subsequent_mask(src.size(0)).to(self.device)
                     output = self.model(src, src_mask)
                     loss = self.criterion(output, tgt)
+                    print(output, tgt)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                    batch_data_point_count += 1
+                    data_point_count += 1
+                    self.df_result.loc[len(self.df_result.index)] = [epoch + 1, batch, batch_data_point_count,
+                                                                     data_point_count, round(loss.item(), 4),
+                                                                     datetime.now().strftime("%m/%d/%Y, %H:%M:%S")]
                 self.optimizer.step()
                 self.scheduler.step()
 
@@ -118,7 +127,7 @@ class Train_Transformer:
                     total_loss = 0
                     start_time = time.time()
             running_loss /= len(self.dataloader)
-            wandb.log({"loss": running_loss})
+            wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
             print(f'End of epoch {epoch + 1}, Running loss {running_loss:.2f}')
             # Save the model
             if epoch % self.save_interval == 0:
@@ -130,5 +139,7 @@ class Train_Transformer:
                 }, os.path.join(self.save_directory, f"transformer_checkpoint_{epoch}.pth"))
         print("===============================================")
         print(f'End of training at {datetime.now().time().strftime("%H:%M:%S")}')
+        print(self.df_result.head(20))
+        self.logger.save_result(self.df_result)
         wandb.finish()
         return running_loss

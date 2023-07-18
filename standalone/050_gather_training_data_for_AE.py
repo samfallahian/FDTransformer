@@ -1,83 +1,81 @@
-import json
-import pandas as pd
-import numpy as np
 import os
+import pandas as pd
+import json
 import random
+import time
 import torch
 from CoordinateAnalyzer import CoordinateAnalyzer
-from multiprocessing import Pool, cpu_count
 
-def process_file(filename):
-    df = pd.read_hdf(os.path.join('/Users/kkreth/PycharmProjects/data/DL-PTV', filename), key='processed_data')
+# 0) Meta-data file path as GLOBAL variable
+META_DATA_FILE_PATH = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+ITERATED = 1000
 
-    # sort dataframe by x, y, z, and time
-    df.sort_values(by=['x', 'y', 'z', 'time'], inplace=True)
-
-    # Load the arrays from the JSON file and convert to integers
-    x_enumerated = [int(x) for x in experiment_dict[filename]['x_enumerated']]
-    y_enumerated = [int(y) for y in experiment_dict[filename]['y_enumerated']]
-    z_enumerated = [int(z) for z in experiment_dict[filename]['z_enumerated']]
-    time_enumerated = [int(t) for t in experiment_dict[filename]['time_enumerated']]
-
-    # trim 2 lowest and 2 highest values from x, y, z arrays
-    x_enumerated_trimmed = x_enumerated[2:-2]
-    y_enumerated_trimmed = y_enumerated[2:-2]
-    z_enumerated_trimmed = z_enumerated[2:-2]
-
-    # ensure trimmed arrays are of expected size
-    assert len(x_enumerated_trimmed) == len(x_enumerated) - 4
-    assert len(y_enumerated_trimmed) == len(y_enumerated) - 4
-    assert len(z_enumerated_trimmed) == len(z_enumerated) - 4
-
-    counter = 0
-    batch_size = 1000
-
-    with open("/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData/AE_training_data.JSON", 'ab') as f:
-        for _ in range(1000000):
-            # select random x, y, z, and time
-            x_random = random.choice(x_enumerated_trimmed)
-            y_random = random.choice(y_enumerated_trimmed)
-            z_random = random.choice(z_enumerated_trimmed)
-            time_random = random.choice(time_enumerated)
-
-            # create a new dataframe subset
-            df_subset = df[(df['time'] == time_random)]
-
-            # define analyzer variable
-            try:
-                analyzer = CoordinateAnalyzer(df_subset)
-                result = analyzer.get_nearest_values(x_random, y_random, z_random)
-
-                # assert that there are 125 datapoints
-                assert len(result) == 125, "Analyzer does not contain 125 data points"
-
-                # extract velocity information
-                velocity_tensor = torch.tensor(result[['vx', 'vy', 'vz']].values).unsqueeze(0)
-
-                torch.save(velocity_tensor, f)
-                f.write(b'\n')
-
-                counter += 1
-
-                if counter % batch_size == 0:
-                    print(f"{counter} lines written for file {filename}")
-
-            except Exception as e:
-                print(f"Failed to process file {filename} with error: {str(e)}")
-
-# read in the meta-data file
-with open("/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt", 'r') as f:
+# Read in the meta-data file
+with open(META_DATA_FILE_PATH, 'r') as f:
     experiment_dict = json.load(f)
 
-# Get the list of .pkl files in the directory
-file_list = [filename for filename in os.listdir('/Users/kkreth/PycharmProjects/data/DL-PTV') if filename.endswith('.pkl')]
 
-# Create a multiprocessing Pool
-pool = Pool(processes=cpu_count())
+def process_file(filename='/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/359.hdf'):
+    start_time = time.time()
 
-# Process the files in parallel
-pool.map(process_file, file_list)
+    # 0.5) Delete file if it exists
+    output_file_path = filename.replace('.hdf', '_tensors.hdf')
+    if os.path.isfile(output_file_path):
+        print(f"Deleting existing file: {output_file_path}")
+        os.remove(output_file_path)
 
-# Close the multiprocessing Pool
-pool.close()
-pool.join()
+    # 2) Read file
+    df = pd.read_hdf(filename, key='processed_data')
+
+    # 5) Sort dataframe by x, y, z
+    df.sort_values(by=['x', 'y', 'z'], inplace=True)
+
+    velocity_tensors = []
+
+    # 3) Iterations
+    for _ in range(ITERATED):
+        # 6) Trim 2 lowest and 2 highest values from x, y, z arrays
+        x_enumerated = df['x'].unique()
+        y_enumerated = df['y'].unique()
+        z_enumerated = df['z'].unique()
+
+        x_enumerated_trimmed = x_enumerated[2:-2]
+        y_enumerated_trimmed = y_enumerated[2:-2]
+        z_enumerated_trimmed = z_enumerated[2:-2]
+
+        # ensure trimmed arrays are of expected size
+        assert len(x_enumerated_trimmed) == len(x_enumerated) - 4
+        assert len(y_enumerated_trimmed) == len(y_enumerated) - 4
+        assert len(z_enumerated_trimmed) == len(z_enumerated) - 4
+
+        # 7) Random coordinates
+        x_random = random.choice(x_enumerated_trimmed)
+        y_random = random.choice(y_enumerated_trimmed)
+        z_random = random.choice(z_enumerated_trimmed)
+
+        # 8) Use analyzer to find nearest values
+        df_subset = df
+
+        try:
+            # Assuming CoordinateAnalyzer is a defined class that takes a DataFrame and provides a method get_nearest_values
+            analyzer = CoordinateAnalyzer(df_subset)
+            result = analyzer.get_nearest_values(x_random, y_random, z_random)
+
+            assert len(result) == 125, "Analyzer does not contain 125 data points"
+
+            velocity_tensor = torch.tensor(result[['vx', 'vy', 'vz']].values).unsqueeze(0)
+
+            velocity_tensors.append(velocity_tensor)
+
+        except Exception as e:
+            print(f"Error processing data: {e}")
+
+    # 9) Gather tensors and write them to hdf5
+    torch.save(velocity_tensors, output_file_path)
+
+    print(f"File processed and saved in: {output_file_path}")
+    print(f"Total run time: {time.time() - start_time} seconds")
+
+
+if __name__ == "__main__":
+    process_file()

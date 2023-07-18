@@ -4,10 +4,10 @@ import numpy as np
 import os
 import random
 import torch
-from standalone.CoordinateAnalyzer import CoordinateAnalyzer
+from CoordinateAnalyzer import CoordinateAnalyzer
 
 def process_file(filename, experiment_dict):
-    df = pd.read_hdf(os.path.join('/Users/kkreth/PycharmProjects/data/DL-PTV', filename), key='processed_data')
+    df = pd.read_hdf(os.path.join('/home/kkreth_umassd_edu/DL-PTV', filename), key='processed_data')
 
     # sort dataframe by x, y, z, and time
     df.sort_values(by=['x', 'y', 'z', 'time'], inplace=True)
@@ -31,8 +31,8 @@ def process_file(filename, experiment_dict):
     counter = 0
     batch_size = 1000
 
-    with open("/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData/AE_training_data.JSON", 'ab') as f:
-        for _ in range(1000000):
+    with open("/home/kkreth_umassd_edu/DL-PTV-TrainingData/AE_training_data.JSON", 'ab') as f:
+        for _ in range(100000):
             # select random x, y, z, and time
             x_random = random.choice(x_enumerated_trimmed)
             y_random = random.choice(y_enumerated_trimmed)

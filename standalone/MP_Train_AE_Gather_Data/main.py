@@ -8,11 +8,11 @@ import multiprocessing as mp
 mp.set_start_method('fork')
 
 # read in the meta-data file
-with open("/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt", 'r') as f:
+with open("/home/kkreth_umassd_edu/Umass_experiments.txt", 'r') as f:
     experiment_dict = json.load(f)
 
 # Get the list of .pkl files in the directory
-file_list = [filename for filename in os.listdir('/Users/kkreth/PycharmProjects/data/DL-PTV') if filename.endswith('.pkl')]
+file_list = [filename for filename in os.listdir('/home/kkreth_umassd_edu/DL-PTV') if filename.endswith('.pkl')]
 
 # Create a multiprocessing Pool
 pool = Pool(processes=cpu_count())

@@ -11,7 +11,7 @@ ITERATED = 1000
 
 
 def process_file(filename='/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/359.hdf',
-                 META_DATA_FILE_PATH="/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"):
+                 META_DATA_FILE_PATH="/home/kkreth_umassd_edu/cgan/configs/Umass_experiments.txt"):
     # Open and load the metadata file as a dictionary
     with open(META_DATA_FILE_PATH, 'r') as f:
         experiment_dict = json.load(f)

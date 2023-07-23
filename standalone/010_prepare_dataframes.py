@@ -12,14 +12,14 @@ with open("/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt", 'r
 
 # Specify the directories for input and output
 input_dir = "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/"
-output_dir = "/Users/kkreth/PycharmProjects/data/DL-PTV/"
+output_dir = "/Users/kkreth/PycharmProjects/data/DL-PTV-2/"
 
 # Initialize the converter
 converter = TransformLatent.FloatConverter()
 
 def process_dataframe(df):
     # Ensure that vx, vy, vz, time, distance, x, y, and z are 16-bit signed integers
-    columns_to_convert = ['vx', 'vy', 'vz', 'time', 'distance', 'x', 'y', 'z']
+    columns_to_convert = ['time', 'distance', 'x', 'y', 'z']
     df[columns_to_convert] = df[columns_to_convert].astype('int16')
 
     # Ensure that vx, vy, vz are float32

@@ -1,11 +1,12 @@
 import torch
 import torch.nn as nn
 
+
 class ConvolutionalAutoencoder(nn.Module):
     def __init__(self, latent_size=(8, 6)):
         super(ConvolutionalAutoencoder, self).__init__()
 
-        #self.batch_size = batch_size
+        # self.batch_size = batch_size
         self.latent_size = latent_size
 
         # Encoder layers
@@ -20,7 +21,7 @@ class ConvolutionalAutoencoder(nn.Module):
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2, stride=2),
             nn.Flatten(),
-            nn.Linear(in_features=8*15, out_features=8*6)
+            nn.Linear(in_features=8 * 15, out_features=8 * 6)
         )
 
         # Decoder layers
@@ -54,14 +55,24 @@ class ConvolutionalAutoencoder(nn.Module):
         decoded = self.decoder(encoded.view(x.size(0), -1))
 
         assert decoded.size()[1:] == (
-        3, 125), f"Decoder output size {decoded.size()[1:]} does not match the specified output size (3, 125)."
+            3, 125), f"Decoder output size {decoded.size()[1:]} does not match the specified output size (3, 125)."
 
         return decoded, encoded
+
+    def encode(self, x):
+        encoded = self.encoder(x)
+        encoded = encoded.view(x.size(0), *self.latent_size)  # Reshape the tensor to desired latent size
+        return encoded
+
+    def decode(self, x):
+        decoded = self.decoder(x.view(x.size(0), -1))
+        return decoded
 
 
 def print_model_architecture():
     model = ConvolutionalAutoencoder()
     print(model)
+
 
 if __name__ == '__main__':
     target_input_size = (1, 3, 125)
@@ -74,5 +85,7 @@ if __name__ == '__main__':
     encoder_output = torch.zeros(target_input_size)
     decoded_output = model(encoder_output)
 
-    assert encoder_output.size() == torch.Size(target_input_size), f"Encoder input size {encoder_output.size()} does not match the target input size {target_input_size}."
-    assert decoded_output.size() == torch.Size((1, 3, 125)), f"Decoder output size {decoded_output.size()} does not match the target output size (1, 3, 125)."
+    assert encoder_output.size() == torch.Size(
+        target_input_size), f"Encoder input size {encoder_output.size()} does not match the target input size {target_input_size}."
+    assert decoded_output.size() == torch.Size(
+        (1, 3, 125)), f"Decoder output size {decoded_output.size()} does not match the target output size (1, 3, 125)."

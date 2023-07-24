@@ -10,11 +10,11 @@ import math
 from torch.optim.lr_scheduler import StepLR
 import wandb
 from TransformersDataLoader import CustomDataset
-from TransformerModel import TransformerModel
+from DataDecoder import DecodeData
 import pandas as pd
 from utils import helpers
 
-class Train_Transformer:
+class TrainTransformer:
     # Trainer class for the Transformer model
 
     def load_tensor_from_pickle(self, file_path):
@@ -25,12 +25,13 @@ class Train_Transformer:
     def __init__(self, model, device, data_path="encoded_tensor.pickle",
                  lr=0.001, seq_len=48, epochs=10, log_interval=200,
                  batch_src_seq=9, batch_tgt_seq=1, scheduler_step=1000,
-                 lr_gamma=0.95):
-        # Initializes the model and the necessary parameters for training
-        wandb.init(project='Transformers')
-        config = wandb.config
-        config.batch_size = (batch_src_seq + batch_tgt_seq) * seq_len
-        config.lr = lr
+                 lr_gamma=0.95, is_wandb=True):
+
+        if is_wandb:
+            wandb.init(project='Transformers')
+            config = wandb.config
+            config.batch_size = (batch_src_seq + batch_tgt_seq) * seq_len
+            config.lr = lr
 
         self.debug = True
         self.model = model
@@ -59,8 +60,10 @@ class Train_Transformer:
         self.df_result = pd.DataFrame(
             columns=["epoch", "batch", "batch_data_point", "data_point", "loss", "time"])
 
+        self.decoder = DecodeData(device=device)
+        self.is_wandb = is_wandb
+
     def train(self):
-        # Function to perform the training of the model
         data_point_count = 0
         for epoch in range(self.epochs):
             self.model.train()
@@ -71,7 +74,6 @@ class Train_Transformer:
             src_mask = self.model.generate_square_subsequent_mask(self.seq_len).to(self.device)
             batch_data_point_count = 0
             for batch, (src_batch, tgt) in enumerate(self.dataloader):
-                # print("batch no ", batch, " len src", len(src_batch), " * ",len(src_batch[0]), " len target", len(tgt))
                 tgt = tgt.to(self.device)
                 self.optimizer.zero_grad()
 
@@ -101,8 +103,14 @@ class Train_Transformer:
                     if src.size(0) != self.seq_len:
                         src_mask = self.model.generate_square_subsequent_mask(src.size(0)).to(self.device)
                     output = self.model(src, src_mask)
+                    # Decode values
+                    # decoded_output = self.decoder.decoded_tensor(output)
+                    # decoded_tgt = self.decoder.decoded_tensor(tgt)
+
+                    torch.autograd.set_detect_anomaly(True)
+                    # loss for decoded values
+                    # real_loss = self.criterion(decoded_output, decoded_tgt)
                     loss = self.criterion(output, tgt)
-                    print(output, tgt)
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                     batch_data_point_count += 1
@@ -127,7 +135,9 @@ class Train_Transformer:
                     total_loss = 0
                     start_time = time.time()
             running_loss /= len(self.dataloader)
-            wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
+            if self.is_wandb:
+                wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
+
             print(f'End of epoch {epoch + 1}, Running loss {running_loss:.2f}')
             # Save the model
             if epoch % self.save_interval == 0:
@@ -141,5 +151,6 @@ class Train_Transformer:
         print(f'End of training at {datetime.now().time().strftime("%H:%M:%S")}')
         print(self.df_result.head(20))
         self.logger.save_result(self.df_result)
-        wandb.finish()
+        if self.is_wandb:
+            wandb.finish()
         return running_loss

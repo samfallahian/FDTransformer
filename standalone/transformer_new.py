@@ -1,5 +1,5 @@
 import torch
-from TransformerTrain import Train_Transformer
+from TransformerTrain import TrainTransformer
 from TransformerModel import TransformerModel
 
 
@@ -20,12 +20,13 @@ batch_tgt_seq = 1
 scheduler_step = 5000
 lr_gamma = 0.97
 data_path= "/mnt/d/sources/cgan/playground/convolutional/dataset/encoded_tensor.pickle"
+is_wandb = False
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)
 model = TransformerModel(ninp, nhead, nhid, nlayers, dropout).to(device)
-trainer = Train_Transformer(model, device, data_path=data_path,
+trainer = TrainTransformer(model, device, data_path=data_path,
                  lr=lr, seq_len=seq_len, epochs=epochs, log_interval=log_interval,
                  batch_src_seq=9, batch_tgt_seq=batch_tgt_seq, scheduler_step=scheduler_step,
-                 lr_gamma=lr_gamma)
+                 lr_gamma=lr_gamma, is_wandb=is_wandb)
 loss = trainer.train()

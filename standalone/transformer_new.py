@@ -7,7 +7,7 @@ from TransformerModel import TransformerModel
 
 # Define constants
 seq_len = 48
-epochs = 301
+epochs = 10 # 301
 ninp = 48  # The dimension of your input feature
 nhid = 128  # 200  # Dimension of the feedforward network model in nn.TransformerEncoder
 nlayers = 2  # Number of nn.TransformerEncoderLayer in nn.TransformerEncoder
@@ -19,7 +19,8 @@ batch_src_seq = 9
 batch_tgt_seq = 1
 scheduler_step = 5000
 lr_gamma = 0.97
-data_path= "/mnt/d/sources/cgan/playground/convolutional/dataset/encoded_tensor.pickle"
+# data_path= "/mnt/d/sources/cgan/playground/convolutional/dataset/encoded_tensor.pickle"
+data_path= "../playground/convolutional/dataset/encoded_tensor.pickle"
 is_wandb = False
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')

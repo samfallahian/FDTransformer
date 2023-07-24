@@ -51,7 +51,11 @@ class Encode_Data:
         os.makedirs(self.save_directory, exist_ok=True)  # Create the directory if it doesn't exist
 
     def create_encoded_tensor(self):
-        self.model.load_state_dict(torch.load(self.saved_model_path)["model_state_dict"])
+        if self.device == 'cuda':
+            self.model.load_state_dict(torch.load(self.saved_model_path)["model_state_dict"])
+        else:
+            self.model.load_state_dict(torch.load(self.saved_model_path, map_location=self.device)["model_state_dict"])
+
         appended_tensor = torch.empty(0, 8, 6).float().to(self.device)
 
         for i, data in enumerate(self.orig_data_loader):
@@ -66,7 +70,7 @@ class Encode_Data:
 
 # saved_model_path = r"/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_300.pth"
 # data_path = r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle"
-saved_model_path = "saved_models/checkpoint_300.pth"
+saved_model_path = "saved_models/checkpoint_300_new.pth"
 data_path = "_data_train_autoencoder_flat.pickle"
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 model = ConvolutionalAutoencoder().to(device)

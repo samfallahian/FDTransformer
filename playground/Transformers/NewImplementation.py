@@ -28,7 +28,7 @@ class CustomDataset(Dataset):
 class TransformerSeq2Seq(nn.Module):
     def __init__(self, d_model, nhead, num_encoder_layers, num_decoder_layers):
         super(TransformerSeq2Seq, self).__init__()
-        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, batch_first=True)
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, batch_first=True, dropout=0.1)
         self.fc = nn.Linear(d_model, d_model)  # Simple output layer
 
     def forward(self, src, tgt):
@@ -78,6 +78,8 @@ optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
 for epoch in range(epochs):
     for batch_idx, (source, target) in enumerate(dataloader):
+        source = source.to(device)
+        target = target.to(device)
         # Zero the gradients
         optimizer.zero_grad()
 

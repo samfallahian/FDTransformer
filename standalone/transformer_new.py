@@ -11,7 +11,7 @@ nhead = 6
 num_encoder_layers = 2
 num_decoder_layers = 2
 learning_rate = 0.001
-epochs = 50
+epochs = 300
 batch_size = 48
 dropout = 0.1
 lr = 0.001
@@ -22,7 +22,7 @@ source_size = 8
 target_size = 2
 data_path= "/mnt/d/sources/cgan/playground/convolutional/dataset/encoded_tensor.pickle"
 # data_path= "../playground/convolutional/dataset/encoded_tensor.pickle"
-is_wandb = False
+is_wandb = True
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)

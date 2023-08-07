@@ -94,10 +94,10 @@ class TrainTransformer:
                 if batch_idx % self.log_interval == 0 and batch_idx > 0:
                     elapsed = time.time() - start_time
 
-                    print('| epoch {:3d} | {:5d}/{:5d} batches | '
+                    print('| epoch {:3d}/{:3d} | {:5d}/{:5d} batches | '
                           'lr {:02.6f} | ms/batch {:5.2f} | '
                           'loss {:5.4f}'.format(
-                        epoch + 1, batch_idx, len(self.dataloader), self.scheduler.get_last_lr()[0],
+                        epoch + 1, epoch, batch_idx, len(self.dataloader), self.scheduler.get_last_lr()[0],
                         elapsed * 1000 / self.log_interval,
                         loss.item()))
                     start_time = time.time()

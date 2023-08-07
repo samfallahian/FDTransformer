@@ -1,16 +1,22 @@
 from torch.utils.data import Dataset, DataLoader
 
 class CustomDataset(Dataset):
-    def __init__(self, data, seq_len, batch_src_seq, batch_tgt_seq):
+    def __init__(self, data, source_size=8, target_size=2):
         self.data = data
-        self.seq_len = seq_len
-        self.total_seq = batch_src_seq + batch_tgt_seq  # Here is 10
-        self.batch_src_seq = batch_src_seq  # Here is 9 sequences for source
+        self.source_size = source_size
+        self.target_size = target_size
+        self.chunk_size = source_size + target_size
 
     def __len__(self):
-        return (len(self.data) - self.total_seq * self.seq_len) + 1  # + 1 means the last possible sequence
+        # Number of chunks we can make
+        return len(self.data) // self.chunk_size
 
     def __getitem__(self, idx):
-        src = [self.data[idx + i * self.seq_len: idx + (i + 1) * self.seq_len] for i in range(self.batch_src_seq)]
-        tgt = self.data[idx + self.batch_src_seq * self.seq_len: idx + self.total_seq * self.seq_len]
-        return src, tgt
+        # Start index of chunk
+        start_idx = idx * self.chunk_size
+
+        # Splitting the chunk into source and target
+        source = self.data[start_idx:start_idx + self.source_size]
+        target = self.data[start_idx + self.source_size:start_idx + self.chunk_size]
+
+        return source, target

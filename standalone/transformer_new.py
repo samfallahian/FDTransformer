@@ -11,7 +11,7 @@ nhead = 6
 num_encoder_layers = 2
 num_decoder_layers = 2
 learning_rate = 0.001
-epochs = 300
+epochs = 501
 batch_size = 48
 dropout = 0.1
 lr = 0.001
@@ -20,7 +20,7 @@ scheduler_step = 5000
 lr_gamma = 0.97
 source_size = 8
 target_size = 2
-data_path= "/mnt/d/sources/cgan/playground/convolutional/dataset/encoded_tensor.pickle"
+data_path= "/mnt/d/sources/cgan/standalone/dataset/encoded_tensor_08082023.pickle"
 # data_path= "../playground/convolutional/dataset/encoded_tensor.pickle"
 is_wandb = True
 

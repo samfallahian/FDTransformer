@@ -31,7 +31,7 @@ class CustomDataset(torch.utils.data.Dataset):
 class Encode_Data:
     # Encode data using the Convolutional Autoencoder pre-trained model
 
-    def __init__(self, model, device, saved_model_path="saved_models/checkpoint_300.pth",
+    def __init__(self, model, device, saved_model_path="saved_models/checkpoint_400.pth",
                  data_path="_data_train_autoencoder_flat.pickle",
                  batch_size=1):
         self.model = model
@@ -63,15 +63,15 @@ class Encode_Data:
             appended_tensor = torch.cat((appended_tensor, encoded), dim=0)
         print(f"Encoded tensor shape: {appended_tensor.shape}")
         # Save the tensor using pickle
-        with open(f"{self.save_directory}/appended_tensor.pickle", 'wb') as f:
+        with open(f"{self.save_directory}/appended_tensor_08082023.pickle", 'wb') as f:
             pickle.dump(appended_tensor, f)
         return appended_tensor
 
 
-# saved_model_path = r"/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_300.pth"
-# data_path = r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle"
-saved_model_path = "saved_models/checkpoint_300_new.pth"
-data_path = "_data_train_autoencoder_flat.pickle"
+saved_model_path = r"/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_400.pth"
+data_path = r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencoder_flat.pickle"
+# saved_model_path = "saved_models/checkpoint_400.pth"
+# data_path = "_data_train_autoencoder_flat.pickle"
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 model = ConvolutionalAutoencoder().to(device)
 encoding = Encode_Data(model=model, device=device, saved_model_path=saved_model_path, data_path= data_path)

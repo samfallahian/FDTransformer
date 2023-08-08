@@ -21,11 +21,7 @@ class TrainTransformer:
     def load_tensor_from_pickle(self, file_path):
         with open(file_path, 'rb') as f:
             loaded_tensor = pickle.load(f)
-            tensor_min = loaded_tensor.min()
-            tensor_max = loaded_tensor.max()
-            normalized_tensor = (loaded_tensor - tensor_min) / (
-                    tensor_max - tensor_min)
-        return normalized_tensor.detach()
+        return loaded_tensor
 
     def __init__(self, model, device, data_path="encoded_tensor.pickle",
                  lr=0.001, epochs=10, log_interval=50,

@@ -1,3 +1,5 @@
-import pandas as pd
+import torch
 
-df = pd.read_hdf(path_or_buf='/Users/kkreth/PycharmProjects/data/DL-PTV/8p4.pkl', key='processed_data')
+tensor = torch.load('/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1_exhaustive_tensors.hdf')
+
+

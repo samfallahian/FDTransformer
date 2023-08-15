@@ -37,10 +37,10 @@ class Train_Conv:
         train_data, val_data = random_split(data, [train_len, val_len])
         return train_data, val_data
 
-    def __init__(self, model, device, data_path="_data_train_autoencoder_flat.pickle",
-                 batch_size=100, lr=0.0001):
+    def __init__(self, model, device, data_path="/home/kkreth_umassd_edu/cgan/DL-PTV-TrainingData/AE_training_data.hdf",
+                 batch_size=1000, lr=0.001):
         # Initializes the model and the necessary parameters for training
-        wandb.init(project='ConvolutionalAEv4')  # Starts a new run on Weights & Biases
+        wandb.init(project='ConvAEv6UNITY')  # Starts a new run on Weights & Biases
         config = wandb.config
         config.batch_size = batch_size
         config.lr = lr
@@ -48,7 +48,7 @@ class Train_Conv:
         self.model = model
         print("Model initialized.")
         self.device = device
-        self.data = CustomDataset(pickle.load(open(data_path, "rb")))  # Loads the dataset
+        self.data = CustomDataset(torch.load(data_path)) # Loads the dataset
         print(f"Data loaded. Total samples: {len(self.data)}")
 
         self.batch_size = batch_size
@@ -59,7 +59,7 @@ class Train_Conv:
         self.train_loader = torch.utils.data.DataLoader(self.train_data,
                                                         batch_size=self.batch_size, shuffle=True)
         self.val_loader = torch.utils.data.DataLoader(self.val_data,
-                                                      batch_size=self.batch_size, shuffle=False)
+                                                      batch_size=self.batch_size, shuffle=True)
         self.save_interval = 100  # Save the model every 100 epochs
         self.save_directory = "saved_models"  # Directory to save the models
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist

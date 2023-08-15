@@ -5,13 +5,22 @@ import random
 import time
 import torch
 from CoordinateAnalyzer import CoordinateAnalyzer
+import sys
 
 # Define a global variable for the number of iterations
 ITERATED = 1000
 
+def process_file(filename, META_DATA_FILE_PATH):
+    """
+    Process the HDF file and generate velocity tensors.
 
-def process_file(filename='/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/359.hdf',
-                 META_DATA_FILE_PATH="/home/kkreth_umassd_edu/cgan/configs/Umass_experiments.txt"):
+    Args:
+        filename (str): Path to the HDF file.
+        META_DATA_FILE_PATH (str): Path to the metadata file.
+
+    Returns:
+        None
+    """
     # Open and load the metadata file as a dictionary
     with open(META_DATA_FILE_PATH, 'r') as f:
         experiment_dict = json.load(f)
@@ -83,4 +92,14 @@ def process_file(filename='/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/359.hdf
 
 
 if __name__ == "__main__":
-    process_file()
+    # Check if the correct number of arguments is provided
+    if len(sys.argv) != 3:
+        print("Usage: python 050_gather_training_data_for_AE.py <filename> <META_DATA_FILE_PATH>")
+        sys.exit(1)
+
+    # Extract the command-line arguments
+    filename = sys.argv[1]
+    META_DATA_FILE_PATH = sys.argv[2]
+
+    # Call the function with the provided arguments
+    process_file(filename, META_DATA_FILE_PATH)

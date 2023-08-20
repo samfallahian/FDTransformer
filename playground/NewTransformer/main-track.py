@@ -14,19 +14,19 @@ import pandas as pd
 from utils import helpers
 
 
-# def load_data(file_pattern, num_files):
-#     data_by_coords = defaultdict(list)
-#
-#     for i in range(1, num_files + 1):
-#         filename = file_pattern.format(i)
-#         data = torch.load(filename)
-#
-#         for entry in data:
-#             coords = tuple(entry['coordinates'])
-#             answer = entry['answer'].squeeze(0)  # Reshape [1, 8, 6] to [8, 6]
-#             data_by_coords[coords].append(answer)
-#
-#     return data_by_coords
+def load_data(file_pattern, num_files):
+    data_by_coords = defaultdict(list)
+
+    for i in range(1, num_files + 1):
+        filename = file_pattern.format(i)
+        data = torch.load(filename)
+
+        for entry in data:
+            coords = tuple(entry['coordinates'])
+            answer = entry['answer'].squeeze(0)  # Reshape [1, 8, 6] to [8, 6]
+            data_by_coords[coords].append(answer)
+
+    return data_by_coords
 
 
 data = load_data("/mnt/d/sources/cgan/playground/dataset/3p6_time_{}.torch", 10)
@@ -88,17 +88,17 @@ data_loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
 
 
-# class TransformerModel(nn.Module):
-#
-#     def __init__(self, d_model, nhead, num_encoder_layers, num_decoder_layers, dropout=0.1):
-#         super(TransformerModel, self).__init__()
-#         self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, batch_first=True
-#                                           , dropout=dropout)
-#         self.fc = nn.Linear(d_model, d_model)  # Output layer
-#
-#     def forward(self, src, tgt):
-#         output = self.transformer(src, tgt)
-#         return self.fc(output)
+class TransformerModel(nn.Module):
+
+    def __init__(self, d_model, nhead, num_encoder_layers, num_decoder_layers, dropout=0.1):
+        super(TransformerModel, self).__init__()
+        self.transformer = nn.Transformer(d_model, nhead, num_encoder_layers, num_decoder_layers, batch_first=True
+                                          , dropout=dropout)
+        self.fc = nn.Linear(d_model, d_model)  # Output layer
+
+    def forward(self, src, tgt):
+        output = self.transformer(src, tgt)
+        return self.fc(output)
 
 
 class TrainTransformer:

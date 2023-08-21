@@ -36,7 +36,9 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)
 model = TransformerModel(d_model, nhead, num_encoder_layers, num_decoder_layers, dropout).to(device)
 
-data_reader = DataReader("/Users/mfallahi/Sources/cgan/dataset/3p6_time_{}.torch")
+# data_reader = DataReader("/Users/mfallahi/Sources/cgan/dataset/3p6_time_{}.torch")
+data_reader = DataReader("/mnt/d/sources/cgan/playground/dataset/3p6_time_{}.torch")
+
 data_by_coords = data_reader.load_data(num_time_frame)
 dataset = CustomDataset(data_by_coords=data_by_coords, source_len=source_len, target_len=target_len)
 

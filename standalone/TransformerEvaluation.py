@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import r2_score
+from collections import defaultdict
 
 class Eval:
     def __init__(self, model, device):
@@ -12,7 +13,10 @@ class Eval:
         total_mse = 0.0
         total_mae = 0.0
         all_preds = []
-        all_targets = []
+        all_preds_2d = []
+        # all_targets = []
+        all_targets_2d = []
+        all_coords = []
 
         with torch.no_grad():
             for coords_batch, source_batch, target_batch in data_loader:
@@ -25,11 +29,21 @@ class Eval:
                 total_mse += mse
                 total_mae += mae
 
-                all_preds.extend(output.view(-1).tolist())
-                all_targets.extend(target_batch.view(-1).tolist())
+                all_preds_2d.extend(output.view(-1).tolist())
+                # all_coords.extend(coords_batch.view(-1).tolist())
+                all_targets_2d.extend(target_batch.view(-1).tolist())
 
-        r2 = r2_score(all_targets, all_preds)
+                all_preds.append(output.cpu())
+                all_coords.append(coords_batch.cpu())
+                # all_targets.append(target_batch.cpu())
+
+            all_preds = torch.cat(all_preds, dim=0)
+            all_coords = torch.cat(all_coords, dim=0)
+            # all_targets = torch.cat(all_targets, dim=0)
+
+        r2 = r2_score(all_targets_2d, all_preds_2d)
         mean_mse = total_mse / len(data_loader)
         mean_mae = total_mae / len(data_loader)
 
-        return mean_mse, mean_mae, r2
+
+        return mean_mse, mean_mae, r2, all_preds, all_coords

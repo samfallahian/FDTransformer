@@ -98,6 +98,7 @@ def process_file(filename, META_DATA_FILE_PATH):
 
 '''
 For testing purposes, we can use the following (or equivalent) when calling:
+
 python 050_gather_training_data_for_AE_ALL.py /Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1.hdf /Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt
 '''
 

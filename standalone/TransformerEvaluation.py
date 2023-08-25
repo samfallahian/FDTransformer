@@ -45,5 +45,11 @@ class Eval:
         mean_mse = total_mse / len(data_loader)
         mean_mae = total_mae / len(data_loader)
 
+        predictions_by_coords = defaultdict(list)
 
-        return mean_mse, mean_mae, r2, all_preds, all_coords
+        for i in range(all_coords.size(0)):
+            c_tuple = tuple(all_coords[i].numpy())
+            predictions_by_coords[c_tuple].append(all_preds[i].numpy())
+
+
+        return mean_mse, mean_mae, r2, predictions_by_coords

@@ -1,5 +1,7 @@
 from collections import defaultdict
 import torch
+import gzip
+import io
 
 
 class DataReader:
@@ -11,7 +13,9 @@ class DataReader:
 
         for i in range(1, num_files + 1):
             filename = self.file_pattern.format(i)
-            data = torch.load(filename)
+            with gzip.open(filename, 'rb') as gz_file:
+                buffer = io.BytesIO(gz_file.read())
+            data = torch.load(buffer)
 
             for entry in data:
                 coords = tuple(entry['coordinates'])

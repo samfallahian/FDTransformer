@@ -95,5 +95,5 @@ class TrainTransformer:
         if self.is_wandb:
             wandb.finish()
         # Save the final trained model
-        torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_Final_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
         return running_loss

@@ -142,3 +142,9 @@ playground/data
 
 wandb
 /playground/convolutional/_data_train_autoencoder_flat.pickle
+
+dataset/3p6
+dataset/4p4
+dataset/4p6
+dataset/test
+

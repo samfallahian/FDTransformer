@@ -17,6 +17,12 @@ class DataReader:
                 buffer = io.BytesIO(gz_file.read())
             data = torch.load(buffer)
 
+            PERCENTAGE = 10
+            core_set_size = (PERCENTAGE / 100) * len(data)
+            core_set_size = int(core_set_size)
+            indices = torch.linspace(0, len(data) - 1, core_set_size).long()
+            data = [data[i] for i in indices]
+
             for entry in data:
                 coords = tuple(entry['coordinates'])
                 answer = entry['answer'].squeeze(0)  # Reshape [1, 8, 6] to [8, 6]

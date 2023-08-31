@@ -13,19 +13,19 @@ num_encoder_layers = 2
 num_decoder_layers = 2
 
 # Data
-batch_size = 512
+batch_size = 256
 source_size = 8
 target_size = 2
 source_len = 8
 target_len = 2
-num_time_frame = 200 # should be 1200 for this problem
+num_time_frame = 1200 # should be 1200 for this problem
 
 # Training
 learning_rate = 0.001
 epochs = 301
 dropout = 0.1
 lr = 0.001
-scheduler_step = 20000
+scheduler_step = 60000
 lr_gamma = 0.97
 
 # Log
@@ -39,6 +39,7 @@ model = TransformerModel(d_model, nhead, num_encoder_layers, num_decoder_layers,
 # data_reader = DataReader("/Users/mfallahi/Sources/cgan/dataset/3p6_time_{}.torch")
 # data_reader = DataReader("/mnt/d/sources/cgan/playground/dataset/3p6_time_{}.torch")
 data_reader = DataReader("/mnt/d/sources/cgan/dataset/3p6/{}_tensor_for_transformer.torch.gz")
+# data_reader = DataReader("/mnt/d/sources/cgan/dataset/test/{}_tensor_for_transformer.torch.gz")
 
 data_by_coords = data_reader.load_data(num_time_frame)
 dataset = CustomDataset(data_by_coords=data_by_coords, source_len=source_len, target_len=target_len)

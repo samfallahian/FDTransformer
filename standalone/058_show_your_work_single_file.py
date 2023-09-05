@@ -1,10 +1,14 @@
 import torch
+import gzip
+import io
 
-# Specify the path to the saved new .torch file
-new_file_path = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1_new_tensors.torch"
+# Specify the path to the saved new .torch.gz file
+new_file_path = "/home/kkreth_umassd_edu/DL-PTV/3p6/983_tensor_for_transformer.torch.gz"
 
-# Load the new data from file
-loaded_new_data = torch.load(new_file_path)
+# Unzip and load the new data from file
+with gzip.open(new_file_path, 'rb') as f:
+    buffer = io.BytesIO(f.read())
+loaded_new_data = torch.load(buffer)
 
 # Check if there are at least 5 items in the loaded data
 if len(loaded_new_data) < 5:

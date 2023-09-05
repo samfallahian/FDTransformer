@@ -21,7 +21,8 @@ class ConvolutionalAutoencoder(nn.Module):
             nn.ReLU(),
             nn.MaxPool1d(kernel_size=2, stride=2),
             nn.Flatten(),
-            nn.Linear(in_features=8 * 15, out_features=8 * 6)
+            nn.Linear(in_features=8 * 15, out_features=8 * 6),
+            nn.Sigmoid()  # Added Sigmoid activation to normalize values between 0 and 1.
         )
 
         # Decoder layers

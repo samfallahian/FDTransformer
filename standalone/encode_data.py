@@ -9,7 +9,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ConvolutionalAutoencoder import ConvolutionalAutoencoder
+from HybrdidAutoencoder import HybrdidAutoencoder
 
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -73,6 +73,6 @@ data_path = r"/mnt/d/sources/cgan/playground/convolutional/_data_train_autoencod
 # saved_model_path = "saved_models/checkpoint_400.pth"
 # data_path = "_data_train_autoencoder_flat.pickle"
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
-model = ConvolutionalAutoencoder().to(device)
+model = HybrdidAutoencoder().to(device)
 encoding = Encode_Data(model=model, device=device, saved_model_path=saved_model_path, data_path= data_path)
 encoding.create_encoded_tensor()

@@ -3,7 +3,7 @@ import pytest
 #from ConvolutionalAutoencoder import ConvolutionalAutoencoder
 import sys
 sys.path.append("/Users/kkreth/PycharmProjects/cgan/standalone/")
-from ConvolutionalAutoencoder import ConvolutionalAutoencoder
+from HybrdidAutoencoder import HybrdidAutoencoder
 
 class TestConvolutionalAutoencoder:
     @pytest.fixture
@@ -11,7 +11,7 @@ class TestConvolutionalAutoencoder:
         """
         PyTest fixture that creates a ConvolutionalAutoencoder instance.
         """
-        return ConvolutionalAutoencoder(latent_size=(8, 6))
+        return HybrdidAutoencoder(latent_size=(8, 6))
 
     @pytest.fixture
     def saved_state_path(self):

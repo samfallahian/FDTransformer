@@ -1,12 +1,12 @@
 import torch
-from ConvolutionalAutoencoder import ConvolutionalAutoencoder
+from HybrdidAutoencoder import HybrdidAutoencoder
 
 
 class DecodeData:
 
     def __init__(self, device,
                  saved_model_path="/mnt/d/sources/cgan/playground/convolutional/saved_models/checkpoint_300.pth"):
-        self.model = ConvolutionalAutoencoder().to(device)
+        self.model = HybrdidAutoencoder().to(device)
         self.device = device
         self.saved_model_path = saved_model_path
 

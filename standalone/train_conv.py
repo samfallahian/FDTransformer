@@ -9,7 +9,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from ConvolutionalAutoencoder import ConvolutionalAutoencoder
+from HybrdidAutoencoder import HybrdidAutoencoder
 
 
 class CustomDataset(torch.utils.data.Dataset):
@@ -37,10 +37,10 @@ class Train_Conv:
         train_data, val_data = random_split(data, [train_len, val_len])
         return train_data, val_data
 
-    def __init__(self, model, device, data_path="/home/kkreth_umassd_edu/cgan/DL-PTV-TrainingData/AE_training_data.hdf",
+    def __init__(self, model, device, data_path="/home/kkreth_umassd_edu/DL-PTV-TrainingData/AE_training_data.hdf",
                  batch_size=1000, lr=0.001):
         # Initializes the model and the necessary parameters for training
-        wandb.init(project='ConvAEv6UNITY')  # Starts a new run on Weights & Biases
+        wandb.init(project='ConvAEv7UNITY')  # Starts a new run on Weights & Biases
         config = wandb.config
         config.batch_size = batch_size
         config.lr = lr
@@ -55,12 +55,12 @@ class Train_Conv:
         self.optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
         self.scaler = GradScaler()  # For mixed precision training
         self.train_data, self.val_data = self.split_data(self.data)
-        self.epochs = 400
+        self.epochs = 100
         self.train_loader = torch.utils.data.DataLoader(self.train_data,
                                                         batch_size=self.batch_size, shuffle=True)
         self.val_loader = torch.utils.data.DataLoader(self.val_data,
                                                       batch_size=self.batch_size, shuffle=True)
-        self.save_interval = 100  # Save the model every 100 epochs
+        self.save_interval = 50  # Save the model every 100 epochs
         self.save_directory = "saved_models"  # Directory to save the models
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
 
@@ -81,9 +81,9 @@ class Train_Conv:
 
                 with autocast():
                     # Forward pass through the model
-                    reconstruction, encoded = self.model(inputs)
-                    # Compute the loss
-                    loss = self.model.criterion(inputs, reconstruction)
+                    reconstruction, mu, logvar = self.model(inputs)
+                    # Compute the loss using the new loss function
+                    loss = self.model.loss_function(reconstruction, inputs, mu, logvar)
 
                 # Backward pass and optimization
                 self.scaler.scale(loss).backward()
@@ -92,7 +92,7 @@ class Train_Conv:
 
                 # Store the shape of the encoded tensor after the first forward pass
                 if encoded_shape is None:
-                    encoded_shape = encoded.shape[1:]
+                    encoded_shape = mu.shape[1:]
 
                 running_loss += loss.item()
 
@@ -106,7 +106,7 @@ class Train_Conv:
             for i, data in enumerate(self.val_loader):
                 inputs = data.float().to(self.device)
                 with torch.no_grad():
-                    reconstruction, encoded = self.model(inputs)
+                    reconstruction, _, _ = self.model(inputs)  # Updated this line
                     loss = self.model.criterion(inputs, reconstruction)
                 running_loss += loss.item()
 
@@ -122,7 +122,7 @@ class Train_Conv:
                     'optimizer_state_dict': self.optimizer.state_dict(),
                     'loss': train_loss[-1],
                     'encoded_shape': encoded_shape
-                }, os.path.join(self.save_directory, f"checkpoint_{epoch}.pth"))
+                }, os.path.join(self.save_directory, f"checkpoint_AEHybrid_BatchNORM_{epoch}.pth"))
         print('Finished Training')
         return train_loss, val_loss
 
@@ -138,7 +138,7 @@ class Train_Conv:
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
-model = ConvolutionalAutoencoder().to(device)
+model = HybrdidAutoencoder().to(device)
 trainer = Train_Conv(model, device)
 train_loss, val_loss = trainer.train()
 trainer.plot_loss(train_loss, val_loss)

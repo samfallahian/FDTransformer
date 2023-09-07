@@ -20,7 +20,7 @@ def create_json_object(driver_source, model_source, std_out):
 if __name__ == "__main__":
     # Read text from files
     driver_source = read_file("/Users/kkreth/PycharmProjects/cgan/standalone/train_conv.py")
-    model_source = read_file("/Users/kkreth/PycharmProjects/cgan/standalone/ConvolutionalAutoencoder.py")
+    model_source = read_file("/standalone/HybrdidAutoencoder.py")
     std_out = read_file("/Users/kkreth/PycharmProjects/cgan/standalone/console_output/console.txt")
 
     # Create JSON object

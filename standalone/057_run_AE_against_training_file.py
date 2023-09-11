@@ -2,7 +2,7 @@ import torch
 import os  # <-- Import os for path operation
 import sys
 sys.path.append("/home/kkreth_umassd_edu/cgan/standalone/")
-from HybrdidAutoencoder import HybrdidAutoencoder
+from HybridAutoencoder import HybrdidAutoencoder
 import gzip
 import shutil
 

@@ -3,7 +3,7 @@ import pytest
 #from ConvolutionalAutoencoder import ConvolutionalAutoencoder
 import sys
 sys.path.append("/Users/kkreth/PycharmProjects/cgan/standalone/")
-from HybrdidAutoencoder import HybrdidAutoencoder
+from HybridAutoencoder import HybridAutoencoder
 
 class TestConvolutionalAutoencoder:
     @pytest.fixture
@@ -11,7 +11,7 @@ class TestConvolutionalAutoencoder:
         """
         PyTest fixture that creates a ConvolutionalAutoencoder instance.
         """
-        return HybrdidAutoencoder(latent_size=(8, 6))
+        return HybridAutoencoder(latent_size=(8, 6))
 
     @pytest.fixture
     def saved_state_path(self):
@@ -41,12 +41,10 @@ class TestConvolutionalAutoencoder:
         assert decoded_output.size() == (1, 3, 125), f"Decoding failed. Expected size (1, 3, 125), but got {decoded_output.size()}."
 
     def test_model_loading(self, model, saved_state_path):
-        """
-        Test if the model can load a saved state and still produce the expected output sizes.
-        """
-        # Load the saved state into the model
-        checkpoint = torch.load(saved_state_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Preprocess the state dictionary to remove prefixes
+        processed_state_dict = {k.replace("encoder.", "").replace("decoder.", ""): v for k, v in checkpoint['model_state_dict'].items()}
+        model.load_state_dict(processed_state_dict)
 
         # Generate a random tensor with size (1, 3, 125) to simulate the input data
         random_input = torch.randn((1, 3, 125))

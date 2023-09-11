@@ -1,5 +1,5 @@
 import torch
-from HybrdidAutoencoder import HybrdidAutoencoder
+from HybridAutoencoder import HybrdidAutoencoder
 
 
 class DecodeData:

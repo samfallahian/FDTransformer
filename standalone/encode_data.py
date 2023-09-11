@@ -9,7 +9,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from HybrdidAutoencoder import HybrdidAutoencoder
+from HybridAutoencoder import HybrdidAutoencoder
 
 
 class CustomDataset(torch.utils.data.Dataset):

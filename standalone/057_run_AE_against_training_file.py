@@ -2,7 +2,7 @@ import torch
 import os  # <-- Import os for path operation
 import sys
 sys.path.append("/home/kkreth_umassd_edu/cgan/standalone/")
-from HybridAutoencoder import HybrdidAutoencoder
+from HybridAutoencoder import HybridAutoencoder
 import gzip
 import shutil
 
@@ -21,7 +21,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 loaded_data = torch.load(file_path)
 
 # Instantiate the model first and move it to the device
-model = HybrdidAutoencoder().to(device)
+model = HybridAutoencoder().to(device)
 
 # Load the saved state into the model
 checkpoint = torch.load(saved_state_path, map_location=device)

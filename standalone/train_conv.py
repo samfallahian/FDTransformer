@@ -3,7 +3,11 @@ import torch
 from HybridAutoencoder import HybridAutoencoder, TrainHA, loss_function
 from standalone.HDF4Dataset import HDF5Dataset
 
-def train_conv(data_path="/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData/AE_training_data_subset_corrected.hdf"):
+def train_conv(data_path="/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData/AE_training_data_corrected.hdf"):
+    # Define the device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
     # Create an instance of HDF5Dataset
     data_tensor = HDF5Dataset(data_path)
 
@@ -16,8 +20,10 @@ def train_conv(data_path="/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData
     train_loader = DataLoader(train_dataset, batch_size=1000, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=1000, shuffle=True)
 
-    # Initialize model and train
-    model = HybridAutoencoder(latent_size=(8, 6))
+    # Initialize model and move to device
+    model = HybridAutoencoder(latent_size=(8, 6)).to(device)
+
+    # Train
     TrainHA(model, train_loader, epochs=100, learning_rate=0.001, beta=.75)
 
     # Evaluate on validation set (optional)
@@ -25,8 +31,9 @@ def train_conv(data_path="/Users/kkreth/PycharmProjects/data/DL-PTV-TrainingData
     with torch.no_grad():
         total_loss = 0
         for data in val_loader:
-            reconstructed, mu, logvar = model(data)
-            loss = loss_function(reconstructed, data, mu, logvar, beta=1.0)
+            data = data.to(device)
+            reconstructed, mu, logvar, _ = model(data)  # Adjusted to account for the new return value of z in the forward method
+            loss, _, _, _ = loss_function(reconstructed, data, mu, logvar, beta=.75)  # Adjusted to match loss_function's returned values
             total_loss += loss.item()
 
         avg_loss = total_loss / len(val_loader)

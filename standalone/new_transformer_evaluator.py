@@ -7,7 +7,7 @@ import os
 import pickle
 from HybridAutoencoder import HybridAutoencoder
 
-################ Loading Model ###########################################
+################ Loading Transfer Model ###########################################
 d_model = 48
 nhead = 6
 num_encoder_layers = 2
@@ -19,6 +19,13 @@ model = TransformerModel(d_model, nhead, num_encoder_layers, num_decoder_layers)
 model.load_state_dict(torch.load('/mnt/d/sources/cgan/saved_models/transformer_final_saved_model_09162023.pth'))
 model.eval()
 ############################################################
+
+###################### AE Model ##################################
+ae_model = HybridAutoencoder().to(device)
+ae_model.load_state_dict(torch.load('/mnt/d/sources/cgan/saved_models/HYBRID_checkpoint_50.pth')['model_state_dict'])
+ae_model.eval()
+
+
 
 ############# test data config #############################
 source_len = 4
@@ -55,11 +62,12 @@ for i in range(1, no_seq, window_size):
             source_tensors = source_tensors.to(device)
             target_tensors = target_tensors.to(device)
             output = model(source_tensors, target_tensors)
-            mse = F.mse_loss(output, target_tensors, reduction='mean').item()
-            mae = F.l1_loss(output, target_tensors, reduction='mean').item()
+            decoded_target = ae_model.decode(target_tensors)
+            decoded_output = ae_model.decode(output)
+            mse = F.mse_loss(decoded_output, decoded_target, reduction='mean').item()
+            mae = F.l1_loss(decoded_output, decoded_target, reduction='mean').item()
 
         results.append({'seq': source_len + i, 'coordinates': coordinate, 'answer': target_tensors.view(1, 8, 6),
                         'predicted_answer': output.view(1, 8, 6), 'mse': mse, 'mae': mae})
     with gzip.open(f"{result_directory}/{source_len + i}_{test_dataset}_transformer_result.torch.gz", 'wb') as f:
         pickle.dump(results, f)
-    print(results)

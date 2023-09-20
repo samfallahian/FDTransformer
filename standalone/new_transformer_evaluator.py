@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import os
 import pickle
 from HybridAutoencoder import HybridAutoencoder
+from TransformLatent import FloatConverter
 
 ################ Loading Transfer Model ###########################################
 d_model = 48
@@ -24,6 +25,10 @@ model.eval()
 ae_model = HybridAutoencoder().to(device)
 ae_model.load_state_dict(torch.load('/mnt/d/sources/cgan/saved_models/HYBRID_checkpoint_50.pth')['model_state_dict'])
 ae_model.eval()
+
+############# transform #############################
+converter = FloatConverter()
+###########################################################
 
 
 
@@ -64,8 +69,14 @@ for i in range(1, no_seq, window_size):
             output = model(source_tensors, target_tensors)
             decoded_target = ae_model.decode(target_tensors)
             decoded_output = ae_model.decode(output)
+            converted_target = converter.unconvert(decoded_target)
+            converted_output = converter.unconvert(decoded_output)
             mse = F.mse_loss(decoded_output, decoded_target, reduction='mean').item()
             mae = F.l1_loss(decoded_output, decoded_target, reduction='mean').item()
+            mse_decoded = F.mse_loss(converted_output, converted_target, reduction='mean').item()
+            mae_decoded = F.l1_loss(converted_output, converted_target, reduction='mean').item()
+            print(mse, mse_decoded)
+            print(mae, mae_decoded)
 
         results.append({'seq': source_len + i, 'coordinates': coordinate, 'answer': target_tensors.view(1, 8, 6),
                         'predicted_answer': output.view(1, 8, 6), 'mse': mse, 'mae': mae})

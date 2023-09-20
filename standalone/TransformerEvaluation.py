@@ -3,10 +3,14 @@ import torch.nn.functional as F
 from sklearn.metrics import r2_score
 from collections import defaultdict
 
+
+# from DataDecoder import DecodeData
+
 class Eval:
     def __init__(self, model, device):
         self.model = model
         self.device = device
+        # self.decoder = DecodeData(device=device)
 
     def evaluate(self, data_loader):
         self.model.eval()
@@ -22,10 +26,14 @@ class Eval:
             for coords_batch, source_batch, target_batch in data_loader:
                 source_batch = source_batch.to(self.device)
                 target_batch = target_batch.to(self.device)
-                tgt = torch.zeros((source_batch.size(0), 2, source_batch.size(2)), device=self.device)
-                output = self.model(source_batch, tgt)
+                # tgt = torch.zeros((source_batch.size(0), 2, source_batch.size(2)), device=self.device)
+                # Decoded Source Batch
+                # source_batch = self.decoder.decoded_tensor(source_batch)
+                # tgt = self.decoder.decoded_tensor(tgt)
+                output = self.model(source_batch, target_batch)
                 mse = F.mse_loss(output, target_batch, reduction='mean').item()
                 mae = F.l1_loss(output, target_batch, reduction='mean').item()
+
                 total_mse += mse
                 total_mae += mae
 
@@ -50,6 +58,5 @@ class Eval:
         for i in range(all_coords.size(0)):
             c_tuple = tuple(all_coords[i].numpy())
             predictions_by_coords[c_tuple].append(all_preds[i].numpy())
-
 
         return mean_mse, mean_mae, r2, predictions_by_coords

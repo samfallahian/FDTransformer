@@ -36,3 +36,25 @@ class FloatConverter:
             return converted_df
         else:
             raise TypeError(f"Unsupported input type: {type(value)}, value: {value}")
+
+    def unconvert(self, value):
+        if isinstance(value, (int, float, np.float16)):
+            # Single float value
+            original_value = (value - self.shift) / self.scale
+            if original_value < self.min_value or original_value > self.max_value:
+                raise ValueError("Value out of range")
+            return original_value
+        elif isinstance(value, np.ndarray):
+            # Array of float values
+            original_values = (value - self.shift) / self.scale
+            if np.any(original_values < self.min_value) or np.any(original_values > self.max_value):
+                raise ValueError("Value out of range")
+            return original_values
+        elif isinstance(value, pd.DataFrame):
+            # DataFrame of float values
+            original_df = (value - self.shift) / self.scale
+            if (original_df < self.min_value).any().any() or (original_df > self.max_value).any().any():
+                raise ValueError("Value out of range")
+            return original_df
+        else:
+            raise TypeError(f"Unsupported input type: {type(value)}, value: {value}")

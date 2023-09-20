@@ -81,7 +81,7 @@ class TrainTransformer:
             print(f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.5f}, at {datetime.now().time().strftime('%H:%M:%S')}")
             print("-------------------------------------------------------------------")
             # Save the model
-            if epoch + 1 % self.save_interval == 0:
+            if (epoch + 1) % self.save_interval == 0:
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': self.model.state_dict(),

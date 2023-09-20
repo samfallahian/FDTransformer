@@ -16,6 +16,7 @@ class DataReader:
             with gzip.open(filename, 'rb') as gz_file:
                 buffer = io.BytesIO(gz_file.read())
             data = torch.load(buffer)
+            data = data
 
             PERCENTAGE = 10
             core_set_size = (PERCENTAGE / 100) * len(data)
@@ -25,7 +26,7 @@ class DataReader:
 
             for entry in data:
                 coords = tuple(entry['coordinates'])
-                answer = entry['answer'].squeeze(0)  # Reshape [1, 8, 6] to [8, 6]
+                answer = entry['answer'].squeeze(0) # Reshape [1, 8, 6] to [8, 6]
                 data_by_coords[coords].append(answer)
 
         return data_by_coords

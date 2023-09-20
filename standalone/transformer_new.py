@@ -25,12 +25,12 @@ learning_rate = 0.001
 epochs = 301
 dropout = 0.1
 lr = 0.001
-scheduler_step = 60000
-lr_gamma = 0.97
+scheduler_step = 120000
+lr_gamma = 0.98
 
 # Log
-is_wandb = True
-log_interval = 50
+is_wandb = False
+log_interval = 100
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)
@@ -38,7 +38,7 @@ model = TransformerModel(d_model, nhead, num_encoder_layers, num_decoder_layers,
 
 # data_reader = DataReader("/Users/mfallahi/Sources/cgan/dataset/3p6_time_{}.torch")
 # data_reader = DataReader("/mnt/d/sources/cgan/playground/dataset/3p6_time_{}.torch")
-data_reader = DataReader("/mnt/d/sources/cgan/dataset/3p6/{}_tensor_for_transformer.torch.gz")
+data_reader = DataReader("/mnt/d/sources/cgan/dataset/4p6/{}_tensor_for_transformer.torch.gz")
 # data_reader = DataReader("/mnt/d/sources/cgan/dataset/test/{}_tensor_for_transformer.torch.gz")
 
 data_by_coords = data_reader.load_data(num_time_frame)

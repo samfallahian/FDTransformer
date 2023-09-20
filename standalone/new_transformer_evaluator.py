@@ -69,16 +69,18 @@ for i in range(1, no_seq, window_size):
             output = model(source_tensors, target_tensors)
             decoded_target = ae_model.decode(target_tensors)
             decoded_output = ae_model.decode(output)
-            converted_target = converter.unconvert(decoded_target)
-            converted_output = converter.unconvert(decoded_output)
+            converted_target = converter.unconvert(decoded_target.cpu().reshape(-1, 3).numpy())
+            converted_output = converter.unconvert(decoded_output.cpu().reshape(-1, 3).numpy())
+
             mse = F.mse_loss(decoded_output, decoded_target, reduction='mean').item()
             mae = F.l1_loss(decoded_output, decoded_target, reduction='mean').item()
-            mse_decoded = F.mse_loss(converted_output, converted_target, reduction='mean').item()
-            mae_decoded = F.l1_loss(converted_output, converted_target, reduction='mean').item()
-            print(mse, mse_decoded)
-            print(mae, mae_decoded)
+            mse_denormalized = F.mse_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
+            mae_denormalized = F.l1_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
+
 
         results.append({'seq': source_len + i, 'coordinates': coordinate, 'answer': target_tensors.view(1, 8, 6),
                         'predicted_answer': output.view(1, 8, 6), 'mse': mse, 'mae': mae})
     with gzip.open(f"{result_directory}/{source_len + i}_{test_dataset}_transformer_result.torch.gz", 'wb') as f:
         pickle.dump(results, f)
+
+    # Add

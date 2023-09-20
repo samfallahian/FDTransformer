@@ -60,6 +60,7 @@ for i in range(1, no_seq, window_size):
             data = data[coordinate_idx]
             coordinate = data['coordinates']
             all_tensors.append(data['answer'].squeeze(0))
+            velocity = data['velocity']
 
         source_tensors = torch.stack(all_tensors[:source_len], dim=0).view(source_len, -1)
         target_tensors = torch.stack(all_tensors[source_len:], dim=0).view(target_len, -1)
@@ -76,6 +77,9 @@ for i in range(1, no_seq, window_size):
             mae = F.l1_loss(decoded_output, decoded_target, reduction='mean').item()
             mse_denormalized = F.mse_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
             mae_denormalized = F.l1_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
+
+        print(velocity)
+        print(converted_target)
 
 
         results.append({'seq': source_len + i, 'coordinates': coordinate, 'answer': target_tensors.view(1, 8, 6),

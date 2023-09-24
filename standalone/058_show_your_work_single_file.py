@@ -3,7 +3,8 @@ import gzip
 import io
 
 # Specify the path to the saved new .torch.gz file
-new_file_path = "/home/kkreth_umassd_edu/DL-PTV/10p4/1_tensor_for_transformer.torch.gz"
+new_file_path = "/home/kkreth_umassd_edu/DL-PTV/11p4/11_tensor_for_transformer.torch.gz"
+new_file_path = "/Users/kkreth/PycharmProjects/data/DL-PTV/4p4_sample/1000_tensor_for_transformer.torch.gz"
 
 # Unzip and load the new data from file
 with gzip.open(new_file_path, 'rb') as f:

@@ -34,14 +34,14 @@ model.eval()
 new_data = []
 
 # Show me what this model looks like
-print(dir(model))
+#print(dir(model))
 
 # Now to iterate through them all
 for pair in loaded_data:
     coordinates = pair['coordinates']
     velocity = pair['velocity']
     velocity = velocity.to(torch.float32)
-    velocity = velocity.permute(0, 2, 1)
+    #velocity = velocity.permute(0, 2, 1)
     answer = model.encode(velocity.to(device))
 
     # Append a tuple containing the three values to the list

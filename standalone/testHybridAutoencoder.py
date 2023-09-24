@@ -38,7 +38,6 @@ def test_dataloader_output(setup_dataloader):
         if i < len(dataloader) - 1:  # If it's not the last batch
             assert batch.shape == (100, 125, 3), f"Expected output shape: (100, 125, 3), but got: {batch.shape}"
         else:
-            assert batch.shape[1:] == (
-            125, 3), f"Expected last batch shape to have dimensions (x, 125, 3), but got: {batch.shape}"
+            assert batch.shape[1:] == (125, 3), f"Expected last batch shape to have dimensions (x, 125, 3), but got: {batch.shape}"
 
 

@@ -9,14 +9,20 @@ def print_dataset(name, obj):
     if isinstance(obj, h5py.Dataset):
         try:
             data = obj[...]
-            df = pd.DataFrame(data)
+            reshaped_data = data.reshape(-1, data.shape[-1])  # Reshape the data to 2D
+            df = pd.DataFrame(reshaped_data)
 
             # If columns attribute is available in the dataset, set DataFrame columns
             if 'columns' in obj.attrs:
                 df.columns = [str(col) for col in obj.attrs['columns']]
 
             print(f"Dataset Name: {name}")
-            print(df.head(5))
+            # Print surrogate_coordinate attributes if available
+            for key in obj.attrs.keys():
+                if 'surrogate_coordinate_' in key:
+                    print(f"{key}: {obj.attrs[key]}")
+
+            print(df.head(125))
             print()
 
         except Exception as e:

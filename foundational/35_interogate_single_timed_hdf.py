@@ -16,7 +16,7 @@ def print_dataset(name, obj):
                 df.columns = [str(col) for col in obj.attrs['columns']]
 
             print(f"Dataset Name: {name}")
-            print(df.head(5))
+            print(df.head(25))
             print()
 
         except Exception as e:

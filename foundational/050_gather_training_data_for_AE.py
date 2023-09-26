@@ -5,7 +5,7 @@ import random
 import time
 import torch
 import h5py  # ADDED: Importing the h5py library
-from CoordinateAnalyzer_V2 import CoordinateAnalyzer
+from AnalyzerOfCoordinates import CoordinateAnalyzer
 import sys
 
 '''

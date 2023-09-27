@@ -28,5 +28,5 @@ def explore_hdf5(file_name):
         file.visititems(print_dataset)
 
 
-file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1.hdf'
+file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/tensor_2.hdf'
 explore_hdf5(file_name)

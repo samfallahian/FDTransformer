@@ -4,6 +4,7 @@ import itertools
 from typing import List
 import os
 import unittest
+pd.set_option('display.max_columns', None)
 
 
 class AnalyzerOfCoordinates:
@@ -68,6 +69,20 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
         self.assertTrue(all(value in result_df['x'].values for value in expected_x_values))
         self.assertTrue(all(value in result_df['y'].values for value in expected_y_values))
         self.assertTrue(all(value in result_df['z'].values for value in expected_z_values))
+        print("\r")
+        print(result_df)
+
+
+    def test_analyzer_edge_case(self):
+        json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+        hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1.hdf"
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
+
+        x, y, z = -46.0, -0.0, -33.0
+        with self.assertRaises(ValueError) as context:
+            analyzer.analyze(x, y, z)
+
+        self.assertIn("coordinate not found", str(context.exception))
 
 
 if __name__ == '__main__':

@@ -42,17 +42,19 @@ class FindTensorsForAETraining:
     def run(self):
         random_coordinates = self.get_random_coordinates()
 
-        # Opening the hdf file to read the dataset and output HDF file to write
         with h5py.File(self.hdf_file, 'r') as hdf, h5py.File(self.output_file, 'w') as hdf_out:
             dataset = hdf['processed_data/table']
 
             for idx, (x, y, z) in enumerate(random_coordinates):
                 try:
-                    # Analyzing the coordinates and storing the results as a new dataset in the output HDF5 file
                     result_df = self.analyzer.analyze(x, y, z)
                     tensor = result_df[['vx', 'vy', 'vz']].to_numpy()
                     dataset_name = f"{os.path.basename(os.path.dirname(self.hdf_file))}_{self.output_file_index}_{x}_{y}_{z}"
-                    hdf_out.create_dataset(dataset_name, data=tensor)
+                    dset = hdf_out.create_dataset(dataset_name, data=tensor, compression="gzip", compression_opts=5)
+
+                    # Add the column names as an attribute to the dataset
+                    dset.attrs['columns'] = ['vx', 'vy', 'vz']
+
                 except Exception as e:
                     print(f"Error occurred with coordinates x: {x}, y: {y}, z: {z}. Error: {e}")
 

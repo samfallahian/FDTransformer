@@ -28,5 +28,6 @@ def explore_hdf5(file_name):
         file.visititems(print_dataset)
 
 
-file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/tensor_4.hdf'
+file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/10p4/tensor_4.hdf'
+file_name = '/Users/kkreth/PycharmProjects/merged_file_test_feel_free_to_delete.hdf'
 explore_hdf5(file_name)

@@ -89,9 +89,7 @@ x*x*z here can be asserted to have size 125, with these specific coordinates aro
 going forward:
 
 Here is the sorted complete list (also in JSON format stored locally for me here:
-
-
-
+/Users/kkreth/PycharmProjects/cgan/dataset/3p6 time 300 sample at ReadME.txt.json
 
 
 

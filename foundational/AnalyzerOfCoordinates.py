@@ -4,6 +4,7 @@ import itertools
 from typing import List
 import os
 import unittest
+
 pd.set_option('display.max_columns', None)
 
 
@@ -52,6 +53,12 @@ class AnalyzerOfCoordinates:
 
         return result_df.sort_values(by=['x', 'y', 'z'])
 
+    def provide_coordinates_ordered_list(self, x: float, y: float, z: float) -> List[List[float]]:
+        x_values = self.locate_adjacent_values(x, self.x_enumerated)
+        y_values = self.locate_adjacent_values(y, self.y_enumerated)
+        z_values = self.locate_adjacent_values(z, self.z_enumerated)
+        return list(itertools.product(x_values, y_values, z_values))
+
 
 class TestAnalyzerOfCoordinates(unittest.TestCase):
     def test_analyzer(self):
@@ -69,9 +76,48 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
         self.assertTrue(all(value in result_df['x'].values for value in expected_x_values))
         self.assertTrue(all(value in result_df['y'].values for value in expected_y_values))
         self.assertTrue(all(value in result_df['z'].values for value in expected_z_values))
-        print("\r")
-        print(result_df)
 
+    def test_provide_coordinates_ordered_list(self):
+        json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+        hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/300.hdf"
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
+
+        x, y, z = -113.0, -68.0, -17.0
+        coordinates_ordered_list = analyzer.provide_coordinates_ordered_list(x, y, z)
+
+        centroid_coordinates = (x, y, z)
+
+        expected_coordinates = (-121.0, -68.0, -25.0)
+        # Add other expected coordinates as needed...
+
+        self.assertEqual(coordinates_ordered_list[10], expected_coordinates)
+
+    def test_provide_coordinates_center_center(self):
+        json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+        hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/300.hdf"
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
+
+        x, y, z = -113.0, -68.0, -17.0
+        coordinates_ordered_list = analyzer.provide_coordinates_ordered_list(x, y, z)
+
+        centroid_coordinates = (x, y, z)
+        # Add other expected coordinates as needed...
+
+        expected_coordinates = (-113.0, -68.0, -17.0)
+        # Add other expected coordinates as needed...
+
+        self.assertEqual(coordinates_ordered_list[62], expected_coordinates)
+
+    def test_provide_coordinates_ordered_list_missing_coordinates(self):
+        json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+        hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/300.hdf"
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
+
+        # Missing coordinates, should raise an error
+        with self.assertRaises(ValueError) as context:
+            coordinates_ordered_list = analyzer.provide_coordinates_ordered_list()
+
+        self.assertIn("Provide x, y, and z coordinates", str(context.exception))
 
     def test_analyzer_edge_case(self):
         json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
@@ -87,4 +133,3 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

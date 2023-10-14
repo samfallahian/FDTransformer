@@ -36,7 +36,7 @@ def explore_hdf5(file_name):
 
 file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1_tensors.hdf'
 file_name = '/home/kkreth_umassd_edu/DL-PTV/3p6/tensor_111.hdf'
-file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/111.hdf'
+#file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/111.hdf'
 explore_hdf5(file_name)
 
 

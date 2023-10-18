@@ -37,6 +37,30 @@ In this manner, given a time (arbitrary here, but it is how the files are broken
 experiment ID, and given an x,y,z, you can use this class to find the 125 coordinates (assuming 
 they exist).
 
+Probably worth taking a minute to look at the training files used for the AE. Those files have an
+"attribute" I believe it is called in HD5 files, this is a unique key. I'll be writing a class to 
+read these files, I'll call that:
+
+read_ae_training_files_fileloader.py
+
+I'll pick (probably the very first one in the file) of the combined attribute file (which took a day
+or so to gather on the Unity cluster to sample from all experiments and all times). The file is roughly
+(excepting the fact that duplicates are dropped) ~1000 samples (thanks to random duplicates this is
+closer to ~985) for each time slice of each experiment. Since there are >1,000 time slices this amounts
+to more than a million samples from each and every experiment, "evenly" distributed across time.
+If an encoder can be built using this data that can both have a very low reconstruction error (which has
+to be on the order of hundredths I would think based on the precision of the input data) as measured
+through MSE, and KL divergence (which is proven to be useful to follow on so-called downstream 
+algorithms, whether they are CNNs, Transformers, or Random Forests).
+
+It is worth noting here, that if this AE fails to perform as required in the downstream side, we will
+have to revisit the criterion conceit above. Specifically, measuring MSE across all 125 datapoints may be
+detrimental (given our MSE precision) using 125 datapoints (think ~a hundred datapoints and hundredths of precision,
+these might overlap with one another). We might need to adjust the loss function to instead minimize the one centroid
+error, either completely or using a forced importance through something like a log transformation assumption in the
+underlying polynomial. Hopefully it won't come to this, as I certainly don't want to regenerate all of this data
+iteratively, but honestly whether this works or not this is something we should explore for completeness. Folks will
+definitely care if it works, and if it doesn't this might be the "central reason".
 
 
 

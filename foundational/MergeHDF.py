@@ -16,7 +16,7 @@ def merge_hdf(input_directory, output_file):
             filepath = os.path.join(input_directory, filename)
             print(f"Checking {filepath}")
 
-            if filename.startswith('tensor_') and (filename.endswith('.h5') or filename.endswith('.hdf')):
+            if filename.startswith("tensor") and (filename.endswith('.h5') or filename.endswith('.hd5') or filename.endswith('.hdf')):
                 print(f"Matched {filepath}")
                 matched_files.append(filepath)
 

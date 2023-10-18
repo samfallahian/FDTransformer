@@ -29,5 +29,7 @@ def explore_hdf5(file_name):
 
 
 file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/10p4/tensor_4.hdf'
-file_name = '/Users/kkreth/PycharmProjects/merged_file_test_feel_free_to_delete.hdf'
+file_name = '/home/kkreth_umassd_edu/DL-PTV/10p4/tensor_4.hdf'
+#file_name = '/Users/kkreth/PycharmProjects/merged_file_test_feel_free_to_delete.hdf'
+#file_name = '/home/kkreth_umassd_edu/DL-PTV/_combined/4p4.hd5'
 explore_hdf5(file_name)

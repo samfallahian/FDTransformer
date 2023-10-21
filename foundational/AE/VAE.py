@@ -91,8 +91,11 @@ class VAE(nn.Module):
         return recon_x, mu, logvar
 
 
-def vae_loss(recon_x, x, mu, logvar):
-    MSE = F.mse_loss(recon_x, x.view(x.size(0), -1))
+def loss_function(recon_x, x, mu, logvar):
+    #print(recon_x.shape)
+    #print(x.shape)
+    MSE = F.mse_loss(recon_x.view(x.size(0), -1), x.view(x.size(0), -1))
+
     # KL divergence
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
@@ -141,7 +144,7 @@ def train(model, dataloader, optimizer, num_epochs=100):
         for data in dataloader:
             optimizer.zero_grad()
             recon, mu, logvar = model(data)
-            loss = vae_loss(recon, data, mu, logvar)
+            loss = loss_function(recon, data, mu, logvar)
             loss.backward()
             optimizer.step()
 

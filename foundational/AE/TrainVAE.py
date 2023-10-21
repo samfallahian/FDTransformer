@@ -6,7 +6,7 @@ from foundational.h5DataLoader import DataLoader
 
 
 class Trainer:
-    def __init__(self, dataset_path, batch_size=32, learning_rate=1e-3, num_epochs=50):
+    def __init__(self, dataset_path, batch_size=1000, learning_rate=1e-3, num_epochs=500):
         # Initialize the data loader
         self.dataloader = DataLoader(HDF5DataLoader(dataset_path), batch_size=batch_size, shuffle=True)
 
@@ -15,7 +15,7 @@ class Trainer:
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
 
         # Check if CUDA is available and if so, move the model to the GPU
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
         self.model.to(self.device)
 
         self.num_epochs = num_epochs

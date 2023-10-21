@@ -30,7 +30,7 @@ class HDF5DataLoader(Dataset):
             raise ValueError(f"No valid attribute name for dataset at index {index}.")
 
         if self.debug:
-            print(f"Index: {index}, Key: {key}, Data Shape: {data.shape}, Attribute Name: {attribute_name}")
+            print(f"Index: {index}, Key: {key}, Data Shape: {data.shape}")
 
         return data, attribute_name
 

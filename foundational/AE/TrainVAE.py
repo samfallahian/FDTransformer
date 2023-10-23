@@ -6,9 +6,9 @@ from foundational.h5DataLoader import DataLoader
 
 
 class Trainer:
-    def __init__(self, dataset_path, batch_size=1000, learning_rate=1e-3, num_epochs=500):
+    def __init__(self, dataset_path, batch_size=100000, learning_rate=1e-3, num_epochs=50):
         # Initialize the data loader
-        self.dataloader = DataLoader(HDF5DataLoader(dataset_path), batch_size=batch_size, shuffle=True)
+        self.dataloader = DataLoader(HDF5DataLoader(dataset_path), batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
         # Initialize the VAE and the optimizer
         self.model = VAE()
@@ -38,6 +38,7 @@ class Trainer:
                 if batch_idx % 100 == 0:
                     print(f"Epoch {epoch} [{batch_idx}/{len(self.dataloader)}]\tLoss: {loss.item() / len(data)}")
             print(f"====> Epoch {epoch}: Average Loss: {train_loss / len(self.dataloader.dataset)}")
+            self.save_model(f'vae_model_epoch_{epoch}.pth')
 
     def save_model(self, path):
         torch.save(self.model.state_dict(), path)

@@ -119,7 +119,7 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
 
         self.assertIn("Provide x, y, and z coordinates", str(context.exception))
 
-    def test_analyzer_edge_case(self):
+    def test_analyzer_edge_case_1(self):
         json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
         hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1.hdf"
         analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
@@ -127,6 +127,17 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
         x, y, z = -46.0, -0.0, -33.0
         with self.assertRaises(ValueError) as context:
             analyzer.analyze(x, y, z)
+
+        self.assertIn("coordinate not found", str(context.exception))
+
+    def test_analyzer_edge_case_2(self):
+        json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
+        hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1.hdf"
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file)
+
+        x, y, z = -46.0, -0.0, -33.0
+        with self.assertRaises(ValueError) as context:
+            analyzer.provide_coordinates_ordered_list(x, y, z)
 
         self.assertIn("coordinate not found", str(context.exception))
 

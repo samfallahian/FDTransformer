@@ -55,7 +55,7 @@ def print_dataset(name, obj):
 def test_hdf5_dataloader():
     # Define test hdf5 file name
     test_file_name = '/home/kkreth_umassd_edu/DL-PTV/_combined/3p6.hd5'
-    test_file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/4p6.hd5'
+    test_file_name = '/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/4p6.hd5'
 
 
     # Test DataLoader with debug mode enabled

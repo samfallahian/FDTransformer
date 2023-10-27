@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import torch
 from AE.VAE import VAE
+import argparse
 
 """
 This file scintilates or "pulls together" several items to produce a final table of valid targets for the VAE. All 
@@ -10,7 +11,12 @@ output should have sufficient 'bread crumbs' to completely recreate (or test) th
 When testing locally I used:
 --df /Users/kkreth/PycharmProjects/data/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip --hdf_raw_table /Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1199.hdf --model_path /Users/kkreth/PycharmProjects/cgan/foundational/AE/vae_model_epoch_14.pth
 On the cluster, it will look slightly different (with SLURM substitutions for numbers), but basically this:
---df /home/kkreth_umassd_edu/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip --hdf_raw_table /home/kkreth_umassd_edu/DL-PTV/3p6/1199.hdf --model_path /home/kkreth_umassd_edu/cgan/foundational/AE/vae_model_epoch_14.pth
+--df /home/kkreth_umassd_edu/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip 
+--hdf_raw_table /home/kkreth_umassd_edu/DL-PTV/3p6/1199.hdf 
+--model_path /home/kkreth_umassd_edu/cgan/foundational/AE/vae_model_epoch_14.pth
+
+--df /home/kkreth_umassd_edu/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip --hdf_raw_table /home/kkreth_umassd_edu/DL-PTV/3p6/1199.hdf  --model_path /home/kkreth_umassd_edu/cgan/foundational/AE/vae_model_epoch_14.pth
+
 """
 
 class Scintillator:
@@ -29,7 +35,7 @@ class Scintillator:
 
     def _load_model(self, model_path):
         model = VAE()
-        model.load_state_dict(torch.load(model_path))
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
         model.eval()
         return model
 
@@ -87,7 +93,6 @@ class Scintillator:
         new_file_name = self.df_path.replace("centroid_coordinates_from_", "latent_representation_for_").replace(".hdf", "")
         self.df.to_pickle(new_file_name, compression="zip")
 
-import argparse
 
 def main(args):
     scintillator = Scintillator(args.df, args.hdf_raw_table, args.model_path)

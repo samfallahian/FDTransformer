@@ -3,9 +3,20 @@ import numpy as np
 import torch
 from AE.VAE import VAE
 
+"""
+This file scintilates or "pulls together" several items to produce a final table of valid targets for the VAE. All 
+output should have sufficient 'bread crumbs' to completely recreate (or test) the output.
+
+When testing locally I used:
+--df /Users/kkreth/PycharmProjects/data/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip --hdf_raw_table /Users/kkreth/PycharmProjects/data/DL-PTV/3p6/1199.hdf --model_path /Users/kkreth/PycharmProjects/cgan/foundational/AE/vae_model_epoch_14.pth
+On the cluster, it will look slightly different (with SLURM substitutions for numbers), but basically this:
+--df /home/kkreth_umassd_edu/DL-PTV/3p6/centroid_coordinates_from_1199.hdf.pkl.zip --hdf_raw_table /home/kkreth_umassd_edu/DL-PTV/3p6/1199.hdf --model_path /home/kkreth_umassd_edu/cgan/foundational/AE/vae_model_epoch_14.pth
+"""
+
 class Scintillator:
 
     def __init__(self, df_path, hdf_path, model_path):
+        self.df_path = df_path
         self.df = self._load_dataframe(df_path)
         self.hdf_raw_table = self._load_hdf_table(hdf_path)
         self.vae_model = self._load_model(model_path)
@@ -47,6 +58,7 @@ class Scintillator:
     def process(self):
         exception_messages = []
         total_rows = len(self.df)
+        latent_representations = []
 
         for idx, (_, row) in enumerate(self.df.iterrows()):
             raw_input_tensor = np.zeros((3, 125))
@@ -59,7 +71,7 @@ class Scintillator:
 
             input_tensor = torch.tensor(raw_input_tensor, dtype=torch.float32)
             latent_representation = self.get_latent_representation(input_tensor)
-            print(latent_representation)  # Or do something else with it
+            latent_representations.append(latent_representation.numpy())
 
             if (idx + 1) % 1000 == 0:
                 percentage_complete = (idx + 1) / total_rows * 100
@@ -69,6 +81,11 @@ class Scintillator:
             print("\nExceptions encountered during processing:")
             for exception in exception_messages:
                 print(exception)
+
+        # Add latent representations to dataframe and save
+        self.df['latent_representation'] = latent_representations
+        new_file_name = self.df_path.replace("centroid_coordinates_from_", "latent_representation_for_").replace(".hdf", "")
+        self.df.to_pickle(new_file_name, compression="zip")
 
 import argparse
 

@@ -1,10 +1,10 @@
 import torch
-from TransformerModel import TransformerModel
 import gzip
 import io
 import torch.nn.functional as F
 import os
 import pickle
+from TransformerModel import TransformerModel
 from HybridAutoencoder import HybridAutoencoder
 from TransformLatent import FloatConverter
 
@@ -68,22 +68,43 @@ for i in range(1, no_seq, window_size):
             source_tensors = source_tensors.to(device)
             target_tensors = target_tensors.to(device)
             output = model(source_tensors, target_tensors)
-            decoded_target = ae_model.decode(target_tensors)
-            decoded_output = ae_model.decode(output)
-            converted_target = converter.unconvert(decoded_target.cpu().reshape(-1, 3).numpy())
-            converted_output = converter.unconvert(decoded_output.cpu().reshape(-1, 3).numpy())
+            decoded_target = ae_model.decode(target_tensors).permute(0, 2, 1)
+            decoded_output = ae_model.decode(output).permute(0, 2, 1)
+            converted_target = converter.unconvert(decoded_target.cpu().numpy())
+            converted_output = converter.unconvert(decoded_output.cpu().numpy())
+
+
 
             mse = F.mse_loss(decoded_output, decoded_target, reduction='mean').item()
             mae = F.l1_loss(decoded_output, decoded_target, reduction='mean').item()
             mse_denormalized = F.mse_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
             mae_denormalized = F.l1_loss(torch.from_numpy(converted_output), torch.from_numpy(converted_target), reduction='mean').item()
 
-        print(velocity)
-        print(converted_target)
+        # print("Original velocity shape", velocity.shape)
+        # print("===============================================")
+        # print("decoded_output shape", decoded_output.shape)
+        # # print("decoded_output", decoded_output)
+        # print("===============================================")
+        # print("decoded_target shape", decoded_target.shape)
+        # # print("decoded_target", decoded_target)
+        # print("===============================================")
+        # print("converted_target shape", converted_target.shape)
+        # # print("converted_target", converted_target)
+        # # print("denormalized velocity", converter.unconvert(velocity.cpu().reshape(-1, 3).numpy()))
+        # print("===============================================")
+        # print("converted_output shape", converted_output.shape)
+        # # print("converted_output", converted_output)
+        # print("===============================================")
+        # print("mae", mae)
+        # print("mae norm", mae_denormalized)
 
 
         results.append({'seq': source_len + i, 'coordinates': coordinate, 'answer': target_tensors.view(1, 8, 6),
-                        'predicted_answer': output.view(1, 8, 6), 'mse': mse, 'mae': mae})
+                        'predicted_answer': output.view(1, 8, 6),'decoded_answer': converted_target ,
+                        'predicted_decoded_answer': converted_output , 'mse': mse, 'mae': mae,
+                        'real_mse': mse_denormalized, 'real_mae': mae_denormalized})
+        print(results)
+    break
     with gzip.open(f"{result_directory}/{source_len + i}_{test_dataset}_transformer_result.torch.gz", 'wb') as f:
         pickle.dump(results, f)
 

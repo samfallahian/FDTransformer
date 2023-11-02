@@ -9,7 +9,6 @@ from torch.optim.lr_scheduler import StepLR
 import wandb
 import pandas as pd
 from utils import helpers
-import torch.nn.functional as F
 
 
 class TrainTransformer:
@@ -30,8 +29,8 @@ class TrainTransformer:
         self.save_interval = 100  # Save the model every 100 epochs
         self.save_directory = save_directory
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
-        # self.df_result = pd.DataFrame(
-        #     columns=["epoch", "batch", "batch_data_point", "data_point", "loss", "time"])
+        self.df_result = pd.DataFrame(
+            columns=["epoch", "batch", "batch_data_point", "data_point", "loss", "time"])
 
         # Data
         self.dataset = dataset
@@ -50,12 +49,7 @@ class TrainTransformer:
 
     def loss_function(self, output, target):
         MSE = self.mse(output, target)
-        output_normalized = F.softmax(output, dim=1)
-        target_normalized = F.softmax(target, dim=1)
-        # KLD = torch.sum(target * (torch.log(target) - torch.log(output)))
-        KLD = torch.sum(
-            target_normalized * (torch.log(target_normalized + 1e-10) - torch.log(output_normalized + 1e-10)))
-
+        KLD = torch.sum(target * (torch.log(target) - torch.log(output)))
         total_loss = MSE + self.beta * KLD
         return total_loss
 
@@ -67,12 +61,11 @@ class TrainTransformer:
             start_time = time.time()
             print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
 
-            for batch_idx, (source, target) in enumerate(self.dataloader):
-                source = source.permute(1, 0, 2)
+            for batch_idx, (coords_batch, source, target) in enumerate(self.dataloader):
                 source, target = source.to(self.device), target.to(self.device)
 
                 self.optimizer.zero_grad()
-                output = self.model(source)
+                output = self.model(source, target)
 
                 loss = self.loss_function(output, target)
                 loss.backward()

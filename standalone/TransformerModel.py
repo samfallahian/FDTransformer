@@ -21,28 +21,29 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(0), :]
         return self.dropout(x)
 
-# class Seq2PointTransformer(nn.Module):
-#     def __init__(self, nhead, num_encoder_layers, dim_feedforward, feature_size = 48, max_seq_len=5000, dropout=0.1):
-#         super(Seq2PointTransformer, self).__init__()
-#
-#         self.embedding = nn.Linear(feature_size, feature_size)
-#         self.pos_encoder = PositionalEncoding(feature_size, max_len=max_seq_len)
-#
-#         encoder_layer = nn.TransformerEncoderLayer(d_model=feature_size, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
-#         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
-#
-#         self.decoder = nn.Linear(feature_size, feature_size)
-#
-#     def forward(self, src):
-#         src = self.embedding(src)
-#         src = self.pos_encoder(src)
-#         encoder_output = self.transformer_encoder(src)
-#         output = self.decoder(encoder_output[-1])  # Get the output of the last time step
-#         return output
+
+class Seq2PointPosTransformer(nn.Module):
+    def __init__(self, nhead, num_encoder_layers, dim_feedforward, feature_size = 48, max_seq_len=5000, dropout=0.1):
+        super(Seq2PointPosTransformer, self).__init__()
+
+        self.embedding = nn.Linear(feature_size, feature_size)
+        self.pos_encoder = PositionalEncoding(feature_size, max_len=max_seq_len)
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model=feature_size, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
+
+        self.decoder = nn.Linear(feature_size, feature_size)
+
+    def forward(self, src):
+        src = self.embedding(src)
+        src = self.pos_encoder(src)
+        encoder_output = self.transformer_encoder(src)
+        output = self.decoder(encoder_output[-1])  # Get the output of the last time step
+        return torch.tanh(output)
 
 
 class Seq2PointTransformer(nn.Module):
-    def __init__(self, d_model, nhead, num_encoder_layers, dim_feedforward, feature_size = 48, dropout=0.1):
+    def __init__(self, d_model, nhead, num_encoder_layers, dim_feedforward, feature_size=48, dropout=0.1):
         super(Seq2PointTransformer, self).__init__()
         self.model_type = 'Transformer'
 
@@ -59,7 +60,8 @@ class Seq2PointTransformer(nn.Module):
 
         # Use the last timestep of the encoder output for prediction
         output = self.decoder(encoder_output[-1])
-        return output
+        return torch.tanh(output)
+
 
 class TransformerModel(nn.Module):
 

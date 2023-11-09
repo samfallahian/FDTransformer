@@ -15,7 +15,7 @@ import torch.nn.functional as F
 class TrainTransformer:
     def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
                  beta=0.75, scheduler_step=1000, batch_size=48, lr_gamma=0.95,
-                 is_wandb=True, save_directory="saved_models"):
+                 is_wandb=True, save_directory="saved_models", is_positional=True):
         if is_wandb:
             wandb.init(project='Transformers')
             config = wandb.config
@@ -47,6 +47,7 @@ class TrainTransformer:
         self.mse = nn.MSELoss()  # Define loss and optimizer
         self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma)
         self.beta = beta
+        self.is_positional = is_positional
 
     def loss_function(self, output, target):
         MSE = self.mse(output, target)
@@ -73,7 +74,10 @@ class TrainTransformer:
                 source, target = source.to(self.device), target.to(self.device)
 
                 self.optimizer.zero_grad()
-                output = self.model(source, target)
+                if self.is_positional:
+                    output = self.model(source)
+                else:
+                    output = self.model(source, target)
 
                 # loss = self.loss_function(output, target)
                 loss = self.mse(output, target)

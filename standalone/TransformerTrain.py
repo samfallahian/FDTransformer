@@ -54,6 +54,7 @@ class TrainTransformer:
         target_normalized = F.softmax(target, dim=1)
         # KLD = torch.sum(target * (torch.log(target) - torch.log(output)))
         KLD = torch.sum(
+
             target_normalized * (torch.log(target_normalized + 1e-10) - torch.log(output_normalized + 1e-10)))
 
         total_loss = MSE + self.beta * KLD
@@ -72,9 +73,10 @@ class TrainTransformer:
                 source, target = source.to(self.device), target.to(self.device)
 
                 self.optimizer.zero_grad()
-                output = self.model(source)
+                output = self.model(source, target)
 
-                loss = self.loss_function(output, target)
+                # loss = self.loss_function(output, target)
+                loss = self.mse(output, target)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
 

@@ -14,8 +14,8 @@ import torch.nn.functional as F
 
 class TrainTransformer:
     def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
-                 beta=0.75, scheduler_step=1000, batch_size=48, lr_gamma=0.95,
-                 is_wandb=True, save_directory="saved_models", is_positional=True):
+                 scheduler_step=1000, batch_size=256, lr_gamma=0.95,
+                 is_wandb=True, save_directory="saved_models", kind=1):
         if is_wandb:
             wandb.init(project='Transformers')
             config = wandb.config
@@ -23,6 +23,7 @@ class TrainTransformer:
             config.lr = lr
 
         # Helpers and Logging
+        self.kind = kind
         self.is_wandb = is_wandb
         self.debug = True
         self.logger = helpers.Log("transformer")
@@ -35,7 +36,7 @@ class TrainTransformer:
 
         # Data
         self.dataset = dataset
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=False)
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
 
         # Training
         self.epochs = epochs
@@ -46,8 +47,6 @@ class TrainTransformer:
         self.scaler = GradScaler()  # For mixed precision training
         self.mse = nn.MSELoss()  # Define loss and optimizer
         self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma)
-        self.beta = beta
-        self.is_positional = is_positional
 
     def loss_function(self, output, target):
         MSE = self.mse(output, target)
@@ -61,44 +60,76 @@ class TrainTransformer:
         total_loss = MSE + self.beta * KLD
         return total_loss
 
-
     def train(self):
         for epoch in range(self.epochs):
             self.model.train()
-            running_loss = 0.
+            epoch_loss = 0.
+
             start_time = time.time()
             print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
+            i = 0
+            for coord, sequences in self.dataloader:
+                loss1 = 0.
+                i+=1
+                print(sequences.shape)
+                sequences = sequences.to(self.device)
+                for sequence in sequences:
+                    loss2 = 0.
+                    for s in sequence:
 
-            for batch_idx, (source, target) in enumerate(self.dataloader):
-                source = source.permute(1, 0, 2)
-                source, target = source.to(self.device), target.to(self.device)
+                        if self.kind == 1:
+                            src_seq = s[:-1]
+                            tgt_seq = s[-1]
 
-                self.optimizer.zero_grad()
-                if self.is_positional:
-                    output = self.model(source)
-                else:
-                    output = self.model(source, target)
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq)
+                            # output = model(src_seq[-1])
+                            loss = self.mse(output.view(-1), tgt_seq.view(-1))
 
-                # loss = self.loss_function(output, target)
-                loss = self.mse(output, target)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                        elif self.kind == 2:
+                            src_seq = s[:-1]
+                            tgt_seq = s[-1]
 
-                self.optimizer.step()
-                self.scheduler.step()
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq[-1], tgt_seq)
+                            loss = self.mse(output[-1].view(-1), tgt_seq.view(-1))
 
-                running_loss += loss.item()
-                if batch_idx % self.log_interval == 0 and batch_idx > 0:
+                        elif self.kind == 3:
+                            src_seq = s[:-1]
+                            tgt_seq = s[-1]
+
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq)
+                            loss = self.mse(output[-1].view(-1), tgt_seq.view(-1))
+
+                        elif self.kind == 4:
+                            src_seq = s[:-1]
+                            tgt_seq = s[-1].unsqueeze(0)
+
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq, tgt_seq)
+                            # output = model(src_seq[-1])
+                            loss = self.mse(output, tgt_seq)
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        loss2 += loss.item()
+                    loss1 += (loss2 / len(sequence))
+                epoch_loss += (loss1 / len(sequences))
+                print(i, self.log_interval, i % self.log_interval)
+                if i % self.log_interval == 0:
                     elapsed = time.time() - start_time
 
-                    print(f"| epoch {epoch+1}/{self.epochs} | {batch_idx} batches | lr {self.scheduler.get_last_lr()[0]:.6f} "
-                          f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss.item():.6f}")
-
-            running_loss /= len(self.dataloader)
+                    print(f"| {i} steps | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
+                          f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss1 / len(sequences):.6f}")
+            running_loss = epoch_loss / len(self.dataloader)
             if self.is_wandb:
                 wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
 
-            print(f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.5f}, at {datetime.now().time().strftime('%H:%M:%S')}")
+            print(
+                f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.6f}, at {datetime.now().time().strftime('%H:%M:%S')}")
             print("-------------------------------------------------------------------")
             # Save the model
             if (epoch + 1) % self.save_interval == 0:
@@ -110,10 +141,7 @@ class TrainTransformer:
                 }, os.path.join(self.save_directory, f"transformer_checkpoint_{epoch + 1}.pth"))
         print("=================================================================")
         print(f'End of training at {datetime.now().time().strftime("%H:%M:%S")}')
-        # print(self.df_result.head(20))
-        # self.logger.save_result(self.df_result)
         if self.is_wandb:
             wandb.finish()
         # Save the final trained model
         torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
-        return running_loss

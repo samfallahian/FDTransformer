@@ -3,25 +3,40 @@ import torch
 import numpy as np
 
 
-class CustomDataset(Dataset):
-    def __init__(self, df, source_len=4):
-        self.df = df
-        self.source_len = source_len
-
-        # Flatten all the data into sequences and keep track of the coordinates
-        self.sequences = []
+class SpatioTemporalDataset(Dataset):
+    def __init__(self, dataframe, start_time_frame, sequence_length=5):
+        self.dataframe = dataframe
+        self.sequence_length = sequence_length
+        self.start_time_frame = start_time_frame
+        self.num_samples = len(self.dataframe)
+        self.max_time_frame = self.dataframe.columns[-1]
 
     def __len__(self):
-        return len(self.df) * (self.df.columns.size - self.source_len)  # sliding window of 4
+        return self.num_samples
 
     def __getitem__(self, idx):
-        row_idx = idx // (self.df.columns.size - self.source_len)
-        col_idx = idx % (self.df.columns.size - self.source_len)
+        if idx >= self.num_samples:
+            raise IndexError("Index out of range")
 
-        src_values = [self.df.iloc[row_idx, col_idx + i] for i in range(4)]
-        x = torch.tensor(np.array(src_values), dtype=torch.float32)
+        # Retrieve spatial coordinates
+        coordinates = self.dataframe.iloc[idx][['x', 'y', 'z']].values.astype(np.float32)
 
-        y_values = self.df.iloc[row_idx, col_idx + 4]
-        y = torch.tensor(np.array(y_values), dtype=torch.float32)
+        # Prepare the sequence of latent representations
+        sequences = []
+        num_time_window = (self.max_time_frame - self.start_time_frame + 1) // (self.sequence_length)
 
-        return x, y
+        for t in range(0, num_time_window):
+            c_range = self.start_time_frame + t*self.sequence_length
+            windows = []
+            for c in range(c_range, c_range + self.sequence_length):
+                time_col = c
+                if time_col > self.max_time_frame:
+                    raise IndexError(f"Time column {time_col} not found in the dataframe")
+
+                vector = self.dataframe[int(time_col)].iloc[idx]
+                windows.append(vector)
+
+            windows = np.stack(windows)
+            sequences.append(windows)
+        sequences = np.stack(sequences)
+        return coordinates, torch.tensor(sequences, dtype=torch.float)

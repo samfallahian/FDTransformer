@@ -14,8 +14,8 @@ import torch.nn.functional as F
 
 class TrainTransformer:
     def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
-                 scheduler_step=1000, batch_size=256, lr_gamma=0.95,
-                 is_wandb=True, save_directory="saved_models", kind=1):
+                 beta=0.75, scheduler_step=1000, batch_size=48, lr_gamma=0.95,
+                 is_wandb=True, save_directory="saved_models", is_positional=True):
         if is_wandb:
             wandb.init(project='Transformers')
             config = wandb.config
@@ -23,7 +23,6 @@ class TrainTransformer:
             config.lr = lr
 
         # Helpers and Logging
-        self.kind = kind
         self.is_wandb = is_wandb
         self.debug = True
         self.logger = helpers.Log("transformer")
@@ -36,7 +35,7 @@ class TrainTransformer:
 
         # Data
         self.dataset = dataset
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=False)
 
         # Training
         self.epochs = epochs
@@ -47,6 +46,8 @@ class TrainTransformer:
         self.scaler = GradScaler()  # For mixed precision training
         self.mse = nn.MSELoss()  # Define loss and optimizer
         self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma)
+        self.beta = beta
+        self.is_positional = is_positional
 
     def loss_function(self, output, target):
         MSE = self.mse(output, target)
@@ -60,61 +61,44 @@ class TrainTransformer:
         total_loss = MSE + self.beta * KLD
         return total_loss
 
+
     def train(self):
         for epoch in range(self.epochs):
             self.model.train()
             running_loss = 0.
-
             start_time = time.time()
             print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
-            for batch_idx, (src, tgt, coord, sequences) in enumerate(self.dataloader):
-                # print(len(self.dataloader))
-                # print(batch_idx)
 
-                src, tgt = src.to(self.device), tgt.to(self.device)
-
-                # [seq_len, batch, features]
-                src = src.transpose(0, 1)
-                tgt_input = tgt.unsqueeze(0)
+            for batch_idx, (source, target) in enumerate(self.dataloader):
+                source = source.permute(1, 0, 2)
+                source, target = source.to(self.device), target.to(self.device)
 
                 self.optimizer.zero_grad()
+                if self.is_positional:
+                    output = self.model(source)
+                else:
+                    output = self.model(source, target)
 
-                if self.kind == 1:
-                    output = self.model(src)
-                    # loss = self.mse(output.view(-1), tgt.view(-1))
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
-
-                elif self.kind == 2:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
-
-                elif self.kind == 3:
-                    output = self.model(src)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
-
-                elif self.kind == 4:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output, tgt_input)
-
+                # loss = self.loss_function(output, target)
+                loss = self.mse(output, target)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+
                 self.optimizer.step()
                 self.scheduler.step()
-                running_loss += loss.item()
 
+                running_loss += loss.item()
                 if batch_idx % self.log_interval == 0 and batch_idx > 0:
                     elapsed = time.time() - start_time
 
-                    print(
-                        f"| {batch_idx} batches | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
-                        f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss.item():.6f}")
+                    print(f"| epoch {epoch+1}/{self.epochs} | {batch_idx} batches | lr {self.scheduler.get_last_lr()[0]:.6f} "
+                          f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss.item():.6f}")
 
             running_loss /= len(self.dataloader)
             if self.is_wandb:
                 wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
 
-            print(
-                f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.6f}, at {datetime.now().time().strftime('%H:%M:%S')}")
+            print(f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.5f}, at {datetime.now().time().strftime('%H:%M:%S')}")
             print("-------------------------------------------------------------------")
             # Save the model
             if (epoch + 1) % self.save_interval == 0:
@@ -126,7 +110,10 @@ class TrainTransformer:
                 }, os.path.join(self.save_directory, f"transformer_checkpoint_{epoch + 1}.pth"))
         print("=================================================================")
         print(f'End of training at {datetime.now().time().strftime("%H:%M:%S")}')
+        # print(self.df_result.head(20))
+        # self.logger.save_result(self.df_result)
         if self.is_wandb:
             wandb.finish()
         # Save the final trained model
         torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        return running_loss

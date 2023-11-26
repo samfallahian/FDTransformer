@@ -63,53 +63,67 @@ class TrainTransformer:
     def train(self):
         for epoch in range(self.epochs):
             self.model.train()
-            running_loss = 0.
+            epoch_loss = 0.
 
             start_time = time.time()
             print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
-            for batch_idx, (src, tgt, coord, sequences) in enumerate(self.dataloader):
-                # print(len(self.dataloader))
-                # print(batch_idx)
+            i = 0
+            for coord, sequences in self.dataloader:
+                loss1 = 0.
+                i+=1
 
-                src, tgt = src.to(self.device), tgt.to(self.device)
+                sequences = sequences.to(self.device)
+                for sequence in sequences:
+                    loss2 = 0.
+                    for s in range(0, sequence.shape[0], 5):
 
-                # [seq_len, batch, features]
-                src = src.transpose(0, 1)
-                tgt_input = tgt.unsqueeze(0)
+                        if self.kind == 1:
+                            src_seq = sequence[s:s + 5][:-1]
+                            tgt_seq = sequence[s:s + 5][-1]
 
-                self.optimizer.zero_grad()
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq)
+                            # output = model(src_seq[-1])
+                            loss = self.mse(output.view(-1), tgt_seq.view(-1))
 
-                if self.kind == 1:
-                    output = self.model(src)
-                    # loss = self.mse(output.view(-1), tgt.view(-1))
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                        elif self.kind == 2:
+                            src_seq = sequence[s:s + 5][:-1]
+                            tgt_seq = sequence[s:s + 5][-1]
 
-                elif self.kind == 2:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq[-1], tgt_seq)
+                            loss = self.mse(output[-1].view(-1), tgt_seq.view(-1))
 
-                elif self.kind == 3:
-                    output = self.model(src)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                        elif self.kind == 3:
+                            src_seq = sequence[s:s + 5][:-1]
+                            tgt_seq = sequence[s:s + 5][-1]
 
-                elif self.kind == 4:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output, tgt_input)
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq)
+                            loss = self.mse(output[-1].view(-1), tgt_seq.view(-1))
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                self.optimizer.step()
-                self.scheduler.step()
-                running_loss += loss.item()
+                        elif self.kind == 4:
+                            src_seq = sequence[s:s + 5][:-1]
+                            tgt_seq = sequence[s:s + 5][-1].unsqueeze(0)
 
-                if batch_idx % self.log_interval == 0 and batch_idx > 0:
+                            self.optimizer.zero_grad()
+                            output = self.model(src_seq, tgt_seq)
+                            # output = model(src_seq[-1])
+                            loss = self.mse(output, tgt_seq)
+
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                        self.optimizer.step()
+                        self.scheduler.step()
+                        loss2 += loss.item()
+                    loss1 += (loss2 / len(sequence))
+                epoch_loss += (loss1 / len(sequences))
+                if i % self.log_interval == 0:
                     elapsed = time.time() - start_time
 
-                    print(
-                        f"| {batch_idx} batches | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
-                        f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss.item():.6f}")
-
-            running_loss /= len(self.dataloader)
+                    print(f"| {i} steps | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
+                          f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss1 / len(sequences):.6f}")
+            running_loss = epoch_loss / len(self.dataloader)
             if self.is_wandb:
                 wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
 

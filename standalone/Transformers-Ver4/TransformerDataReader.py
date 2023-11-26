@@ -21,8 +21,14 @@ class DataReader:
             all_dfs.append(sampled_df)
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
+        df_pivot = df_combined.pivot_table(index=['x', 'y', 'z'], columns='time', values='latent_representation',
+                                           aggfunc='first')
+        df_pivot_flat = df_pivot.reset_index()
 
-        return df_combined
+        return df_pivot_flat
 
+# data_reader = DataReader("/mnt/d/sources/cgan/standalone/dataset/latent_representation_for_")
+#
+# df_pivot = data_reader.load_data(15)
 
 

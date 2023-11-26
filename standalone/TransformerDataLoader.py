@@ -4,39 +4,45 @@ import numpy as np
 
 
 class SpatioTemporalDataset(Dataset):
-    def __init__(self, dataframe, start_time_frame, sequence_length=5):
+    def __init__(self, dataframe, num_files, window_size=5, step_size=6):
         self.dataframe = dataframe
-        self.sequence_length = sequence_length
-        self.start_time_frame = start_time_frame
-        self.num_samples = len(self.dataframe)
-        self.max_time_frame = self.dataframe.columns[-1]
+        self.window_size = window_size
+        self.unique_locations = dataframe[['x', 'y', 'z']].drop_duplicates()
+        self.step_size = step_size
+        self.num_files = num_files
 
     def __len__(self):
-        return self.num_samples
+
+        # return len(self.unique_locations) * (self.num_files - self.window_size + 1)
+        num_windows_per_location = (self.num_files - self.window_size) // self.step_size + 1
+        return len(self.unique_locations) * num_windows_per_location
 
     def __getitem__(self, idx):
-        if idx >= self.num_samples:
-            raise IndexError("Index out of range")
+        # Determine location and time window based on index
+        # loc_idx = idx // (self.num_files - self.window_size + 1)
+        # time_idx = idx % (self.num_files - self.window_size + 1)
 
-        # Retrieve spatial coordinates
-        coordinates = self.dataframe.iloc[idx][['x', 'y', 'z']].values.astype(np.float32)
+        loc_idx = idx // ((self.num_files - self.window_size) // self.step_size + 1)
+        time_idx = (idx % ((self.num_files - self.window_size) // self.step_size + 1)) * self.step_size
 
-        # Prepare the sequence of latent representations
-        sequences = []
-        num_time_window = (self.max_time_frame - self.start_time_frame + 1) // (self.sequence_length)
+        # Extract the specific location
+        location = self.unique_locations.iloc[loc_idx]
+        x, y, z = location
 
-        for t in range(0, num_time_window):
-            c_range = self.start_time_frame + t*self.sequence_length
-            windows = []
-            for c in range(c_range, c_range + self.sequence_length):
-                time_col = c
-                if time_col > self.max_time_frame:
-                    raise IndexError(f"Time column {time_col} not found in the dataframe")
+        # Extracting the sliding window for this location
+        window_data = self.dataframe[(self.dataframe['x'] == x) &
+                                     (self.dataframe['y'] == y) &
+                                     (self.dataframe['z'] == z)]
+        window_data = window_data.iloc[time_idx:time_idx + self.window_size]
 
-                vector = self.dataframe[int(time_col)].iloc[idx]
-                windows.append(vector)
+        # Extracting source, target, and time sequences
+        source = np.array(window_data.iloc[:-1]['latent_representation'].tolist())
+        target = window_data.iloc[-1]['latent_representation']  # Assuming this is a numpy array
+        time_seq = np.array(window_data['time'].tolist())
 
-            windows = np.stack(windows)
-            sequences.append(windows)
-        sequences = np.stack(sequences)
-        return coordinates, torch.tensor(sequences, dtype=torch.float)
+        # Converting to tensors
+        source_tensor = torch.FloatTensor(source)
+        target_tensor = torch.FloatTensor(target)
+        time_seq_tensor = torch.LongTensor(time_seq)
+
+        return source_tensor, target_tensor, (x, y, z), time_seq_tensor

@@ -4,12 +4,12 @@ import numpy as np
 
 
 class SpatioTemporalDataset(Dataset):
-    def __init__(self, dataframe, num_files, window_size=5, step_size=6):
+    def __init__(self, dataframe, num_files, window_size=5, step_size=6, start_time_frame=10):
         self.dataframe = dataframe
         self.window_size = window_size
         self.unique_locations = dataframe[['x', 'y', 'z']].drop_duplicates()
         self.step_size = step_size
-        self.num_files = num_files
+        self.num_files = num_files - start_time_frame
 
     def __len__(self):
 

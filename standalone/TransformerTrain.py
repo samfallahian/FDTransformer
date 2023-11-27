@@ -15,7 +15,8 @@ import torch.nn.functional as F
 class TrainTransformer:
     def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
                  scheduler_step=1000, batch_size=256, lr_gamma=0.95,
-                 is_wandb=True, save_directory="saved_models", kind=1):
+                 is_wandb=True, save_directory="saved_models", kind=1,
+                 start_time_frame=1, end_time_frame=1200):
         if is_wandb:
             wandb.init(project='Transformers')
             config = wandb.config
@@ -28,7 +29,9 @@ class TrainTransformer:
         self.debug = True
         self.logger = helpers.Log("transformer")
         self.log_interval = log_interval
-        self.save_interval = 100  # Save the model every 100 epochs
+        self.start_time_frame = start_time_frame
+        self.end_time_frame = end_time_frame
+        self.save_interval = 200  # Save the model every 100 epochs
         self.save_directory = save_directory
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
         # self.df_result = pd.DataFrame(
@@ -36,7 +39,7 @@ class TrainTransformer:
 
         # Data
         self.dataset = dataset
-        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True)
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, num_workers=6,drop_last=True)
 
         # Training
         self.epochs = epochs
@@ -77,28 +80,35 @@ class TrainTransformer:
                 src = src.transpose(0, 1)
                 tgt_input = tgt.unsqueeze(0)
 
-                self.optimizer.zero_grad()
+                # self.optimizer.zero_grad()
 
-                if self.kind == 1:
-                    output = self.model(src)
-                    # loss = self.mse(output.view(-1), tgt.view(-1))
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                with autocast():
+                    if self.kind == 1:
+                        output = self.model(src)
+                        # loss = self.mse(output.view(-1), tgt.view(-1))
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
 
-                elif self.kind == 2:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                    elif self.kind == 2:
+                        output = self.model(src, tgt_input)
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
 
-                elif self.kind == 3:
-                    output = self.model(src)
-                    loss = self.mse(output.view(-1), tgt_input.view(-1))
+                    elif self.kind == 3:
+                        output = self.model(src)
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
 
-                elif self.kind == 4:
-                    output = self.model(src, tgt_input)
-                    loss = self.mse(output, tgt_input)
+                    elif self.kind == 4:
+                        output = self.model(src, tgt_input)
+                        loss = self.mse(output, tgt_input)
 
-                loss.backward()
+                self.scaler.scale(loss).backward()
+
+
+                # loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                # self.optimizer.step()
+                self.optimizer.zero_grad()
                 self.scheduler.step()
                 running_loss += loss.item()
 
@@ -129,4 +139,9 @@ class TrainTransformer:
         if self.is_wandb:
             wandb.finish()
         # Save the final trained model
-        torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        # torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss': running_loss
+        }, os.path.join(self.save_directory, f"transformer_sequence_{self.start_time_frame}_to_{self.end_time_frame}_{datetime.now().date().strftime('%m%d%Y')}.pth"))

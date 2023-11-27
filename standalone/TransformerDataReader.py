@@ -13,9 +13,9 @@ class DataReader:
         all_dfs = []
 
         for i in range(start_time_frame, num_files+1):
-            df = pd.read_pickle(f"{self.file_prefix}{i}.pkl.zip", compression="zip")
-            step = len(df) // 3360
-            sampled_df = df.iloc[::step].copy()
+            sampled_df = pd.read_pickle(f"{self.file_prefix}{i}.pkl.zip", compression="zip")
+            # step = len(df) // 3360
+            # sampled_df = df.iloc[::step].copy()
             sampled_df = sampled_df[['x', 'y', 'z', 'time', 'latent_representation']]
             sampled_df['latent_representation'] = sampled_df['latent_representation'].apply(lambda x: x[0])
             all_dfs.append(sampled_df)

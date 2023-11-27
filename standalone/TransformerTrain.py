@@ -18,7 +18,7 @@ class TrainTransformer:
                  is_wandb=True, save_directory="saved_models", kind=1,
                  start_time_frame=1, end_time_frame=1200):
         if is_wandb:
-            wandb.init(project='Transformers')
+            wandb.init(project='Transformers', name=f"Sequence-{start_time_frame}-to-{end_time_frame}-{datetime.now().date().strftime('%m-%d-%Y')}")
             config = wandb.config
             config.batch_size = batch_size
             config.lr = lr
@@ -114,6 +114,9 @@ class TrainTransformer:
 
                 if batch_idx % self.log_interval == 0 and batch_idx > 0:
                     elapsed = time.time() - start_time
+
+                    if self.is_wandb:
+                        wandb.log({"batch_loss": loss.item()})
 
                     print(
                         f"| {batch_idx} batches | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "

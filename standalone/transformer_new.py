@@ -8,7 +8,7 @@ from TransformerDataLoader import SpatioTemporalDataset
 # Data
 batch_size = 512
 start_time_frame = 1
-end_time_frame = 100 #1200
+end_time_frame = 50 #1200
 
 # Training
 epochs = 102
@@ -16,7 +16,7 @@ scheduler_step = 280000
 lr_gamma = 0.98
 
 # Log
-is_wandb = False
+is_wandb = True
 log_interval = 100
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')

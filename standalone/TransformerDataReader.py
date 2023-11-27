@@ -19,6 +19,7 @@ class DataReader:
             sampled_df = sampled_df[['x', 'y', 'z', 'time', 'latent_representation']]
             sampled_df['latent_representation'] = sampled_df['latent_representation'].apply(lambda x: x[0])
             all_dfs.append(sampled_df)
+            print(f"Sequence {i} has been loaded.")
 
         df_combined = pd.concat(all_dfs, ignore_index=True)
 

@@ -1,51 +1,61 @@
 import torch
-from TransformerModel import TransformerModel
-from TransformerEvalDataReader import DataReader
-from TransformerDataLoader import CustomDataset
+import torch.nn as nn
+from TransformerModel import TimeSeriesTransformer, TransformerModelTarget, Seq2PointPosTransformer, CustomTransformer
+from TransformerDataReader import DataReader
+from TransformerDataLoader import SpatioTemporalDataset
 from torch.utils.data import Dataset, DataLoader
 from TransformerEvaluation import Eval
 from collections import defaultdict
-
-
-
-# Model
-d_model = 48
-nhead = 6
-num_encoder_layers = 2
-num_decoder_layers = 2
+import pandas as pd
 
 # Data
 batch_size = 1
-source_size = 5
-target_size = 1
-source_len = 5
-target_len = 1
-num_time_frame = 10 # 1200 # should be 1200 for this problem
-data_chunk_percentage = 100 # percentage of data to load
-data_chunk = 0 # data chunk
+start_time_frame = 1
+end_time_frame = 15  # 1200
+
+# Training
+scheduler_step = 10000
+lr_gamma = 0.98
+
+# Log
+is_wandb = True
+log_interval = 200
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)
-model = TransformerModel(d_model, nhead, num_encoder_layers, num_decoder_layers).to(device)
+model_no = 4
 
-model.load_state_dict(torch.load('/mnt/d/sources/cgan/saved_models/transformer_final_saved_model_09162023.pth'))
-# model.load_state_dict(torch.load('/mnt/d/sources/cgan/saved_models/transformer_final_saved_model_09162023.pth')['model_state_dict'])
-# model.load_state_dict(torch.load('/Users/mfallahi/Sources/cgan/saved_models/transformer_Final_08212023.pth', map_location=torch.device('mps')))
-model.eval()  # Set the model to evaluation mode
+if model_no == 1:
+    model = TimeSeriesTransformer().to(device)
+elif model_no == 2:
+    model = TransformerModelTarget().to(device)
+elif model_no == 3:
+    model = Seq2PointPosTransformer().to(device)
+elif model_no == 4:
+    model = CustomTransformer().to(device)
+    model = nn.DataParallel(model)
+
+model_path = "/mnt/d/sources/cgan/saved_models/transformer_sequence_1101_to_1200_11302023.pth"
+
+model.load_state_dict(torch.load(model_path)["model_state_dict"])
 
 # Load Data
-# data_reader = DataReader("/mnt/d/sources/cgan/dataset/4p4/{}_tensor_for_transformer.torch.gz")
-# data_reader = DataReader("/mnt/d/sources/cgan/dataset/4p4/{}_tensor_for_transformer.torch.gz")
-data_reader = DataReader("/mnt/d/sources/cgan/dataset/test/{}_tensor_for_transformer.torch.gz")
-# data_reader = DataReader("/Users/mfallahi/Sources/cgan/playground/dataset/3p6_time_{}.torch")
+# data_reader = DataReader("/mnt/d/Normalized/4p6/latent_representation_for_")
+data_reader = DataReader("/mnt/d/sources/cgan/standalone/dataset/latent_representation_for_")
 
-data_by_coords = data_reader.load_data(num_time_frame, data_chunk_percentage, data_chunk)
-dataset = CustomDataset(data_by_coords=data_by_coords, source_len=source_len, target_len=target_len)
+data = data_reader.load_data(end_time_frame, start_time_frame, step=10)
 
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+dataset = SpatioTemporalDataset(dataframe=data, num_files=end_time_frame, window_size=5,
+                                start_time_frame=start_time_frame)
+
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=6)
 
 evaluator = Eval(model, device)
 
-mse, mae, r2, predictions_by_coords = evaluator.evaluate(dataloader)
+mse, mae, r2, results = evaluator.evaluate(dataloader)
+
 print(f'MSE: {mse}, MAE: {mae}, R^2: {r2}')
-# print(predictions_by_coords[-117, -76, -25])
+
+results_df = pd.DataFrame(results, columns=["coord", "time", "result"])
+results_df.to_csv("/mnt/d/sources/cgan/standalone/predictions/result.csv", index=False)
+print(results_df.head())

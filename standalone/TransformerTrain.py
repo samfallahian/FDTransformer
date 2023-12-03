@@ -16,9 +16,10 @@ class TrainTransformer:
     def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
                  scheduler_step=1000, batch_size=256, lr_gamma=0.95,
                  is_wandb=True, save_directory="saved_models", kind=1,
-                 start_time_frame=1, end_time_frame=1200):
+                 start_time_frame=1, end_time_frame=1200, beta=0.5):
         if is_wandb:
-            wandb.init(project='Transformers', name=f"Sequence-{start_time_frame}-to-{end_time_frame}-{datetime.now().date().strftime('%m-%d-%Y')}")
+            # wandb.init(project='Transformers', name=f"Sequence-{start_time_frame}-to-{end_time_frame}-{datetime.now().date().strftime('%m-%d-%Y')}")
+            wandb.init(project='Transformers', name=f"Test-KLD-{datetime.now().date().strftime('%m-%d-%Y')}")
             config = wandb.config
             config.batch_size = batch_size
             config.lr = lr
@@ -31,7 +32,7 @@ class TrainTransformer:
         self.log_interval = log_interval
         self.start_time_frame = start_time_frame
         self.end_time_frame = end_time_frame
-        self.save_interval = 200  # Save the model every 100 epochs
+        self.save_interval = 400  # Save the model every 100 epochs
         self.save_directory = save_directory
         os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
         # self.df_result = pd.DataFrame(
@@ -50,6 +51,7 @@ class TrainTransformer:
         self.scaler = GradScaler()  # For mixed precision training
         self.mse = nn.MSELoss()  # Define loss and optimizer
         self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma)
+        self.beta = beta
 
     def loss_function(self, output, target):
         MSE = self.mse(output, target)
@@ -57,7 +59,6 @@ class TrainTransformer:
         target_normalized = F.softmax(target, dim=1)
         # KLD = torch.sum(target * (torch.log(target) - torch.log(output)))
         KLD = torch.sum(
-
             target_normalized * (torch.log(target_normalized + 1e-10) - torch.log(output_normalized + 1e-10)))
 
         total_loss = MSE + self.beta * KLD
@@ -115,8 +116,8 @@ class TrainTransformer:
                 if batch_idx % self.log_interval == 0 and batch_idx > 0:
                     elapsed = time.time() - start_time
 
-                    if self.is_wandb:
-                        wandb.log({"batch_loss": loss.item()})
+                    # if self.is_wandb:
+                    #     wandb.log({"batch_loss": loss.item()})
 
                     print(
                         f"| {batch_idx} batches | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
@@ -143,8 +144,15 @@ class TrainTransformer:
             wandb.finish()
         # Save the final trained model
         # torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        # torch.save({
+        #     'model_state_dict': self.model.state_dict(),
+        #     'optimizer_state_dict': self.optimizer.state_dict(),
+        #     'loss': running_loss
+        # }, os.path.join(self.save_directory, f"transformer_sequence_{self.start_time_frame}_to_{self.end_time_frame}_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+
         torch.save({
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'loss': running_loss
-        }, os.path.join(self.save_directory, f"transformer_sequence_{self.start_time_frame}_to_{self.end_time_frame}_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        }, os.path.join(self.save_directory,
+                        f"Test_KLD_{datetime.now().date().strftime('%m%d%Y')}.pth"))

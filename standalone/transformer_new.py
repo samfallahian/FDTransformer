@@ -8,16 +8,16 @@ from TransformerDataLoader import SpatioTemporalDataset
 # Data
 batch_size = 512
 start_time_frame = 1
-end_time_frame = 50 #1200
+end_time_frame = 100 #1200
 
 # Training
-epochs = 102
-scheduler_step = 280000
+epochs = 103
+scheduler_step = 10000
 lr_gamma = 0.98
 
 # Log
 is_wandb = True
-log_interval = 100
+log_interval = 200
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)
@@ -32,6 +32,11 @@ elif model_no == 3:
 elif model_no == 4:
     model = CustomTransformer().to(device)
     model = nn.DataParallel(model)
+
+is_transfer = False
+model_path = "/mnt/d/sources/cgan/saved_models/transformer_sequence_901_to_1100_11302023.pth"
+if is_transfer:
+    model.load_state_dict(torch.load(model_path)["model_state_dict"])
 
 data_reader = DataReader("/mnt/d/Normalized/latent_representation_for_")
 # data_reader = DataReader("/mnt/d/sources/cgan/standalone/dataset/latent_representation_for_")

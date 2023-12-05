@@ -81,6 +81,14 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
         self.assertTrue(all(value in result_df['y'].values for value in expected_y_values))
         self.assertTrue(all(value in result_df['z'].values for value in expected_z_values))
 
+    def test_analyze_10p4(self):
+        json_file_location = "/path/to/your/json/file.txt"  # Adjust this path
+        hdf_file = "/path/to/your/10p4/experiment/hdf/file.hdf"  # Adjust this path for the 10p4 experiment
+        analyzer = AnalyzerOfCoordinates(json_file_location, hdf_file=hdf_file, key='10p4')
+
+        result_df = analyzer.analyze_10p4(-34.0, 4.0, -17.0)
+        print(result_df)
+
     def test_provide_coordinates_ordered_list(self):
         json_file_location = "/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt"
         hdf_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/3p6/300.hdf"

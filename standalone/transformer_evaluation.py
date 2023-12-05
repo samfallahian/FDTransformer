@@ -11,15 +11,8 @@ import pandas as pd
 # Data
 batch_size = 1
 start_time_frame = 1
-end_time_frame = 15  # 1200
+end_time_frame = 10  # 1200
 
-# Training
-scheduler_step = 10000
-lr_gamma = 0.98
-
-# Log
-is_wandb = True
-log_interval = 200
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'mps')
 print(device)

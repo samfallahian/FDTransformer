@@ -4,17 +4,17 @@ import numpy as np
 
 
 class SpatioTemporalDataset(Dataset):
-    def __init__(self, dataframe, num_files, window_size=5, step_size=6, start_time_frame=10):
+    def __init__(self, dataframe, num_files, window_size=5, start_time_frame=10):
         self.dataframe = dataframe
         self.window_size = window_size
         self.unique_locations = dataframe[['x', 'y', 'z']].drop_duplicates()
-        self.step_size = step_size
-        self.num_files = num_files - start_time_frame
+        self.num_files = num_files - start_time_frame +1
 
     def __len__(self):
 
         # return len(self.unique_locations) * (self.num_files - self.window_size + 1)
-        num_windows_per_location = (self.num_files - self.window_size) // self.step_size + 1
+        # num_windows_per_location = (self.num_files - self.window_size) // self.step_size + 1
+        num_windows_per_location = ((self.num_files - self.window_size) // self.window_size) + 1
         return len(self.unique_locations) * num_windows_per_location
 
     def __getitem__(self, idx):
@@ -22,8 +22,11 @@ class SpatioTemporalDataset(Dataset):
         # loc_idx = idx // (self.num_files - self.window_size + 1)
         # time_idx = idx % (self.num_files - self.window_size + 1)
 
-        loc_idx = idx // ((self.num_files - self.window_size) // self.step_size + 1)
-        time_idx = (idx % ((self.num_files - self.window_size) // self.step_size + 1)) * self.step_size
+        # loc_idx = idx // ((self.num_files - self.window_size) // self.step_size + 1)
+        # time_idx = (idx % ((self.num_files - self.window_size) // self.step_size + 1)) * self.step_size
+
+        loc_idx = idx // ((self.num_files - self.window_size) // self.window_size + 1)
+        time_idx = (idx % ((self.num_files - self.window_size) // self.window_size + 1)) * self.window_size
 
         # Extract the specific location
         location = self.unique_locations.iloc[loc_idx]

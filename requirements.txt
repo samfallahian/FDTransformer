@@ -1,5 +1,12 @@
-torch==1.13.1
+torch~=2.1.0
 torchvision==0.14.1
 torchaudio==0.13.1
-pandas==1.5.2
+pandas~=2.1.1
 scikit_learn==1.2.0
+numpy~=1.26.1
+wandb~=0.16.0
+matplotlib~=3.8.0
+h5py~=3.10.0
+pytest~=7.4.3
+tqdm~=4.66.1
+progressbar~=2.5

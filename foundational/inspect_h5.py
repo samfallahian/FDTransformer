@@ -28,4 +28,5 @@ if __name__ == "__main__":
     hdf5_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/4p6.hd5'  # Change this to your file's path
     hdf5_file_path = '/home/kkreth_umassd_edu/DL-PTV/3p6/tensor_5.hdf'  # Change this to your file's path
     hdf5_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/10p4/14.hdf'
+    hdf5_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/11p4.hd5'
     inspect_hdf5_file(hdf5_file_path)

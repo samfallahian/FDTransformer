@@ -2,8 +2,10 @@ import os
 import pandas as pd
 import dask.dataframe as dd
 import h5py
+from multiprocessing import Pool
+from tqdm import tqdm
 
-def read_hdf5_to_pandas(file_path):
+def read_and_combine_hdf5(file_path):
     with h5py.File(file_path, 'r') as h5file:
         all_dataframes = []
         for dataset_name in h5file.keys():
@@ -13,38 +15,34 @@ def read_hdf5_to_pandas(file_path):
         combined_df = pd.concat(all_dataframes, ignore_index=True)
         return combined_df
 
+def process_file(file):
+    print(f"Processing {file}...")
+    temp_df = read_and_combine_hdf5(file)
+    print(f"Read {len(temp_df)} records from {file}")
+    return temp_df
+
 def combine_hdf5_files(directory, output_directory):
     hdf5_files = [os.path.join(directory, f) for f in os.listdir(directory) if f.endswith('.hd5')]
-    combined_df = None
 
-    for file in hdf5_files:
-        print(f"Processing {file}...")
-        # Read each file into a combined Pandas DataFrame
-        temp_df = read_hdf5_to_pandas(file)
+    # Using multiprocessing to process each file
+    with Pool() as pool:
+        all_dfs = list(tqdm(pool.imap(process_file, hdf5_files), total=len(hdf5_files)))
 
-        print(f"Read {len(temp_df)} records from {file}")
+    # Combining all DataFrames into one Dask DataFrame
+    combined_df = dd.from_pandas(pd.concat(all_dfs, ignore_index=True), npartitions=len(hdf5_files))
 
-        # Convert Pandas DataFrame to Dask DataFrame
-        dask_df = dd.from_pandas(temp_df, npartitions=1)
+    # Convert all column names to strings to satisfy Parquet requirements
+    combined_df.columns = combined_df.columns.astype(str)
 
-        if combined_df is None:
-            combined_df = dask_df
-        else:
-            combined_df = dd.concat([combined_df, dask_df])
+    # Saving the combined DataFrame as Parquet
+    output_file_path = os.path.join(output_directory, 'combined_data.parquet')
+    combined_df.to_parquet(output_file_path)
 
-    if combined_df is not None:
-        # Convert all column names to strings to satisfy Parquet requirements
-        combined_df.columns = combined_df.columns.astype(str)
-
-        # Saving the combined DataFrame as Parquet
-        output_file_path = os.path.join(output_directory, 'combined_data.parquet')
-        combined_df.to_parquet(output_file_path)
-
-        print(f"Successfully combined files into {output_file_path}")
-    else:
-        print("No data was combined.")
+    print(f"Successfully combined files into {output_file_path}")
 
 if __name__ == "__main__":
     input_directory = '/Users/kkreth/PycharmProjects/data/DL-PTV/_combined'
+    input_directory = '/home/kkreth_umassd_edu/DL-PTV/_combined'
     output_directory = '/Users/kkreth/PycharmProjects/data/DL-PTV/'
+    output_directory = '/home/kkreth_umassd_edu/DL-PTV/'
     combine_hdf5_files(input_directory, output_directory)

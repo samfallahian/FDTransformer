@@ -1,6 +1,7 @@
 import h5py
 import csv
 import numpy as np
+import os
 
 
 def stream_hdf5_to_csv(input_hdf5_file, output_csv_file):
@@ -36,6 +37,14 @@ def stream_hdf5_to_csv(input_hdf5_file, output_csv_file):
 
 
 if __name__ == "__main__":
-    hdf5_file_path = "/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/4p6.hd5"
-    output_csv_file = "/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/4p6.csv"
-    stream_hdf5_to_csv(hdf5_file_path, output_csv_file)
+    # Input directory, adjust this to your needs
+    input_directory = "/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/"
+
+    # Iterate over all files in the input directory
+    for filename in os.listdir(input_directory):
+        # Check if file is a .hd5 file
+        if filename.endswith(".hd5"):
+            hdf5_file_path = os.path.join(input_directory, filename)
+            csv_file_name = filename.rsplit('.', 1)[0] + '.csv'  # Name of the .csv file is prefix of the .hd5 file
+            output_csv_file = os.path.join(input_directory, csv_file_name)
+            stream_hdf5_to_csv(hdf5_file_path, output_csv_file)

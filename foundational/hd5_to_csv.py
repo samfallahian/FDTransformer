@@ -12,7 +12,7 @@ def stream_hdf5_to_csv(input_hdf5_file, output_csv_file):
             csv_writer = csv.writer(csv_file)
 
             header = ["Dataset Name"]
-            for coordinate in range(1, 125):
+            for coordinate in range(1, 126):
                 header.extend([
                     f"Coordinate_{coordinate}_X",
                     f"Coordinate_{coordinate}_Y",

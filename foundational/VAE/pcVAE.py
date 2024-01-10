@@ -7,7 +7,7 @@ import time
 import wandb
 
 # Initialize wandb
-wandb.init(project="pcVAE raw data to console")
+wandb.init(project="pcVAE MSE instead of L1")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -71,14 +71,15 @@ def loss_function(recon_x, x, mu, logvar):
     index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
 
     # Assigning higher weight to the 63rd triple
-    weight_for_63rd_triple = 1000.0  # weight for 63rd triple
+    weight_for_63rd_triple = 100.0  # weight for 63rd triple
     custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
 
     # Reshaping custom_weights to match original tensor shape
     custom_weights = custom_weights.view_as(x)
 
     # Deriving L1 loss, which is absolute difference between reconstructed and actual data
-    loss = torch.abs(recon_x - x.view(-1, original_dim))
+    #loss = torch.abs(recon_x - x.view(-1, original_dim))
+    loss = torch.pow(recon_x - x.view(-1, original_dim), 2)
 
     # Applying weights to individually calculated losses
     weighted_loss = loss * custom_weights

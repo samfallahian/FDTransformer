@@ -7,7 +7,7 @@ import time
 import wandb
 
 # Initialize wandb
-wandb.init(project="pcVAE MSE instead of L1")
+wandb.init(project="pcVAE loads of Leaky ReLU")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -25,32 +25,42 @@ def generate_heatmap(raw_data, reconstruct_data):
     axs[1].set_title('Reconstructed Data')
 
     filename = "heatmap.png"
-    plt.savefig(filename, dpi=1200)
+    plt.savefig(filename, dpi=600)
     plt.close(fig)
     return filename
 
 original_dim = 375
 latent_dim = 47
 epochs = 50
-batch_size = 100
+batch_size = 1000
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
 
+        hidden_dim1 = 200
+        hidden_dim2 = 100
+
         # Encoder
-        self.fc1 = nn.Linear(original_dim, 200)
-        self.fc21 = nn.Linear(200, latent_dim)  # mu layer
-        self.fc22 = nn.Linear(200, latent_dim)  # logvariance layer
+        self.fc1 = nn.Linear(original_dim, hidden_dim1)
+        self.relu1 = nn.LeakyReLU()
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.relu2 = nn.LeakyReLU()
+        self.fc21 = nn.Linear(hidden_dim2, latent_dim)  # mu layer
+        self.fc22 = nn.Linear(hidden_dim2, latent_dim)  # logvariance layer
 
         # Decoder
-        self.fc3 = nn.Linear(latent_dim, 200)
-        self.fc4 = nn.Linear(200, original_dim)
+        self.fc3 = nn.Linear(latent_dim, hidden_dim2)
+        self.relu3 = nn.LeakyReLU()
+        self.fc4 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.relu4 = nn.LeakyReLU()
+        self.fc5 = nn.Linear(hidden_dim1, original_dim)
 
     def encode(self, x):
-        h1 = torch.relu(self.fc1(x))
-        return self.fc21(h1), self.fc22(h1)
+        h1 = self.relu1(self.fc1(x))
+        h2 = self.relu2(self.fc2(h1))
+        return self.fc21(h2), self.fc22(h2)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar)
@@ -58,8 +68,9 @@ class VAE(nn.Module):
         return mu + eps*std
 
     def decode(self, z):
-        h3 = torch.relu(self.fc3(z))
-        return torch.sigmoid(self.fc4(h3))
+        h3 = self.relu3(self.fc3(z))
+        h4 = self.relu4(self.fc4(h3))
+        return self.fc5(h4)
 
     def forward(self, x):
         mu, logvar = self.encode(x.view(-1, original_dim))
@@ -77,7 +88,7 @@ def loss_function(recon_x, x, mu, logvar):
     index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
 
     # Assigning higher weight to the 63rd triple
-    weight_for_63rd_triple = 100.0  # weight for 63rd triple
+    weight_for_63rd_triple = 10.0  # weight for 63rd triple
     custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
 
     # Reshaping custom_weights to match original tensor shape
@@ -131,6 +142,11 @@ def train(model, dataloader, epochs):
         print("Selected indices: ", idx)
         print("Raw data for selected indices: \n", raw_data[idx])
         print("Reconstructed data for selected indices: \n", reconstruct_data[idx])
+
+        # manual MSE calculation for selected rows
+        for i in range(len(idx)):
+            spot_mse = np.mean((raw_data[idx][i] - reconstruct_data[idx][i]) ** 2)
+            print(f'Manual spot MSE for index {idx[i]}: ', spot_mse)
 
         wandb.log({"heatmap": wandb.Image(heatmap_filename)})
         end_time = time.time()

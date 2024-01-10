@@ -43,9 +43,39 @@ class VAE(nn.Module):
         return self.decode(z), mu, logvar
 
 def loss_function(recon_x, x, mu, logvar):
-    BCE = nn.functional.binary_cross_entropy(recon_x, x.view(-1, original_dim), reduction='sum')
+    total_elements = x.nelement() # total number of elements in the tensor
+    weight_for_others = 1.0  # weight for all other elements
+
+    # Creating a tensor of ones with the same size as input
+    custom_weights = torch.ones(total_elements).to(x.device)
+
+    # Finding the index for the 63rd triple assuming the triples are flattened in the tensor
+    index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
+
+    # Assigning higher weight to the 63rd triple
+    weight_for_63rd_triple = 10.0  # weight for 63rd triple
+    custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
+
+    # Reshaping custom_weights to match original tensor shape
+    custom_weights = custom_weights.view_as(x)
+
+    # Deriving L1 loss, which is absolute difference between reconstructed and actual data
+    loss = torch.abs(recon_x - x.view(-1, original_dim))
+
+    # Applying weights to individually calculated losses
+    weighted_loss = loss * custom_weights
+
+    # Mean of the weighted losses.
+    # This acts like an expectation since we are summing over the losses of all entries and dividing by the total entries.
+    # And as the weights are normalized the sum of all weights is equal to the total entries.
+    # So, the mean here would be equivalent to expectation if the weights were probabilities (sum to 1)
+    L1 = weighted_loss.sum() / custom_weights.sum()
+
+    # KL Divergence loss same as before
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    return BCE + KLD
+
+    # the final loss is the sum of the MSE and KLD
+    return L1 + KLD
 
 def train(model, dataloader, epochs):
     model.train()

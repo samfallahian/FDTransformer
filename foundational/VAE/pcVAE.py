@@ -14,12 +14,18 @@ import seaborn as sns
 
 def generate_heatmap(raw_data, reconstruct_data):
     fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
-    sns.heatmap(raw_data, ax=axs[0])
+
+    # Determine common color scale from raw_input
+    vmin, vmax = raw_data.min(), raw_data.max()
+
+    sns.heatmap(raw_data, ax=axs[0], vmin=vmin, vmax=vmax)
     axs[0].set_title('Raw Data')
-    sns.heatmap(reconstruct_data, ax=axs[1])
+
+    sns.heatmap(reconstruct_data, ax=axs[1], vmin=vmin, vmax=vmax)
     axs[1].set_title('Reconstructed Data')
+
     filename = "heatmap.png"
-    plt.savefig(filename, dpi=600)
+    plt.savefig(filename, dpi=1200)
     plt.close(fig)
     return filename
 
@@ -102,7 +108,7 @@ def loss_function(recon_x, x, mu, logvar):
 def train(model, dataloader, epochs):
     model.train()
     optimizer = optim.Adam(model.parameters())
-    start_time_epochs = time.time()  # Define your start_time_epochs here
+    start_time_epochs = time.time()
     for epoch in range(epochs):
         start_time = time.time()
         train_loss = 0
@@ -120,14 +126,16 @@ def train(model, dataloader, epochs):
         reconstruct_data = recon_batch.cpu().detach().numpy()
         idx = np.random.choice(len(raw_data), 5)
         heatmap_filename = generate_heatmap(raw_data[idx], reconstruct_data[idx])
+
+        # New code: print raw and reconstructed data to console
+        print("Selected indices: ", idx)
+        print("Raw data for selected indices: \n", raw_data[idx])
+        print("Reconstructed data for selected indices: \n", reconstruct_data[idx])
+
         wandb.log({"heatmap": wandb.Image(heatmap_filename)})
         end_time = time.time()
-        # epoch_time = end_time - start_time
-        # print(f'====> Epoch: {epoch} Average loss: {train_loss / len(dataloader.dataset)}')
-        # print(f'Epoch Time: {epoch_time} seconds')
 
-    total_training_time = end_time - start_time_epochs  # total_training_time is calculated here after the epoch loop
-    # print('Total training time: {} seconds'.format(total_training_time))
+    total_training_time = end_time - start_time_epochs
 
 def main():
     data = pd.read_csv('/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/5p2_for_testing.csv')

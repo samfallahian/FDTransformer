@@ -4,6 +4,24 @@ from torch.utils.data import DataLoader
 import pandas as pd
 import numpy as np
 import time
+import wandb
+
+# Initialize wandb
+wandb.init(project="pcVAE raw data to console")
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+def generate_heatmap(raw_data, reconstruct_data):
+    fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
+    sns.heatmap(raw_data, ax=axs[0])
+    axs[0].set_title('Raw Data')
+    sns.heatmap(reconstruct_data, ax=axs[1])
+    axs[1].set_title('Reconstructed Data')
+    filename = "heatmap.png"
+    plt.savefig(filename, dpi=600)
+    plt.close(fig)
+    return filename
 
 original_dim = 375
 latent_dim = 47
@@ -44,7 +62,7 @@ class VAE(nn.Module):
 
 def loss_function(recon_x, x, mu, logvar):
     total_elements = x.nelement() # total number of elements in the tensor
-    weight_for_others = 1.0  # weight for all other elements
+    weight_for_others = 0.9  # weight for all other elements
 
     # Creating a tensor of ones with the same size as input
     custom_weights = torch.ones(total_elements).to(x.device)
@@ -53,7 +71,7 @@ def loss_function(recon_x, x, mu, logvar):
     index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
 
     # Assigning higher weight to the 63rd triple
-    weight_for_63rd_triple = 10.0  # weight for 63rd triple
+    weight_for_63rd_triple = 1000.0  # weight for 63rd triple
     custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
 
     # Reshaping custom_weights to match original tensor shape
@@ -74,12 +92,16 @@ def loss_function(recon_x, x, mu, logvar):
     # KL Divergence loss same as before
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
+    total_loss = L1 + KLD
+    wandb.log({"L1 Loss": L1.item(), "KLD Loss": KLD.item(), "Total Loss": total_loss.item()})
+    wandb.log({"63rd Triple Loss": weighted_loss[index_63rd_triple:index_63rd_triple + 3].mean().item()})
     # the final loss is the sum of the MSE and KLD
     return L1 + KLD
 
 def train(model, dataloader, epochs):
     model.train()
     optimizer = optim.Adam(model.parameters())
+    start_time_epochs = time.time()  # Define your start_time_epochs here
     for epoch in range(epochs):
         start_time = time.time()
         train_loss = 0
@@ -90,12 +112,21 @@ def train(model, dataloader, epochs):
             loss.backward()
             train_loss += loss.item()
             optimizer.step()
+
+        # After each epoch, randomly select 5 rows from the raw and reconstructed data,
+        # generate a heatmap, and log it to wandb
+        raw_data = batch.cpu().detach().numpy()
+        reconstruct_data = recon_batch.cpu().detach().numpy()
+        idx = np.random.choice(len(raw_data), 5)
+        heatmap_filename = generate_heatmap(raw_data[idx], reconstruct_data[idx])
+        wandb.log({"heatmap": wandb.Image(heatmap_filename)})
         end_time = time.time()
-        epoch_time = end_time - start_time
-        print(f'====> Epoch: {epoch} Average loss: {train_loss / len(dataloader.dataset)}')
-        print(f'Epoch Time: {epoch_time} seconds')
-    total_training_time = end_time - start_time_epochs
-    print('Total training time: {} seconds'.format(total_training_time))
+        # epoch_time = end_time - start_time
+        # print(f'====> Epoch: {epoch} Average loss: {train_loss / len(dataloader.dataset)}')
+        # print(f'Epoch Time: {epoch_time} seconds')
+
+    total_training_time = end_time - start_time_epochs  # total_training_time is calculated here after the epoch loop
+    # print('Total training time: {} seconds'.format(total_training_time))
 
 def main():
     data = pd.read_csv('/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/5p2_for_testing.csv')

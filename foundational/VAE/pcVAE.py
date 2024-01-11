@@ -7,7 +7,7 @@ import time
 import wandb
 
 # Initialize wandb
-wandb.init(project="pcVAE loads of Leaky ReLU")
+wandb.init(project="pcVAE Full Size Input")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -32,7 +32,7 @@ def generate_heatmap(raw_data, reconstruct_data):
 original_dim = 375
 latent_dim = 47
 epochs = 50
-batch_size = 1000
+batch_size = 10000
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 class VAE(nn.Module):
@@ -79,7 +79,7 @@ class VAE(nn.Module):
 
 def loss_function(recon_x, x, mu, logvar):
     total_elements = x.nelement() # total number of elements in the tensor
-    weight_for_others = 0.9  # weight for all other elements
+    weight_for_others = 1.0  # weight for all other elements
 
     # Creating a tensor of ones with the same size as input
     custom_weights = torch.ones(total_elements).to(x.device)
@@ -95,8 +95,7 @@ def loss_function(recon_x, x, mu, logvar):
     custom_weights = custom_weights.view_as(x)
 
     # Deriving L1 loss, which is absolute difference between reconstructed and actual data
-    #loss = torch.abs(recon_x - x.view(-1, original_dim))
-    loss = torch.pow(recon_x - x.view(-1, original_dim), 2)
+    loss = torch.abs(recon_x - x.view(-1, original_dim))
 
     # Applying weights to individually calculated losses
     weighted_loss = loss * custom_weights
@@ -105,16 +104,16 @@ def loss_function(recon_x, x, mu, logvar):
     # This acts like an expectation since we are summing over the losses of all entries and dividing by the total entries.
     # And as the weights are normalized the sum of all weights is equal to the total entries.
     # So, the mean here would be equivalent to expectation if the weights were probabilities (sum to 1)
-    L1 = weighted_loss.sum() / custom_weights.sum()
+    MAE = weighted_loss.sum() / custom_weights.sum()
 
     # KL Divergence loss same as before
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-    total_loss = L1 + KLD
-    wandb.log({"L1 Loss": L1.item(), "KLD Loss": KLD.item(), "Total Loss": total_loss.item()})
+    total_loss = MAE + KLD
+    wandb.log({"MAE Loss": MAE.item(), "KLD Loss": KLD.item(), "Total Loss": total_loss.item()})
     wandb.log({"63rd Triple Loss": weighted_loss[index_63rd_triple:index_63rd_triple + 3].mean().item()})
-    # the final loss is the sum of the MSE and KLD
-    return L1 + KLD
+    # the final loss is the sum of the MAE and KLD
+    return MAE + KLD
 
 def train(model, dataloader, epochs):
     model.train()
@@ -154,7 +153,7 @@ def train(model, dataloader, epochs):
     total_training_time = end_time - start_time_epochs
 
 def main():
-    data = pd.read_csv('/Users/kkreth/PycharmProjects/data/DL-PTV/_combined/5p2_for_testing.csv')
+    data = pd.read_csv('/Users/kkreth/PycharmProjects/data/DL-PTV/combined_data_for_training_AE.csv')
     data = data.iloc[:, 1:]  # Exclude the first column
     data = data.astype(np.float32)
     data = data.values  # Convert to np array

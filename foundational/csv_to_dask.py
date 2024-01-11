@@ -36,7 +36,7 @@ for chunk in chunk_iterator:
 df_pandas.rename(columns={'Dataset Name': 'DatasetName'}, inplace=True)
 
 # Define the path for the output pickle file
-output_pickle_file = os.path.join(os.path.dirname(csv_file), 'dataframe.pkl')
+output_pickle_file = os.path.join(os.path.dirname(csv_file), 'combined_data_for_training_AE.dataframe.pkl')
 
 # Save the Pandas DataFrame to disk using pickle
 with open(output_pickle_file, 'wb') as file:

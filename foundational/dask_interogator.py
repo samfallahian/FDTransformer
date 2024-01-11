@@ -21,7 +21,7 @@ def load_and_print_first_element(file_path):
         print("Array is empty.")
 
 # Path to your pickled Dask array
-pickle_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/combined_external_links.dask'
+pickle_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/combined_data_for_training_AE.dataframe.pkl'
 
 # Load and print the first element
 load_and_print_first_element(pickle_file_path)

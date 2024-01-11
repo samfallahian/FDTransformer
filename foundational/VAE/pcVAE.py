@@ -1,3 +1,5 @@
+import pickle
+
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
@@ -5,6 +7,7 @@ import pandas as pd
 import numpy as np
 import time
 import wandb
+import os
 
 # Initialize wandb
 wandb.init(project="pcVAE Full Size Input")
@@ -153,10 +156,15 @@ def train(model, dataloader, epochs):
     total_training_time = end_time - start_time_epochs
 
 def main():
-    data = pd.read_csv('/Users/kkreth/PycharmProjects/data/DL-PTV/combined_data_for_training_AE.csv')
-    data = data.iloc[:, 1:]  # Exclude the first column
-    data = data.astype(np.float32)
-    data = data.values  # Convert to np array
+    # Path to your pickled dataframe
+    pickle_file_path = '/Users/kkreth/PycharmProjects/data/DL-PTV/combined_data_for_training_AE.dataframe.pkl'
+
+    # Load the pickled DataFrame
+    with open(pickle_file_path, 'rb') as file:
+        df_pandas = pickle.load(file)
+
+    df_pandas_truncated = df_pandas.iloc[:, 1:]
+    data = df_pandas_truncated.Tensor
     data = data.reshape((len(data), np.prod(data.shape[1:])))
     data = torch.Tensor(data)  # convert to Tensor
     data = data.to(device)

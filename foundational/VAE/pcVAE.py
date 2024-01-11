@@ -35,7 +35,7 @@ def generate_heatmap(raw_data, reconstruct_data):
 original_dim = 375
 latent_dim = 47
 epochs = 50
-batch_size = 10000
+batch_size = 1000
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 class VAE(nn.Module):
@@ -164,10 +164,10 @@ def main():
         df_pandas = pickle.load(file)
 
     df_pandas_truncated = df_pandas.iloc[:, 1:]
-    data = df_pandas_truncated.Tensor
-    data = data.reshape((len(data), np.prod(data.shape[1:])))
+    data = df_pandas_truncated.values  # <--- This line is changed.
     data = torch.Tensor(data)  # convert to Tensor
     data = data.to(device)
+
     vae = VAE().to(device)
 
     dataloader = DataLoader(data, batch_size=batch_size, shuffle=True)

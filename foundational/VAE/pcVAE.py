@@ -8,9 +8,10 @@ import numpy as np
 import time
 import wandb
 import os
+from sklearn.model_selection import train_test_split
 
 # Initialize wandb
-wandb.init(project="pcVAE Full Size Input")
+wandb.init(project="Not creating a URL")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -163,9 +164,19 @@ def main():
     with open(pickle_file_path, 'rb') as file:
         df_pandas = pickle.load(file)
 
-    df_pandas_truncated = df_pandas.iloc[:, 1:]
+    #TODO We will have to add official validation logic, but for now this will help
+    # Split data into 80% train and 20% validation
+    train_data, validation_data = train_test_split(df_pandas, test_size=.950, random_state=42)
+    del validation_data
+    del df_pandas
+    df_pandas_truncated = train_data.iloc[:, 1:]
     data = df_pandas_truncated.values  # <--- This line is changed.
     data = torch.Tensor(data)  # convert to Tensor
+    print("Dtypes in use in our dataframe are: " + str(data.dtype))
+    # Check the data type of the tensor
+    if data.dtype == torch.float16:
+        # Convert to Float32
+        data = data.float()
     data = data.to(device)
 
     vae = VAE().to(device)

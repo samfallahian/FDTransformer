@@ -11,7 +11,7 @@ import os
 from sklearn.model_selection import train_test_split
 
 # Initialize wandb
-wandb.init(project="Not creating a URL")
+wandb.init(project="Adjusted L1 Lamda and Batch Size")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -36,7 +36,7 @@ def generate_heatmap(raw_data, reconstruct_data):
 original_dim = 375
 latent_dim = 47
 epochs = 50
-batch_size = 1000
+batch_size = 100
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 class VAE(nn.Module):
@@ -45,26 +45,30 @@ class VAE(nn.Module):
 
         hidden_dim1 = 200
         hidden_dim2 = 100
+        hidden_dim3 = 50
 
         # Encoder
         self.fc1 = nn.Linear(original_dim, hidden_dim1)
-        self.relu1 = nn.LeakyReLU()
+        self.relu1 = nn.ReLU()
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.fc21 = nn.Linear(hidden_dim2, hidden_dim3)  # extra layer
         self.relu2 = nn.LeakyReLU()
-        self.fc21 = nn.Linear(hidden_dim2, latent_dim)  # mu layer
-        self.fc22 = nn.Linear(hidden_dim2, latent_dim)  # logvariance layer
+        self.fc31 = nn.Linear(hidden_dim3, latent_dim)  # mu layer
+        self.fc32 = nn.Linear(hidden_dim3, latent_dim)  # logvariance layer
 
         # Decoder
-        self.fc3 = nn.Linear(latent_dim, hidden_dim2)
-        self.relu3 = nn.LeakyReLU()
-        self.fc4 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.fc4 = nn.Linear(latent_dim, hidden_dim3)
+        self.fc5 = nn.Linear(hidden_dim3, hidden_dim2)  # extra layer
+        self.relu3 = nn.ReLU()
+        self.fc6 = nn.Linear(hidden_dim2, hidden_dim1)
         self.relu4 = nn.LeakyReLU()
-        self.fc5 = nn.Linear(hidden_dim1, original_dim)
+        self.fc7 = nn.Linear(hidden_dim1, original_dim)
 
     def encode(self, x):
         h1 = self.relu1(self.fc1(x))
         h2 = self.relu2(self.fc2(h1))
-        return self.fc21(h2), self.fc22(h2)
+        h3 = self.relu2(self.fc21(h2))
+        return self.fc31(h3), self.fc32(h3)
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5*logvar)
@@ -72,9 +76,10 @@ class VAE(nn.Module):
         return mu + eps*std
 
     def decode(self, z):
-        h3 = self.relu3(self.fc3(z))
-        h4 = self.relu4(self.fc4(h3))
-        return self.fc5(h4)
+        h4 = self.relu3(self.fc4(z))
+        h5 = self.relu3(self.fc5(h4))
+        h6 = self.relu4(self.fc6(h5))
+        return self.fc7(h6)
 
     def forward(self, x):
         mu, logvar = self.encode(x.view(-1, original_dim))
@@ -88,11 +93,18 @@ def loss_function(recon_x, x, mu, logvar):
     # Creating a tensor of ones with the same size as input
     custom_weights = torch.ones(total_elements).to(x.device)
 
+    # Assign higher weight to desired elements (1st, 4th, etc.)
+    # These are the "x" values.
+    indices_to_bias = list(range(0, total_elements, 3))  # get indices: 1st, 4th, ..
+    weight_for_desired_elements = 1.2  # weight for desired elements
+    for idx in indices_to_bias:
+        custom_weights[idx] = weight_for_desired_elements
+
     # Finding the index for the 63rd triple assuming the triples are flattened in the tensor
     index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
 
     # Assigning higher weight to the 63rd triple
-    weight_for_63rd_triple = 10.0  # weight for 63rd triple
+    weight_for_63rd_triple = 1.5  # weight for 63rd triple
     custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
 
     # Reshaping custom_weights to match original tensor shape
@@ -112,8 +124,9 @@ def loss_function(recon_x, x, mu, logvar):
 
     # KL Divergence loss same as before
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    l1_lamda = 5
 
-    total_loss = MAE + KLD
+    total_loss = l1_lamda * MAE + KLD
     wandb.log({"MAE Loss": MAE.item(), "KLD Loss": KLD.item(), "Total Loss": total_loss.item()})
     wandb.log({"63rd Triple Loss": weighted_loss[index_63rd_triple:index_63rd_triple + 3].mean().item()})
     # the final loss is the sum of the MAE and KLD
@@ -142,14 +155,15 @@ def train(model, dataloader, epochs):
         heatmap_filename = generate_heatmap(raw_data[idx], reconstruct_data[idx])
 
         # New code: print raw and reconstructed data to console
-        print("Selected indices: ", idx)
-        print("Raw data for selected indices: \n", raw_data[idx])
-        print("Reconstructed data for selected indices: \n", reconstruct_data[idx])
+        print("Raw data for selected indices: \n", raw_data)
+        print("Reconstructed data for selected indices: \n", reconstruct_data)
 
-        # manual MSE calculation for selected rows
-        for i in range(len(idx)):
-            spot_mse = np.mean((raw_data[idx][i] - reconstruct_data[idx][i]) ** 2)
-            print(f'Manual spot MSE for index {idx[i]}: ', spot_mse)
+        # manual MSE calculation for all rows
+        for i in range(len(raw_data)):
+            spot_mse = np.mean((raw_data[i] - reconstruct_data[i]) ** 2)
+            print(f'Raw data for index {i}: ', raw_data[i])
+            print(f'Reconstructed data for index {i}: ', reconstruct_data[i])
+            print(f'Manual spot MSE for index {i}: ', spot_mse)
 
         wandb.log({"heatmap": wandb.Image(heatmap_filename)})
         end_time = time.time()
@@ -166,7 +180,7 @@ def main():
 
     #TODO We will have to add official validation logic, but for now this will help
     # Split data into 80% train and 20% validation
-    train_data, validation_data = train_test_split(df_pandas, test_size=.950, random_state=42)
+    train_data, validation_data = train_test_split(df_pandas, test_size=.970, random_state=42)
     del validation_data
     del df_pandas
     df_pandas_truncated = train_data.iloc[:, 1:]

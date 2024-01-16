@@ -49,7 +49,7 @@ class VAE(nn.Module):
 
         # Encoder
         self.fc1 = nn.Linear(original_dim, hidden_dim1)
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.Softplus()
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
         self.fc21 = nn.Linear(hidden_dim2, hidden_dim3)  # extra layer
         self.relu2 = nn.LeakyReLU()
@@ -61,7 +61,7 @@ class VAE(nn.Module):
         self.fc5 = nn.Linear(hidden_dim3, hidden_dim2)  # extra layer
         self.relu3 = nn.ReLU()
         self.fc6 = nn.Linear(hidden_dim2, hidden_dim1)
-        self.relu4 = nn.LeakyReLU()
+        self.relu4 = nn.Softplus()
         self.fc7 = nn.Linear(hidden_dim1, original_dim)
 
     def encode(self, x):

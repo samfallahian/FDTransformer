@@ -11,10 +11,14 @@ import os
 from sklearn.model_selection import train_test_split
 
 # Initialize wandb
-wandb.init(project="Adjusted L1 Lamda and Batch Size")
+wandb.init(project="Small amount added to Minkowski Distance")
+# Minkowski Distance Parameter
+p_minkowski = 1.5
 
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+
 
 def generate_heatmap(raw_data, reconstruct_data):
     fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
@@ -35,17 +39,17 @@ def generate_heatmap(raw_data, reconstruct_data):
 
 original_dim = 375
 latent_dim = 47
-epochs = 50
-batch_size = 100
+epochs = 500
+batch_size = 10000
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
 class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
 
-        hidden_dim1 = 200
-        hidden_dim2 = 100
-        hidden_dim3 = 50
+        hidden_dim1 = 250
+        hidden_dim2 = 150
+        hidden_dim3 = 60
 
         # Encoder
         self.fc1 = nn.Linear(original_dim, hidden_dim1)
@@ -85,56 +89,58 @@ class VAE(nn.Module):
         mu, logvar = self.encode(x.view(-1, original_dim))
         z = self.reparameterize(mu, logvar)
         return self.decode(z), mu, logvar
+def minkowski_distance(x, y, p, eps=1e-7):
+    """
+    Function to compute the Minkowski distance.
+    """
+    md = torch.pow(torch.sum(torch.pow(torch.abs(x - y) + eps, p)), 1/p)
+    return md
 
 def loss_function(recon_x, x, mu, logvar):
-    total_elements = x.nelement() # total number of elements in the tensor
-    weight_for_others = 1.0  # weight for all other elements
+    # Continue with your previous code...
+    # ...
 
-    # Creating a tensor of ones with the same size as input
-    custom_weights = torch.ones(total_elements).to(x.device)
+    recon_x_grouped = recon_x.view(-1, int(recon_x.nelement()/3), 3)
+    x_grouped = x.view(-1, int(x.nelement()/3), 3)
 
-    # Assign higher weight to desired elements (1st, 4th, etc.)
-    # These are the "x" values.
-    indices_to_bias = list(range(0, total_elements, 3))  # get indices: 1st, 4th, ..
-    weight_for_desired_elements = 1.2  # weight for desired elements
-    for idx in indices_to_bias:
-        custom_weights[idx] = weight_for_desired_elements
+    triplet_minkowski = minkowski_distance(recon_x_grouped, x_grouped, p_minkowski)
 
-    # Finding the index for the 63rd triple assuming the triples are flattened in the tensor
-    index_63rd_triple = 63 * 3  # each triple consists of 3 elements (x,y,z)
+    # Calculate MAE for grouped data
+    triplet_mae = torch.max(torch.abs(recon_x_grouped - x_grouped), dim=2)[0]
+    MAE = torch.mean(triplet_mae)
 
-    # Assigning higher weight to the 63rd triple
-    weight_for_63rd_triple = 1.5  # weight for 63rd triple
-    custom_weights[index_63rd_triple:index_63rd_triple + 3] = weight_for_63rd_triple
+    # Calculating the mean, variance and standard deviation of triplet_mae
+    minkowski_mean = torch.mean(triplet_minkowski)
+    # Calculating the variance and standard deviation of triplet_mae
+    variance = torch.var(triplet_mae)
+    std_dev = torch.std(triplet_mae)
 
-    # Reshaping custom_weights to match original tensor shape
-    custom_weights = custom_weights.view_as(x)
-
-    # Deriving L1 loss, which is absolute difference between reconstructed and actual data
-    loss = torch.abs(recon_x - x.view(-1, original_dim))
-
-    # Applying weights to individually calculated losses
-    weighted_loss = loss * custom_weights
-
-    # Mean of the weighted losses.
-    # This acts like an expectation since we are summing over the losses of all entries and dividing by the total entries.
-    # And as the weights are normalized the sum of all weights is equal to the total entries.
-    # So, the mean here would be equivalent to expectation if the weights were probabilities (sum to 1)
-    MAE = weighted_loss.sum() / custom_weights.sum()
-
-    # KL Divergence loss same as before
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-    l1_lamda = 5
 
-    total_loss = l1_lamda * MAE + KLD
-    wandb.log({"MAE Loss": MAE.item(), "KLD Loss": KLD.item(), "Total Loss": total_loss.item()})
-    wandb.log({"63rd Triple Loss": weighted_loss[index_63rd_triple:index_63rd_triple + 3].mean().item()})
-    # the final loss is the sum of the MAE and KLD
-    return MAE + KLD
+    l1_lamda = 1.0
+
+    total_loss = l1_lamda * minkowski_mean + KLD + variance + std_dev
+
+    # Logging the losses to wandb
+    wandb.log({
+        "Minkowski Loss": minkowski_mean.item(),
+        "Variance Loss": variance.item(),
+        "MAE Loss": MAE.item(),
+        "Std Dev Loss": std_dev.item(),
+        "KLD Loss": KLD.item(),
+        "Total Loss": total_loss.item()
+    })
+
+    wandb.log({"63rd Triple Loss": triplet_minkowski.mean().item()})
+
+    return total_loss
 
 def train(model, dataloader, epochs):
     model.train()
-    optimizer = optim.Adam(model.parameters())
+    from torch.optim import Adam
+
+# Initialize the optimizer
+    optimizer = Adam(model.parameters(), lr=1e-4)
     start_time_epochs = time.time()
     for epoch in range(epochs):
         start_time = time.time()
@@ -180,7 +186,7 @@ def main():
 
     #TODO We will have to add official validation logic, but for now this will help
     # Split data into 80% train and 20% validation
-    train_data, validation_data = train_test_split(df_pandas, test_size=.970, random_state=42)
+    train_data, validation_data = train_test_split(df_pandas, test_size=.980, random_state=42)
     del validation_data
     del df_pandas
     df_pandas_truncated = train_data.iloc[:, 1:]

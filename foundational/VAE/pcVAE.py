@@ -11,12 +11,14 @@ import os
 from sklearn.model_selection import train_test_split
 
 # Initialize wandb
-wandb.init(project="Small amount added to Minkowski Distance")
+wandb.init(project="Wasserstein Autoencoder V04 Might be Working")
 # Minkowski Distance Parameter
 p_minkowski = 1.5
 
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+import torch.nn.functional as F
 
 
 
@@ -40,106 +42,107 @@ def generate_heatmap(raw_data, reconstruct_data):
 original_dim = 375
 latent_dim = 47
 epochs = 500
-batch_size = 10000
+batch_size = 1000
 device = torch.device("cuda" if torch.cuda.is_available() else "mps")
 
+# Main class definition for your model
 class VAE(nn.Module):
     def __init__(self):
         super(VAE, self).__init__()
 
-        hidden_dim1 = 250
-        hidden_dim2 = 150
-        hidden_dim3 = 60
+        # Define the sizes for the hidden layers
+        hidden_dim1 = 250  # Modify as needed
+        hidden_dim2 = 150  # Modify as needed
+        hidden_dim3 = 100  # Modify as needed
 
         # Encoder
         self.fc1 = nn.Linear(original_dim, hidden_dim1)
-        self.relu1 = nn.Softplus()
+        self.elu1 = nn.ELU()
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
-        self.fc21 = nn.Linear(hidden_dim2, hidden_dim3)  # extra layer
-        self.relu2 = nn.LeakyReLU()
-        self.fc31 = nn.Linear(hidden_dim3, latent_dim)  # mu layer
-        self.fc32 = nn.Linear(hidden_dim3, latent_dim)  # logvariance layer
+        self.elu2 = nn.ELU()
+        self.fc3 = nn.Linear(hidden_dim2, hidden_dim3)
+        self.elu3 = nn.ELU()
+        self.fc4 = nn.Linear(hidden_dim3, latent_dim)
 
         # Decoder
-        self.fc4 = nn.Linear(latent_dim, hidden_dim3)
-        self.fc5 = nn.Linear(hidden_dim3, hidden_dim2)  # extra layer
-        self.relu3 = nn.ReLU()
-        self.fc6 = nn.Linear(hidden_dim2, hidden_dim1)
-        self.relu4 = nn.Softplus()
-        self.fc7 = nn.Linear(hidden_dim1, original_dim)
-
-    def encode(self, x):
-        h1 = self.relu1(self.fc1(x))
-        h2 = self.relu2(self.fc2(h1))
-        h3 = self.relu2(self.fc21(h2))
-        return self.fc31(h3), self.fc32(h3)
-
-    def reparameterize(self, mu, logvar):
-        std = torch.exp(0.5*logvar)
-        eps = torch.randn_like(std)
-        return mu + eps*std
+        self.fc5 = nn.Linear(latent_dim, hidden_dim3)
+        self.elu4 = nn.ELU()
+        self.fc6 = nn.Linear(hidden_dim3, hidden_dim2)
+        self.elu5 = nn.ELU()
+        self.fc7 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.elu6 = nn.ELU()
+        self.fc8 = nn.Linear(hidden_dim1, original_dim)
 
     def decode(self, z):
-        h4 = self.relu3(self.fc4(z))
-        h5 = self.relu3(self.fc5(h4))
-        h6 = self.relu4(self.fc6(h5))
-        return self.fc7(h6)
+        h1 = self.elu4(self.fc5(z))
+        h2 = self.elu5(self.fc6(h1))
+        h3 = self.elu6(self.fc7(h2))
+        return self.fc8(h3)
+
+    def encode(self, x):
+        h1 = self.elu1(self.fc1(x))
+        h2 = self.elu2(self.fc2(h1))
+        h3 = self.elu3(self.fc3(h2))
+        return self.fc4(h3)
 
     def forward(self, x):
-        mu, logvar = self.encode(x.view(-1, original_dim))
-        z = self.reparameterize(mu, logvar)
-        return self.decode(z), mu, logvar
-def minkowski_distance(x, y, p, eps=1e-7):
-    """
-    Function to compute the Minkowski distance.
-    """
-    md = torch.pow(torch.sum(torch.pow(torch.abs(x - y) + eps, p)), 1/p)
-    return md
+        mu = self.encode(x.view(-1, original_dim))
+        return self.decode(mu), mu
 
-def loss_function(recon_x, x, mu, logvar):
-    # Continue with your previous code...
-    # ...
 
-    recon_x_grouped = recon_x.view(-1, int(recon_x.nelement()/3), 3)
-    x_grouped = x.view(-1, int(x.nelement()/3), 3)
 
-    triplet_minkowski = minkowski_distance(recon_x_grouped, x_grouped, p_minkowski)
+    def loss_function(self, recon_x, x, mu):
+        recon_x_grouped = recon_x.view(-1, int(recon_x.nelement()/3), 3)
+        x_grouped = x.view(-1, int(x.nelement()/3), 3)
 
-    # Calculate MAE for grouped data
-    triplet_mae = torch.max(torch.abs(recon_x_grouped - x_grouped), dim=2)[0]
-    MAE = torch.mean(triplet_mae)
+        '''
+        # In case shapes are not the expected ones, print them out.
+        if recon_x_grouped.shape[0] < 63 or x_grouped.shape[0] < 63:
+            print('recon_x_grouped shape:', recon_x_grouped.shape)
+            print('x_grouped shape:', x_grouped.shape)
+        '''
+        # Reconstruction loss
+        recon_loss = F.mse_loss(recon_x_grouped, x_grouped)
 
-    # Calculating the mean, variance and standard deviation of triplet_mae
-    minkowski_mean = torch.mean(triplet_minkowski)
-    # Calculating the variance and standard deviation of triplet_mae
-    variance = torch.var(triplet_mae)
-    std_dev = torch.std(triplet_mae)
+        # MMD loss: enforcing prior = posterior in the latent space
+        true_samples = torch.randn(mu.shape).to(device)
+        mmd_loss = self._compute_mmd(mu, true_samples)
 
-    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        # Previous code was assuming there are 63 examples / batch_size
+        # Changed it to compute triplet loss tensor-wide
+        # OR for the 63rd triplet of a random example if there are more than 63
 
-    l1_lamda = 1.0
+        # Instead of [62] this should probably be something like [random_index, 62]
+        # 'random_index' is choosing a random sample in the batch
+        random_index = torch.randint(len(x_grouped), size=(1,)).item()
+        triplet_63_loss = F.mse_loss(recon_x_grouped[random_index, 62], x_grouped[random_index, 62])
 
-    total_loss = l1_lamda * minkowski_mean + KLD + variance + std_dev
+        # Log the losses to wandb
+        wandb.log({"Reconstruction Loss": recon_loss.item(),
+                   "MMD Loss": mmd_loss.item(),
+                   "63rd Reconstruction": triplet_63_loss.item()})
 
-    # Logging the losses to wandb
-    wandb.log({
-        "Minkowski Loss": minkowski_mean.item(),
-        "Variance Loss": variance.item(),
-        "MAE Loss": MAE.item(),
-        "Std Dev Loss": std_dev.item(),
-        "KLD Loss": KLD.item(),
-        "Total Loss": total_loss.item()
-    })
+        return recon_loss + mmd_loss + triplet_63_loss
 
-    wandb.log({"63rd Triple Loss": triplet_minkowski.mean().item()})
+    def _compute_kernel(self, x, y):
+        x_size = x.shape[0]
+        y_size = y.shape[0]
+        dim = x.shape[1]
+        tiled_x = x.view(x_size, 1, dim).repeat(1, y_size, 1)
+        tiled_y = y.view(1, y_size, dim).repeat(x_size, 1, 1)
+        return torch.exp(-torch.mean((tiled_x - tiled_y)**2, dim=2) / dim * 2.0)
 
-    return total_loss
+    def _compute_mmd(self, x, y):
+        x_kernel = self._compute_kernel(x, x)
+        y_kernel = self._compute_kernel(y, y)
+        xy_kernel = self._compute_kernel(x, y)
+        return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
 
 def train(model, dataloader, epochs):
     model.train()
     from torch.optim import Adam
 
-# Initialize the optimizer
+    # Initialize the optimizer
     optimizer = Adam(model.parameters(), lr=1e-4)
     start_time_epochs = time.time()
     for epoch in range(epochs):
@@ -147,8 +150,10 @@ def train(model, dataloader, epochs):
         train_loss = 0
         for batch in dataloader:
             optimizer.zero_grad()
-            recon_batch, mu, logvar = model(batch)
-            loss = loss_function(recon_batch, batch, mu, logvar)
+            recon_batch, mu = model(batch)
+            #print('Batch shape:', batch.shape)
+            #print('Reconstructed batch shape:', recon_batch.shape)
+            loss = model.loss_function(recon_batch, batch, mu) # Adjusted here
             loss.backward()
             train_loss += loss.item()
             optimizer.step()

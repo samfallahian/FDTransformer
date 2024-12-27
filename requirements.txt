@@ -1,8 +1,7 @@
-torch~=2.1.0
-torchvision==0.14.1
-torchaudio==0.13.1
+torch~=2.5.1
+torchvision==0.20.1
 pandas~=2.1.1
-scikit_learn==1.2.0
+scikit_learn==1.6.0
 numpy~=1.26.1
 wandb~=0.16.0
 matplotlib~=3.8.0

@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 
 # Define the directory path containing the files
-directory_path = "/home/kkreth_umassd_edu/data_pi/raw_input"
+directory_path = "/home/rpal_umassd_edu/data_pi/raw_input"
 
 # List all files in the directory
 file_list = os.listdir(directory_path)
@@ -45,7 +45,7 @@ print("Max values:", max_values)
 
 '''
 For vx, here was the output:
-/home/kkreth_umassd_edu/.virtualenvs/cgan/bin/python /home/kkreth_umassd_edu/cgan/standalone/33_LearnTransformation.py 
+/home/rpal_umassd_edu/.cgan_virtual/bin/python /home/rpal_umassd_edu/cgan/standalone/33_LearnTransformation.py 
 Min values: tensor(-1.1100, device='cuda:0', dtype=torch.float64)
 Max values: tensor(2.6400, device='cuda:0', dtype=torch.float64)
 

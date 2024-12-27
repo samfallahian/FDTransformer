@@ -6,14 +6,16 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
 # Target directory containing .pkl files
-target_dir = '/Users/kkreth/PycharmProjects/data/DL-PTV.backup/'
+target_dir = '/Users/roshni/PycharmProjects/cgan/data/DL-PTV.backup/3p6.pkl'
 # Destination directory for JSON output
-output_dir = '/Users/kkreth/PycharmProjects/cgan/configs/'
+output_dir = '/Users/roshni/PycharmProjects/cgan/configs/'
 
 def process_file(file_path):
     # Open the pickle file and load into a pandas DataFrame
     with open(file_path, 'rb') as f:
         df = pd.read_pickle(f, compression="gzip")
+        df = pd.read_pickle(f, compression='zip')
+        df.shape
 
     # Initialize a dictionary to store meta-data
     metadata_dict = {}

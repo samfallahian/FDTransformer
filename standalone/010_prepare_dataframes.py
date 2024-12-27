@@ -7,12 +7,12 @@ from standalone import TransformLatent
 import numpy as np
 
 # Load the JSON file into a dictionary
-with open("/Users/kkreth/PycharmProjects/cgan/configs/Umass_experiments.txt", 'r') as f:
+with open("/Users/roshni/PycharmProjects/cgan/configs/Umass_experiments.txt", 'r') as f:
     experiment_dict = json.load(f)
 
 # Specify the directories for input and output
-input_dir = "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/"
-output_dir = "/Users/kkreth/PycharmProjects/data/DL-PTV-2/"
+input_dir = "/Users/roshni/PycharmProjects/data/DL-PTV.backup/"
+output_dir = "/Users/roshni/PycharmProjects/data/DL-PTV-2/"
 
 # Initialize the converter
 converter = TransformLatent.FloatConverter()

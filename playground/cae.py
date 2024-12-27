@@ -38,6 +38,7 @@ class ContractiveAutoencoder(nn.Module):
     def contractive_loss(self, encoded, x):
         jacobian = torch.autograd.functional.jacobian(self.encoder, x)
         jacobian_norm = torch.norm(jacobian, dim=(0, 2))
+
         return torch.mean(jacobian_norm ** 2 * encoded ** 2)
 
 

@@ -77,6 +77,17 @@ class TestAnalyzerOfCoordinates(unittest.TestCase):
         expected_y_values = [16, 20, 23, 27, 31]
         expected_z_values = [-5, -1, 3, 7, 11]
 
+        # Columns will look like this:
+        # (-85,16,-5), (-85,16,-1), (-85,16,3) ... (-70,31,7), (-70,31,11)
+        # But these will be individual columns (with a naming convention) so:
+        # -85 will be one column of data called x1
+        # 16 would be y1
+        # -5 would be z1
+        # ...
+        # -70 will be x125
+        # 31 will be y125
+        # 11 will be z125
+
         self.assertTrue(all(value in result_df['x'].values for value in expected_x_values))
         self.assertTrue(all(value in result_df['y'].values for value in expected_y_values))
         self.assertTrue(all(value in result_df['z'].values for value in expected_z_values))

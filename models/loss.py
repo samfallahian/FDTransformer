@@ -1,0 +1,141 @@
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import torch.autograd as autograd
+from sklearn.neighbors import KernelDensity
+from scipy.stats import wasserstein_distance
+from utils import helpers
+
+
+class CustomLoss(nn.Module):
+
+    def __init__(self):
+        super(CustomLoss, self).__init__()
+        config = helpers.Config()
+        self.cfg_cgan = config.from_json("training").cgan
+        self.cfg_data_cgan = config.from_json("data").cgan
+        self.cfg_cae = config.from_json("training").cae
+        self.bec_log = nn.BCEWithLogitsLoss()
+        self.bec = nn.BCELoss()
+        self.mse = nn.MSELoss()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def cgan_loss(self, generated_label, real_label, generated_data, real_data, is_generator=True):
+        if self.cfg_cgan.is_critic:
+            loss = self.bec_log(generated_label, real_label)
+        else:
+            loss = self.bec(generated_label, real_label)
+        # here add custom loss and add it to final loss
+        if is_generator:
+            wass_loss = self.wass_distance(real_data, generated_data)
+            final_loss = loss + wass_loss
+        else:
+            final_loss = loss
+        return final_loss
+
+    def cae_loss(self, W, data, decoded, encoded):
+        mse = self.mse(decoded, data)
+        dh = encoded * (1 - encoded)  # Hadamard product produces size N_batch x N_hidden
+        # Sum through the input dimension to improve efficiency, as suggested in #1
+        w_sum = torch.sum(Variable(W) ** 2, dim=1)
+        # unsqueeze to avoid issues with torch.mv
+        w_sum = w_sum.unsqueeze(1)  # shape N_hidden x 1
+        contractive_loss = torch.sum(torch.mm(dh ** 2, w_sum), 0)
+        final_loss = mse + contractive_loss.mul(self.cfg_cae.contractive_coef)
+        return final_loss , mse
+
+    def wass_distance(self, real, generated):
+        """Use KernelDensity to estimate the probability density function (PDF) of the real and generated data. Then,
+        we can use the wasserstein_distance function from the to calculate the Wasserstein distance between the two
+        estimated PDFs."""
+        real = real.cpu()
+        generated = generated.cpu()
+        real = real.detach().numpy()
+        generated = generated.detach().numpy()
+
+        # Estimate PDFs of real and generated data
+        kde_real = KernelDensity(kernel='gaussian', bandwidth=self.cfg_cgan.kd_band_width).fit(real)
+        kde_fake = KernelDensity(kernel='gaussian', bandwidth=self.cfg_cgan.kd_band_width).fit(generated)
+        # Calculate Wasserstein distance between real and generated data
+        real_pdf = kde_real.score_samples(real)
+        fake_pdf = kde_fake.score_samples(generated)
+        wass_distance = wasserstein_distance(real_pdf, fake_pdf)
+        return wass_distance
+
+    def compute_gradient_penalty(self,discriminator, real_samples, fake_samples, condition):
+        # Create random interpolates between real and fake samples
+        alpha = torch.rand(real_samples.size(0), 1).to(self.device)
+        alpha = alpha.expand(real_samples.size()).to(self.device)
+        interpolates = alpha * real_samples + (1 - alpha) * fake_samples
+        interpolates = interpolates.to(self.device).requires_grad_(True)
+
+        # Calculate the discriminator output for interpolates with the condition
+        d_interpolates = discriminator(interpolates, condition)
+
+        # Compute gradients of the discriminator output with respect to the interpolates
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones(d_interpolates.size()).to(self.device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        # Compute gradient penalty
+        gradients_norm = gradients.view(gradients.size(0), -1).norm(2, dim=1)
+        gradient_penalty = ((gradients_norm - 1) ** 2).mean()
+        return gradient_penalty
+
+    def gradient_penalty(self, discriminator_model, real_data, fake_data, labels):
+        """
+        Calculate the gradient penalty for the Wasserstein GAN.
+
+        Args:
+        - discriminator_model: The Discriminator model
+        - real_data: Real data samples
+        - fake_data: Generated fake data samples
+        - conditions: The conditioning variables
+        - device: The device on which to perform the computation (CPU or GPU)
+
+        Returns:
+        - Gradient penalty
+        """
+
+        # gp_lambda: The gradient penalty weight
+
+        # Generate random epsilon for interpolation
+        epsilon = torch.rand(self.cfg_data_cgan.batch_size, 1, device=self.device)
+        epsilon = epsilon.expand_as(real_data)
+        # epsilon = epsilon.expand(real_data.size()).to(self.device)
+
+        # Interpolate between real and fake data
+        interpolated_data = epsilon * real_data + (1 - epsilon) * fake_data
+        interpolated_data = interpolated_data.to(self.device)
+        interpolated_data.requires_grad_(True)
+
+        # Concatenate interpolated data with conditions
+        # conditions_expanded = conditions.unsqueeze(1).expand(-1, real_data.size(1))
+        conditions_expanded = labels.expand(self.cfg_data_cgan.batch_size, -1)
+
+        # Calculate the discriminator's output for interpolated data
+        d_interpolated_output = discriminator_model(interpolated_data, conditions_expanded)
+
+        # Calculate the gradients of the output with respect to the input data
+        gradients = autograd.grad(outputs=d_interpolated_output, inputs=interpolated_data,
+                                  grad_outputs=torch.ones_like(d_interpolated_output, device=self.device),
+                                  create_graph=True, retain_graph=True, only_inputs=True)[0]
+
+        # Calculate the gradient penalty
+        gradients = gradients.view(self.cfg_data_cgan.batch_size, -1)
+        gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+        gradient_penalty = self.cfg_cgan.gp_lambda * ((gradients_norm - 1) ** 2).mean()
+
+        return gradient_penalty
+
+    # @staticmethod
+    # def kl_divergence(real, generated):
+    #     real_logprobs = F.log_softmax(discriminator(real), dim=1)
+    #     fake_logprobs = F.log_softmax(discriminator(generated), dim=1)
+    #     kl_divergence = F.kl_div(fake_logprobs, real_logprobs, reduction='batchmean')
+    #     return intersection / union

@@ -1,0 +1,158 @@
+import time
+from datetime import datetime
+import os
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+import torch
+import torch.nn as nn
+from torch.optim.lr_scheduler import StepLR
+import wandb
+import pandas as pd
+from utils import helpers
+import torch.nn.functional as F
+
+
+class TrainTransformer:
+    def __init__(self, model, device, dataset, lr=0.001, epochs=10, log_interval=50,
+                 scheduler_step=1000, batch_size=256, lr_gamma=0.95,
+                 is_wandb=True, save_directory="saved_models", kind=1,
+                 start_time_frame=1, end_time_frame=1200, beta=0.5):
+        if is_wandb:
+            # wandb.init(project='Transformers', name=f"Sequence-{start_time_frame}-to-{end_time_frame}-{datetime.now().date().strftime('%m-%d-%Y')}")
+            wandb.init(project='Transformers', name=f"Test-KLD-{datetime.now().date().strftime('%m-%d-%Y')}")
+            config = wandb.config
+            config.batch_size = batch_size
+            config.lr = lr
+
+        # Helpers and Logging
+        self.kind = kind
+        self.is_wandb = is_wandb
+        self.debug = True
+        self.logger = helpers.Log("transformer")
+        self.log_interval = log_interval
+        self.start_time_frame = start_time_frame
+        self.end_time_frame = end_time_frame
+        self.save_interval = 400  # Save the model every 100 epochs
+        self.save_directory = save_directory
+        os.makedirs(self.save_directory, exist_ok=True)  # Create the save directory if it doesn't exist
+        # self.df_result = pd.DataFrame(
+        #     columns=["epoch", "batch", "batch_data_point", "data_point", "loss", "time"])
+
+        # Data
+        self.dataset = dataset
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True, num_workers=6,drop_last=True)
+
+        # Training
+        self.epochs = epochs
+        self.model = model
+        print("Model initialized.")
+        self.device = device
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.scaler = GradScaler()  # For mixed precision training
+        self.mse = nn.MSELoss()  # Define loss and optimizer
+        self.scheduler = StepLR(self.optimizer, step_size=scheduler_step, gamma=lr_gamma)
+        self.beta = beta
+
+    def loss_function(self, output, target):
+        MSE = self.mse(output, target)
+        output_normalized = F.softmax(output, dim=1)
+        target_normalized = F.softmax(target, dim=1)
+        # KLD = torch.sum(target * (torch.log(target) - torch.log(output)))
+        KLD = torch.sum(
+            target_normalized * (torch.log(target_normalized + 1e-10) - torch.log(output_normalized + 1e-10)))
+
+        total_loss = MSE + self.beta * KLD
+        return total_loss
+
+    def train(self):
+        for epoch in range(self.epochs):
+            self.model.train()
+            running_loss = 0.
+
+            start_time = time.time()
+            print(f'start of epoch {epoch + 1} at {datetime.now().time().strftime("%H:%M:%S")}')
+            for batch_idx, (src, tgt, coord, sequences) in enumerate(self.dataloader):
+                # print(len(self.dataloader))
+                # print(batch_idx)
+
+                src, tgt = src.to(self.device), tgt.to(self.device)
+
+                # [seq_len, batch, features]
+                src = src.transpose(0, 1)
+                tgt_input = tgt.unsqueeze(0)
+
+                # self.optimizer.zero_grad()
+
+                with autocast():
+                    if self.kind == 1:
+                        output = self.model(src)
+                        # loss = self.mse(output.view(-1), tgt.view(-1))
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
+
+                    elif self.kind == 2:
+                        output = self.model(src, tgt_input)
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
+
+                    elif self.kind == 3:
+                        output = self.model(src)
+                        loss = self.mse(output.view(-1), tgt_input.view(-1))
+
+                    elif self.kind == 4:
+                        output = self.model(src, tgt_input)
+                        loss = self.mse(output, tgt_input)
+
+                self.scaler.scale(loss).backward()
+
+
+                # loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                # self.optimizer.step()
+                self.optimizer.zero_grad()
+                self.scheduler.step()
+                running_loss += loss.item()
+
+                if batch_idx % self.log_interval == 0 and batch_idx > 0:
+                    elapsed = time.time() - start_time
+
+                    # if self.is_wandb:
+                    #     wandb.log({"batch_loss": loss.item()})
+
+                    print(
+                        f"| {batch_idx} batches | epoch {epoch + 1}/{self.epochs} | lr {self.scheduler.get_last_lr()[0]:.6f} "
+                        f"| ms/batch {elapsed * 1000 / self.log_interval:.2f} | loss {loss.item():.6f}")
+
+            running_loss /= len(self.dataloader)
+            if self.is_wandb:
+                wandb.log({"loss": running_loss, "lr": self.scheduler.get_last_lr()[0]})
+
+            print(
+                f"End of epoch {epoch + 1} / {self.epochs}, Running loss {running_loss:.6f}, at {datetime.now().time().strftime('%H:%M:%S')}")
+            print("-------------------------------------------------------------------")
+            # Save the model
+            if (epoch + 1) % self.save_interval == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': running_loss
+                }, os.path.join(self.save_directory, f"transformer_checkpoint_{epoch + 1}.pth"))
+        print("=================================================================")
+        print(f'End of training at {datetime.now().time().strftime("%H:%M:%S")}')
+        if self.is_wandb:
+            wandb.finish()
+        # Save the final trained model
+        # torch.save(self.model.state_dict(), os.path.join(self.save_directory, f"transformer_final_saved_model_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+        # torch.save({
+        #     'model_state_dict': self.model.state_dict(),
+        #     'optimizer_state_dict': self.optimizer.state_dict(),
+        #     'loss': running_loss
+        # }, os.path.join(self.save_directory, f"transformer_sequence_{self.start_time_frame}_to_{self.end_time_frame}_{datetime.now().date().strftime('%m%d%Y')}.pth"))
+
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'loss': running_loss
+        }, os.path.join(self.save_directory,
+                        f"Test_KLD_{datetime.now().date().strftime('%m%d%Y')}.pth"))

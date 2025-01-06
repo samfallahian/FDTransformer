@@ -128,7 +128,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-.idea
+#.idea
 
 temp
 /dataset/6p6.pkl

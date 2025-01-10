@@ -2,48 +2,6 @@
 <project version="4">
   <component name="PublishConfigData" autoUpload="Always" serverName="rpal_umassd_edu@unity.rc.umass.edu:22 agent" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="rpal_umassd_edu@cpu001:22 agent">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/rpal_umassd_edu/cgan_deployment" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="rpal_umassd_edu@gypsum-gpu004:22 agent">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/rpal_umassd_edu/cgan_deployment" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="rpal_umassd_edu@gypsum-gpu016:22 agent">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/rpal_umassd_edu/cgan_deployment" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="rpal_umassd_edu@gypsum-gpu049:22 agent">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/rpal_umassd_edu/cgan_deployment" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="rpal_umassd_edu@gypsum-gpu085:22 agent">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/tmp/pycharm_project_880" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="rpal_umassd_edu@gypsum-gpu085:22 agent (2)">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/home/rpal_umassd_edu/cgan_deployment" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
       <paths name="rpal_umassd_edu@unity.rc.umass.edu:22 agent">
         <serverdata>
           <mappings>

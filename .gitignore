@@ -148,4 +148,11 @@ dataset/4p4
 dataset/4p6
 dataset/test
 
+
 .DS_Store
+.idea/misc.xml
+.idea/workspace.xml
+.idea/cgan.iml
+.idea/inspectionProfiles/Project_Default.xml
+.idea/inspectionProfiles/profiles_settings.xml
+.idea/vcs.xml

@@ -1,29 +1,59 @@
+import os
 import socket
+import re
 import logging
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
 class Config:
-    HOSTNAME = socket.gethostname()
-    logger.info(f"Detected hostname: {HOSTNAME}")
+    SUBMIT_HOSTNAME = os.environ.get('HOSTNAME', socket.gethostname())
+    logger.info(f"Hostname detected: {SUBMIT_HOSTNAME}")
 
-    if "unity" in HOSTNAME or "gypsum" in HOSTNAME:
-        ROOT_DIR = Path("/work/pi_bseyedaghazadeh_umassd_edu")
-        logger.info(f"ROOT_DIR set to: {ROOT_DIR}")
-    else:
-        ROOT_DIR = Path("/default/root/dir")  # Default for other hosts
-        logger.warning(f"ROOT_DIR set to default: {ROOT_DIR}")
-
+    # Add the cluster name regex
+    CLUSTER_PATTERN = re.compile(r"(gpu|unity|gypsum|login\d+)", re.IGNORECASE)
+    try:
+        if CLUSTER_PATTERN.search(SUBMIT_HOSTNAME):
+            ROOT_DIR = Path("/work/pi_bseyedaghazadeh_umassd_edu")
+            LOGS_DIR = Path.home() / "logs"
+            logger.info(f"Cluster environment detected. ROOT_DIR set to: {ROOT_DIR}")
+        else:
+            ROOT_DIR = Path("/default/root/dir")
+            LOGS_DIR = Path.home() / "logs"
+            raise ValueError(f"Unrecognized hostname: {SUBMIT_HOSTNAME}. ROOT_DIR is set to default.")
+    except ValueError as e:
+        logger.error(str(e))
+        raise
+    # Retrieve the current username from the home directory (last part of the path)
     USERNAME = Path.home().parts[-1]
-    HOME_DIR = Path(f"/home/{USERNAME}")
-    logger.info(f"HOME_DIR set to: {HOME_DIR}")
-    INPUT_DIR = ROOT_DIR / "DL-PTV.backup"
-    OUTPUT_BASE_DIR = ROOT_DIR / "DL-PTV/roshni"
-    LOG_FILE = HOME_DIR / "logs/raw_data_process.log"
-    METADATA_PATH = HOME_DIR / "cgan_deployment/configs/Umass_experiments.txt"
+    logger.info(f"USERNAME detected: {USERNAME}")
 
-    # Data types mapping
+    # Set the home directory based on the retrieved username
+    HOME_DIR = Path(f"/home/{USERNAME}")  # Home directory path
+    logger.info(f"HOME_DIR set to: {HOME_DIR}")
+
+    # Define the input data directory (relative to the root directory)
+    INPUT_DIR = ROOT_DIR / "DL-PTV.backup"  # Input directory for backup files
+    logger.info(f"INPUT_DIR set to: {INPUT_DIR}")
+
+    # Define the base directory for output data
+    OUTPUT_BASE_DIR = ROOT_DIR / "DL-PTV/roshni"  # Output base directory for processed data
+    logger.info(f"OUTPUT_BASE_DIR set to: {OUTPUT_BASE_DIR}")
+
+    # Path to the log file for raw data processing
+    LOG_FILE_RAW_DATA_PROCESSOR = LOGS_DIR / "raw_data_process.log"  # Raw data processing log file
+    logger.info(f"LOG_FILE set to: {LOG_FILE_RAW_DATA_PROCESSOR}")
+
+    # Path to the log file for velocity loading process
+    LOAD_VELOCITIES_LOG_FILE = LOGS_DIR / "loadVelocities/load_velocities.log"  # Velocity logs
+    logger.info(f"LOAD_VELOCITIES_LOG_FILE set to: {LOAD_VELOCITIES_LOG_FILE}")
+
+    # Path to the metadata configuration file for experiments
+    METADATA_PATH = HOME_DIR / "cgan_deployment/configs/Experiment_MetaData.txt"  # Experiment metadata path
+    logger.info(f"METADATA_PATH set to: {METADATA_PATH}")
+
+    # Dictionary specifying data types for each column
     COLUMN_DTYPES = {
         "x": "int32",
         "y": "int32",
@@ -35,13 +65,21 @@ class Config:
         "distance": "int32",
     }
 
+    # Dictionary defining experiment configurations
     EXPERIMENTS = {
         "10p4": {
             "input_file": INPUT_DIR / "10p4.pkl",
             "output_dir": OUTPUT_BASE_DIR / "10p4",
         }
     }
+
+    # List specifying columns to drop during data processing
     COLUMNS_TO_DROP = ["px", "py", "pz"]
+    # Options for data transformation during processing
+    TRANSFORM_OPTIONS = ["float32", "linear", "tensor"]
+    logger.info(f"TRANSFORM_OPTIONS set to: {TRANSFORM_OPTIONS}")
+
+
 
 
 

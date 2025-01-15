@@ -6,7 +6,8 @@ from typing import List
 from config import Config
 from TransformLatent import FloatConverter
 
-log_file = Config.LOG_FILE
+log_file = Config.LOG_FILE_RAW_DATA_PROCESSOR
+# logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -134,6 +135,7 @@ class RawDataProcessor:
             logging.warning(f"No valid data found for timestep {time_step}")
 
     def convert_velocities(self, df: pd.DataFrame) -> pd.DataFrame:
+        # df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
         try:
             df['vx'] = df['vx'].apply(self.converter.convert)
             df['vy'] = df['vy'].apply(self.converter.convert)
@@ -162,6 +164,7 @@ class RawDataProcessor:
 
         for idx, time_step in enumerate(unique_times, 1):
             self.process_timestep(df, unique_times)
+            #Periodic updates for large datasets
             if idx % 100 == 0:
                 logging.info(f"Processed {idx}/{len(unique_times)} timesteps")
 

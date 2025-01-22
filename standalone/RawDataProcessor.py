@@ -1,3 +1,4 @@
+import argparse
 import logging
 import pandas as pd
 import json
@@ -7,7 +8,6 @@ from config import Config
 from TransformLatent import FloatConverter
 
 log_file = Config.LOG_FILE_RAW_DATA_PROCESSOR
-# logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -20,7 +20,6 @@ def locate_coordinates(value: int, enumerated_list: List[int]) -> List[int]:
     index = enumerated_list.index(value)
 
     logging.info(f"Index: {index}")
-    logging.info(f"Length of Enumerated list: {len(enumerated_list)}")
     if index < 2 or index >= len(enumerated_list) - 2:
         logging.warning(f"Coordinate {value} out of range for cube formation.")
         raise ValueError("Coordinate out of range for cube formation.")
@@ -34,7 +33,6 @@ class CoordinatesAnalyser:
 
     def analyze(self, df, x, y, z) -> bool:
         try:
-
             x_values = locate_coordinates(x, self.x_enumerated)
             y_values = locate_coordinates(y, self.y_enumerated)
             z_values = locate_coordinates(z, self.z_enumerated)
@@ -58,13 +56,6 @@ class CoordinatesAnalyser:
             logging.error(f"Error analyzing cube for ({x}, {y}, {z}): {e}")
             return False
 
-def convert_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col, dtype in Config.COLUMN_DTYPES.items():
-        if col in df.columns:
-            df[col] = df[col].astype(dtype)
-    logging.info(f"Converted column data types: {Config.COLUMN_DTYPES}")
-    return df
-
 class RawDataProcessor:
     def __init__(self, experiment_id: str):
         self.analyzer = None
@@ -75,14 +66,12 @@ class RawDataProcessor:
         self.metadata_path = Config.METADATA_PATH
         self.output_dir = self.config["output_dir"]
         self.converter = FloatConverter()
-
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Output directory for experiment {experiment_id}: {self.output_dir}")
         except Exception as e:
             logging.error(f"Error creating output directory: {e}")
             raise
-
         self.load_enumerated_coords(experiment_id)
 
     def load_enumerated_coords(self, experiment_id: str):
@@ -92,12 +81,10 @@ class RawDataProcessor:
             enumerated_coords = experiment_dict.get(experiment_id, {})
             if not enumerated_coords:
                 raise ValueError(f"No enumerated coordinates found for experiment: {experiment_id}")
-            self.x_enumerated = [int(x) for x in enumerated_coords.get("x_enumerated", [])]
-            self.y_enumerated = [int(y) for y in enumerated_coords.get("y_enumerated", [])]
-            self.z_enumerated = [int(z) for z in enumerated_coords.get("z_enumerated", [])]
+            self.x_enumerated = enumerated_coords.get("x_enumerated", [])
+            self.y_enumerated = enumerated_coords.get("y_enumerated", [])
+            self.z_enumerated = enumerated_coords.get("z_enumerated", [])
             self.analyzer = CoordinatesAnalyser(self.x_enumerated, self.y_enumerated, self.z_enumerated)
-            logging.info(f"Loaded enumerated coordinates successfully: x({len(self.x_enumerated)}), "
-                         f"y({len(self.y_enumerated)}), z({len(self.z_enumerated)})")
         except Exception as e:
             logging.error(f"Error loading enumerated coordinates: {e}")
             raise
@@ -112,34 +99,30 @@ class RawDataProcessor:
             (time_df['y'].isin(self.y_enumerated[2:-2])) &
             (time_df['z'].isin(self.z_enumerated[2:-2]))
         ]
-        logging.info(f"Checking the datatypes for valid_points: {valid_points.dtypes.to_dict()}")
+        logging.info(f"valid_points length:  {len(valid_points)}")
         valid_data = []
-        coordinates_analyser = CoordinatesAnalyser(valid_points['x'].tolist(), valid_points['y'].tolist(), valid_points['z'].tolist())
-        for _, point in valid_points.iterrows():
-            logging.info(f"Point: {point.to_dict()}")
-            x, y, z = point['x'], point['y'], point['z']
-            logging.info(f"Generated valid points: ({x}, {y}, {z})")
-
-            if coordinates_analyser.analyze(time_df, x, y, z):
-                valid_data.append(point)
+        coordinates_analyser = CoordinatesAnalyser(self.x_enumerated, self.y_enumerated, self.z_enumerated)
+        for point in valid_points.itertuples(index=False):
+            logging.info(f"Point: {point.x, point.y, point.z, point.vx, point.vy, point.vz, point.time, point.distance}")
+            if coordinates_analyser.analyze(time_df, point.x, point.y, point.z):
+                valid_data.append([point.x, point.y, point.z, point.vx, point.vy, point.vz, point.time, point.distance])
 
         if valid_data:
-            valid_data_df = pd.DataFrame(valid_data)
+            valid_data_df = pd.DataFrame(valid_data, columns=['x','y','z','vx', 'vy', 'vz','time','distance'])
+            logging.info(f"Dataframe converted")
+
             output_df = self.convert_velocities(valid_data_df)
-            valid_data_df = convert_columns(output_df)
             # Save output
             output_file = self.output_dir / f"{time_step}.pkl"
-            valid_data_df.to_pickle(output_file, compression="zip")
-            logging.info(f"Saved {len(valid_data_df)} valid points to {output_file}")
+            output_df.to_pickle(output_file, compression="zip")
+            logging.info(f"Saved {len(output_df)} valid points to {output_file}")
         else:
             logging.warning(f"No valid data found for timestep {time_step}")
 
     def convert_velocities(self, df: pd.DataFrame) -> pd.DataFrame:
-        # df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
+        logging.debug(f"Initial velocities: {df[['vx', 'vy', 'vz']].head().to_dict()}")
         try:
-            df['vx'] = df['vx'].apply(self.converter.convert)
-            df['vy'] = df['vy'].apply(self.converter.convert)
-            df['vz'] = df['vz'].apply(self.converter.convert)
+            df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].map(self.converter.convert).astype('float32')
             return df
         except ValueError as e:
             logging.error(f"Error converting velocities: {e}")
@@ -159,18 +142,22 @@ class RawDataProcessor:
         logging.info(f"Updated column dtypes: {df.dtypes.to_dict()}")
 
         unique_times = df['time'].unique()
-        logging.info(f"Found {len(unique_times)} unique timesteps: {unique_times}")
-        # logging.info(f"Found {unique_times} unique timesteps: {unique_times}")
+        logging.info(f"Found {len(unique_times)} time_step: {unique_times}")
+        logging.info(f"Found {unique_times} unique timesteps: {unique_times}")
 
         for idx, time_step in enumerate(unique_times, 1):
             self.process_timestep(df, time_step)
-            #Periodic updates for large datasets
+
+            # Periodic updates for large datasets
             if idx % 100 == 0:
-                logging.info(f"Processed {idx}/{len(unique_times)} timesteps")
+                logging.info(f"Processed {idx}/{len(unique_times)} timesetps")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Process raw data for X,Y,Z coordinates")
+    parser.add_argument("--experiment_id", type=str, required=True, help="Experiment ID to process")
+    args = parser.parse_args()
+    experiment_id = args.experiment_id
     for experiment_id in Config.EXPERIMENTS.keys():
-        logging.info(f"Processing experiment: {experiment_id}")
         try:
             processor = RawDataProcessor(experiment_id)
             processor.load_and_process_data()

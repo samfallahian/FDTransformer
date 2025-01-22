@@ -69,7 +69,6 @@ class Config:
         logger.info(f"INPUT_DIR set to: {INPUT_DIR}")
 
         # Define the base directory for output data
-
         os.makedirs("data/DL-PTV", exist_ok=True)
         OUTPUT_BASE_DIR = "data/DL-PTV"
         logger.info(f"OUTPUT_BASE_DIR set to: {OUTPUT_BASE_DIR}")
@@ -100,8 +99,8 @@ class Config:
     # Dictionary defining experiment configurations
     EXPERIMENTS = {
         "10p4": {
-            "input_file": INPUT_DIR + "10p4.pkl",
-            "output_dir": OUTPUT_BASE_DIR + "10p4",
+            "input_file": INPUT_DIR / "10p4.pkl",
+            "output_dir": OUTPUT_BASE_DIR / "10p4",
         }
     }
 
@@ -110,3 +109,9 @@ class Config:
     # Options for data transformation during processing
     TRANSFORM_OPTIONS = ["float32", "linear", "tensor"]
     logger.info(f"TRANSFORM_OPTIONS set to: {TRANSFORM_OPTIONS}")
+
+
+
+
+
+

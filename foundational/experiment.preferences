@@ -1,0 +1,16 @@
+{
+    "skirt": {
+        "root_path": "/Users/kkreth/data/root",
+        "logging_path": "/Users/kkreth/data/logs",
+        "raw_input": "/Users/kkreth/data/input.pkl",
+        "output_directory": "/Users/kkreth/data/output",
+        "logging_level": "INFO"
+    },
+    "development-server": {
+        "root_path": "/var/data/root",
+        "logging_path": "/var/data/logs",
+        "raw_input": "/var/data/input.pkl",
+        "output_directory": "/var/data/output",
+        "logging_level": "DEBUG"
+    }
+}

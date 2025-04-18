@@ -7,6 +7,7 @@ class HostPreferences:
         self.filename = filename
         self.hostname = self.get_hostname()
         self.root_path = None
+        self.metadata_location = None
         self.logging_path = None
         self.raw_input = None
         self.output_directory = None
@@ -42,6 +43,7 @@ class HostPreferences:
 
             # Set all configuration values
             self.root_path = host_config['root_path']
+            self.metadata_path = host_config['metadata_location']
             self.logging_path = host_config['logging_path']
             self.raw_input = host_config['raw_input']
             self.output_directory = host_config['output_directory']
@@ -61,6 +63,7 @@ if __name__ == "__main__":
         preferences = HostPreferences()
         print("\nConfiguration loaded successfully:")
         print(f"Host: {preferences.hostname}")
+        print(f"Metadata Location: {preferences.metadata_location}")
         print(f"Root Path: {preferences.root_path}")
         print(f"Logging Path: {preferences.logging_path}")
         print(f"Raw Input: {preferences.raw_input}")

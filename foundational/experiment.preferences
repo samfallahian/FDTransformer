@@ -1,8 +1,9 @@
 {
     "skirt": {
         "root_path": "/Users/kkreth/data/root",
+        "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData_v2.txt",
         "logging_path": "/Users/kkreth/data/logs",
-        "raw_input": "/Users/kkreth/data/input.pkl",
+        "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",
         "output_directory": "/Users/kkreth/data/output",
         "logging_level": "INFO"
     },

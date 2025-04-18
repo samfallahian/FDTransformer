@@ -8,12 +8,24 @@ from concurrent.futures import ThreadPoolExecutor
 class MinimalProcessor(HostPreferences):
     def __init__(self, filename="experiment.preferences"):
         super().__init__(filename)
+        # Set default metadata location if not set by parent
+        if not hasattr(self, 'metadata_location') or self.metadata_location is None:
+            self.metadata_location = os.path.join(self.output_directory, 'metadata.json')
 
     def process_file(self, file_path):
-        # Open the pickle file and load into a pandas DataFrame
-        with open(file_path, 'rb') as f:
-            df = pd.read_pickle(f, compression="gzip")
-            df.shape
+        # Try different methods to read the pickle file
+        try:
+            # First try without compression
+            with open(file_path, 'rb') as f:
+                df = pd.read_pickle(f)
+        except Exception as e:
+            try:
+                # If that fails, try with gzip compression
+                with open(file_path, 'rb') as f:
+                    df = pd.read_pickle(f, compression="gzip")
+            except Exception as e2:
+                print(f"Error reading file {file_path}: {str(e2)}")
+                return None
     
         # Initialize a dictionary to store meta-data
         metadata_dict = {}
@@ -22,6 +34,9 @@ class MinimalProcessor(HostPreferences):
         columns_of_interest = ['x', 'y', 'z', 'time', 'distance']
     
         for col in columns_of_interest:
+            if col not in df.columns:
+                continue
+                
             # Convert column to PyTorch tensor
             tensor = torch.from_numpy(df[col].to_numpy())
     
@@ -44,6 +59,9 @@ class MinimalProcessor(HostPreferences):
         print(f"Input: {self.raw_input}")
         print(f"Output: {self.output_directory}")
 
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(self.metadata_location), exist_ok=True)
+
         # Create list of absolute paths for each .pkl file
         file_paths = [os.path.join(self.raw_input, file) 
                      for file in os.listdir(self.raw_input) 
@@ -56,8 +74,9 @@ class MinimalProcessor(HostPreferences):
         with ThreadPoolExecutor() as executor:
             # Process each file
             for file_path, metadata in zip(file_paths, executor.map(self.process_file, file_paths)):
-                # Use filename as key for metadata
-                all_files_metadata[os.path.basename(file_path)] = metadata
+                if metadata is not None:  # Only add successful results
+                    # Use filename as key for metadata
+                    all_files_metadata[os.path.basename(file_path)] = metadata
     
         # Write all metadata to a JSON file
         with open(self.metadata_location, 'w') as f:

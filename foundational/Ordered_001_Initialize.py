@@ -43,7 +43,7 @@ class HostPreferences:
 
             # Set all configuration values
             self.root_path = host_config['root_path']
-            self.metadata_path = host_config['metadata_location']
+            self.metadata_location = host_config['metadata_location']
             self.logging_path = host_config['logging_path']
             self.raw_input = host_config['raw_input']
             self.output_directory = host_config['output_directory']

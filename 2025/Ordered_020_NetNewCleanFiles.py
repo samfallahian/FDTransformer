@@ -58,6 +58,9 @@ class CleanFilesProcessor(HostPreferences):
         # Ensure that vx, vy, vz are float32
         df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
 
+        # Ensure that original versions vx, vy, vz are float32
+        df[['vx_original', 'vy_original', 'vz_original']] = df[['vx_original', 'vy_original', 'vz_original']].astype('float32')
+
         # Drop columns px, py, and pz
         df.drop(['px', 'py', 'pz'], axis=1, inplace=True)
 

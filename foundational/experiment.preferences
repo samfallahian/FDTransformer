@@ -1,10 +1,10 @@
 {
     "skirt": {
-        "root_path": "/Users/kkreth/data/root",
+        "root_path": "*BREAK*",
         "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
-        "logging_path": "/Users/kkreth/data/logs",
+        "logging_path": "*BREAK*",
         "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",
-        "output_directory": "/Users/kkreth/data/output",
+        "output_directory": "/Users/kkreth/PycharmProjects/data/output/",
         "logging_level": "INFO"
     },
     "development-server": {

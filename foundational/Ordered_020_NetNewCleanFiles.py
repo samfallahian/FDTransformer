@@ -1,3 +1,9 @@
+'''
+OK, beware, if your system has <64 GB of RAM, I would highly recommend that you
+limit the threads to 2 or even 1.
+'''
+
+
 from Ordered_001_Initialize import HostPreferences
 import os
 import pandas as pd
@@ -101,17 +107,16 @@ class CleanFilesProcessor(HostPreferences):
         error_count = 0
 
         # Process files sequentially for now (parallel processing can be added later)
-        for file_path in file_paths:
-            try:
-                if self.process_file(file_path):
+        with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
+            results = executor.map(self.process_file, file_paths)
+            
+            for file_path, result in zip(file_paths, results):
+                if result:
                     processed_count += 1
                     print(f"Successfully processed: {os.path.basename(file_path)}")
                 else:
                     error_count += 1
                     print(f"Failed to process: {os.path.basename(file_path)}")
-            except Exception as e:
-                error_count += 1
-                print(f"Error processing {os.path.basename(file_path)}: {str(e)}")
 
         # Print summary
         print(f"\nProcessing Summary:")

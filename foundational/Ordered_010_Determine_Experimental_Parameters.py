@@ -47,13 +47,13 @@ class MinimalProcessor(HostPreferences):
             tensor = torch.sort(torch.unique(tensor)).values
     
             # Store min, max, 4th min, 4th max
-            metadata_dict[col + '_min'] = float(tensor[0])
-            metadata_dict[col + '_max'] = float(tensor[-1])
-            metadata_dict[col + '_4th_min'] = float(tensor[3]) if tensor.shape[0] > 3 else float('nan')
-            metadata_dict[col + '_4th_max'] = float(tensor[-4]) if tensor.shape[0] > 3 else float('nan')
+            metadata_dict[col + '_min'] = int(tensor[0].item())
+            metadata_dict[col + '_max'] = int(tensor[-1].item())
+            metadata_dict[col + '_4th_min'] = int(tensor[3].item()) if tensor.shape[0] > 3 else None
+            metadata_dict[col + '_4th_max'] = int(tensor[-4].item()) if tensor.shape[0] > 3 else None
     
-            # Enumerate the sorted tensor and convert to list
-            metadata_dict[col + '_enumerated'] = list(map(float, tensor.tolist()))
+            # Enumerate the sorted tensor and convert to list of integers
+            metadata_dict[col + '_enumerated'] = [int(x.item()) for x in tensor]
     
         return metadata_dict
 
@@ -129,7 +129,10 @@ class MinimalProcessor(HostPreferences):
         # Write all metadata to a JSON file
         print(f"\nWriting metadata for {len(all_files_metadata)} files to {self.metadata_location}")
         with open(self.metadata_location, 'w') as f:
-            json.dump(all_files_metadata, f, indent=4)
+            json.dump(all_files_metadata, f, 
+                     indent=4,
+                     sort_keys=True,  # For consistent output
+                     default=str)      # Handles any non-standard JSON types
         print("Metadata write complete")
 
 if __name__ == "__main__":

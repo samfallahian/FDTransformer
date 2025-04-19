@@ -1,17 +1,17 @@
 {
     "skirt": {
         "root_path": "/Users/kkreth/data/root",
-        "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData_v2.txt",
+        "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/Users/kkreth/data/logs",
         "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",
         "output_directory": "/Users/kkreth/data/output",
         "logging_level": "INFO"
     },
     "development-server": {
-        "root_path": "/var/data/root",
-        "logging_path": "/var/data/logs",
-        "raw_input": "/var/data/input.pkl",
-        "output_directory": "/var/data/output",
-        "logging_level": "DEBUG"
+        "root_path": "*FILLOUT*",
+        "logging_path": "*FILLOUT*",
+        "raw_input": "*FILLOUT*",
+        "output_directory": "*FILLOUT*",
+        "logging_level": "*FILLOUT*"
     }
 }

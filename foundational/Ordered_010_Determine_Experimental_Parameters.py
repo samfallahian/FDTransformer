@@ -8,15 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 class MinimalProcessor(HostPreferences):
     def __init__(self, filename="experiment.preferences"):
         super().__init__(filename)
-        # Debug original state
-        print(f"Initial metadata_location: {getattr(self, 'metadata_location', 'Not Set')}")
-        
-        # Set default metadata location if not set by parent
-        if not hasattr(self, 'metadata_location') or self.metadata_location is None:
-            self.metadata_location = os.path.join(self.output_directory, 'metadata.json')
-            print(f"Setting default metadata_location to: {self.metadata_location}")
-        else:
-            print(f"Using existing metadata_location: {self.metadata_location}")
+        if not hasattr(self, 'metadata_location'):
+            raise AttributeError(
+                "'metadata_location' is required but not set in the parent class (HostPreferences). Check your configuration.")
+        if self.metadata_location is None:
+            raise ValueError("'metadata_location' is set but contains None value. A valid path must be provided.")
 
     def process_file(self, file_path):
         # Try different methods to read the pickle file

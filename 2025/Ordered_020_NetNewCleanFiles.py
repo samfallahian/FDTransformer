@@ -43,10 +43,7 @@ class CleanFilesProcessor(HostPreferences):
 
         # Ensure that vx, vy, vz, time, distance, x, y, and z are 16-bit signed integers
         columns_to_convert = ['time', 'distance', 'x', 'y', 'z']
-        df[columns_to_convert] = df[columns_to_convert].astype('int16')
-
-        # Ensure that vx, vy, vz are float32
-        df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
+        df[columns_to_convert] = df[columns_to_convert].astype('int32')
 
         # Create additional columns for original velocity values
         df['vx_original'] = df['vx']
@@ -57,6 +54,9 @@ class CleanFilesProcessor(HostPreferences):
         df['vx'] = df['vx'].apply(self.converter.convert)
         df['vy'] = df['vy'].apply(self.converter.convert)
         df['vz'] = df['vz'].apply(self.converter.convert)
+
+        # Ensure that vx, vy, vz are float32
+        df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
 
         # Drop columns px, py, and pz
         df.drop(['px', 'py', 'pz'], axis=1, inplace=True)

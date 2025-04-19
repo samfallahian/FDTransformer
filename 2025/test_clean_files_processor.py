@@ -50,6 +50,28 @@ class TestCleanFilesProcessor(unittest.TestCase):
         self.assertEqual(len(input_files), 11,
                          f"Expected 11 files but found {len(input_files)}")
 
+    def test_compare_column_info(self):
+        """Compare column names and datatypes between input and output files."""
+        # Get all input files
+        input_files = [f for f in os.listdir(self.processor.raw_input) if f.endswith('.pkl')]
+
+        print("\nComparing column information between input and output files:")
+        for input_file in input_files:
+            input_path = os.path.join(self.processor.raw_input, input_file)
+            output_path = os.path.join(self.processor.output_directory, input_file)
+            
+            input_df = self.processor.read_pickle_file(input_path)
+            output_df = pd.read_pickle(output_path, compression='gzip')
+            
+            print(f"\nFile: {input_file}")
+            print("\nInput DataFrame Columns and Types:")
+            for col, dtype in input_df.dtypes.items():
+                print(f"{col}: {dtype}")
+            
+            print("\nOutput DataFrame Columns and Types:")
+            for col, dtype in output_df.dtypes.items():
+                print(f"{col}: {dtype}")
+
 
 if __name__ == '__main__':
     unittest.main()

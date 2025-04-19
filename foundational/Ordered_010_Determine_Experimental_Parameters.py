@@ -8,24 +8,31 @@ from concurrent.futures import ThreadPoolExecutor
 class MinimalProcessor(HostPreferences):
     def __init__(self, filename="experiment.preferences"):
         super().__init__(filename)
+        # Debug original state
+        print(f"Initial metadata_location: {getattr(self, 'metadata_location', 'Not Set')}")
+        
         # Set default metadata location if not set by parent
         if not hasattr(self, 'metadata_location') or self.metadata_location is None:
             self.metadata_location = os.path.join(self.output_directory, 'metadata.json')
+            print(f"Setting default metadata_location to: {self.metadata_location}")
+        else:
+            print(f"Using existing metadata_location: {self.metadata_location}")
 
     def process_file(self, file_path):
         # Try different methods to read the pickle file
-        try:
-            # First try without compression
-            with open(file_path, 'rb') as f:
-                df = pd.read_pickle(f)
-        except Exception as e:
+        for compression in [None, 'zip', 'gzip']:
             try:
-                # If that fails, try with gzip compression
                 with open(file_path, 'rb') as f:
-                    df = pd.read_pickle(f, compression="gzip")
-            except Exception as e2:
-                print(f"Error reading file {file_path}: {str(e2)}")
-                return None
+                    if compression:
+                        df = pd.read_pickle(f, compression=compression)
+                    else:
+                        df = pd.read_pickle(f)
+                    break  # If successful, break the loop
+            except Exception as e:
+                if compression == 'gzip':  # If we've tried all methods
+                    print(f"Error reading file {file_path}: {str(e)}")
+                    return None
+                continue
     
         # Initialize a dictionary to store meta-data
         metadata_dict = {}
@@ -55,10 +62,25 @@ class MinimalProcessor(HostPreferences):
         return metadata_dict
 
     def run(self):
-        print(f"Working with paths:")
+        print(f"\nPath Configuration:")
         print(f"Input: {self.raw_input}")
         print(f"Output: {self.output_directory}")
+        print(f"Metadata Location: {self.metadata_location}")
+        
+        # Verify metadata_location path
+        metadata_dir = os.path.dirname(self.metadata_location)
+        print(f"Metadata directory will be: {metadata_dir}")
+        
+        # Ensure output directory exists and is writable
+        try:
+            os.makedirs(metadata_dir, exist_ok=True)
+            if not os.access(metadata_dir, os.W_OK):
+                raise PermissionError(f"Directory {metadata_dir} is not writable")
+            print(f"Verified metadata directory exists and is writable: {metadata_dir}")
+        except Exception as e:
+            raise RuntimeError(f"Failed to setup metadata directory: {str(e)}")
 
+        # Rest of the run method...
         # Ensure output directory exists
         os.makedirs(os.path.dirname(self.metadata_location), exist_ok=True)
 
@@ -67,20 +89,52 @@ class MinimalProcessor(HostPreferences):
                      for file in os.listdir(self.raw_input) 
                      if file.endswith('.pkl')]
     
+        print(f"Found {len(file_paths)} .pkl files to process")
+        
         # Initialize a dictionary to hold metadata for all files
         all_files_metadata = {}
-    
+        processed_count = 0
+        error_count = 0
+        
         # Use multithreading to process files in parallel
         with ThreadPoolExecutor() as executor:
             # Process each file
             for file_path, metadata in zip(file_paths, executor.map(self.process_file, file_paths)):
-                if metadata is not None:  # Only add successful results
+                try:
+                    if metadata is None:
+                        error_count += 1
+                        print(f"WARNING: No metadata returned for {os.path.basename(file_path)}")
+                        continue
+                    
+                    if not isinstance(metadata, dict):
+                        error_count += 1
+                        print(f"ERROR: Expected dictionary metadata for {os.path.basename(file_path)}, got {type(metadata)}")
+                        continue
+                    
                     # Use filename as key for metadata
-                    all_files_metadata[os.path.basename(file_path)] = metadata
+                    filename = os.path.basename(file_path)
+                    all_files_metadata[filename] = metadata
+                    processed_count += 1
+                    print(f"Successfully processed: {filename}")
+                    
+                except Exception as e:
+                    error_count += 1
+                    print(f"ERROR: Failed to handle metadata for {os.path.basename(file_path)}: {str(e)}")
     
+        # Print summary
+        print(f"\nProcessing Summary:")
+        print(f"Total files: {len(file_paths)}")
+        print(f"Successfully processed: {processed_count}")
+        print(f"Errors: {error_count}")
+        
+        if not all_files_metadata:
+            raise RuntimeError("No files were successfully processed! Check the errors above.")
+        
         # Write all metadata to a JSON file
+        print(f"\nWriting metadata for {len(all_files_metadata)} files to {self.metadata_location}")
         with open(self.metadata_location, 'w') as f:
             json.dump(all_files_metadata, f, indent=4)
+        print("Metadata write complete")
 
 if __name__ == "__main__":
     processor = MinimalProcessor()

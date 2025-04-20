@@ -1,18 +1,17 @@
 '''
-OK, beware, if your system has <64 GB of RAM, I would highly recommend that you
-limit the threads to 2 or even 1.
-This file creates a net new version of the data files, that all have the correct
-dtype...which we must maintain in order to have as clean/fast of a pipeline as possible.
+This script adds 375 coordinate columns (x_1 through x_125, y_1 through y_125, z_1 through z_125)
+and 47 latent columns (latent_1 through latent_47) to the pickle files. 
+All new columns are initialized as float32 data type.
 '''
-
 
 from Ordered_001_Initialize import HostPreferences
 import os
 import pandas as pd
-import TransformLatent
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
-class CleanFilesProcessor(HostPreferences):
+
+class CoordinateProcessor(HostPreferences):
     def __init__(self, filename="experiment.preferences"):
         super().__init__(filename)
         if not hasattr(self, 'metadata_location'):
@@ -20,7 +19,6 @@ class CleanFilesProcessor(HostPreferences):
                 "'metadata_location' is required but not set in the parent class (HostPreferences). Check your configuration.")
         if self.metadata_location is None:
             raise ValueError("'metadata_location' is set but contains None value. A valid path must be provided.")
-        self.converter = TransformLatent.FloatConverter()
 
     def read_pickle_file(self, file_path):
         """Read a pickle file with different compression methods."""
@@ -38,41 +36,29 @@ class CleanFilesProcessor(HostPreferences):
                     return None
                 continue
 
-    def process_dataframe(self, df):
-        """Process a single dataframe according to the requirements."""
+    def add_coordinate_columns(self, df):
+        """Add coordinate columns x_1 through x_125, y_1 through y_125, z_1 through z_125,
+        and latent_1 through latent_47."""
         if df is None:
             return None
 
-        # Ensure that vx, vy, vz, time, distance, x, y, and z are 16-bit signed integers
-        columns_to_convert = ['time', 'distance', 'x', 'y', 'z']
-        df[columns_to_convert] = df[columns_to_convert].astype('int32')
+        # Initialize all coordinate columns with zeros as float32
+        for i in range(1, 126):
+            df[f'x_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'y_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'z_{i}'] = np.zeros(len(df), dtype=np.float32)
 
-        # Create additional columns for original velocity values
-        df['vx_original'] = df['vx']
-        df['vy_original'] = df['vy']
-        df['vz_original'] = df['vz']
-
-        # Apply the transformation to vx, vy, vz
-        df['vx'] = df['vx'].apply(self.converter.convert)
-        df['vy'] = df['vy'].apply(self.converter.convert)
-        df['vz'] = df['vz'].apply(self.converter.convert)
-
-        # Ensure that vx, vy, vz are float32
-        df[['vx', 'vy', 'vz']] = df[['vx', 'vy', 'vz']].astype('float32')
-
-        # Ensure that original versions vx, vy, vz are float32
-        df[['vx_original', 'vy_original', 'vz_original']] = df[['vx_original', 'vy_original', 'vz_original']].astype('float32')
-
-        # Drop columns px, py, and pz
-        df.drop(['px', 'py', 'pz'], axis=1, inplace=True)
+        # Initialize all latent columns with zeros as float32
+        for i in range(1, 48):
+            df[f'latent_{i}'] = np.zeros(len(df), dtype=np.float32)
 
         return df
 
     def process_file(self, file_path):
-        """Process a single file: read and transform its dataframe."""
+        """Process a single file: read and add coordinate columns."""
         df = self.read_pickle_file(file_path)
         if df is not None:
-            processed_df = self.process_dataframe(df)
+            processed_df = self.add_coordinate_columns(df)
             if processed_df is not None:
                 # Save the processed dataframe with compression
                 output_file = os.path.join(self.output_directory, os.path.basename(file_path))
@@ -82,7 +68,7 @@ class CleanFilesProcessor(HostPreferences):
 
     def run(self):
         print(f"\nPath Configuration:")
-        print(f"Input: {self.raw_input}")
+        print(f"Input: {self.output_directory}")
         print(f"Output: {self.output_directory}")
         print(f"Metadata Location: {self.metadata_location}")
 
@@ -102,19 +88,19 @@ class CleanFilesProcessor(HostPreferences):
             raise RuntimeError(f"Failed to setup output directory: {str(e)}")
 
         # Create list of absolute paths for each .pkl file
-        file_paths = [os.path.join(self.raw_input, file) 
-                     for file in os.listdir(self.raw_input) 
-                     if file.endswith('.pkl')]
-    
+        file_paths = [os.path.join(self.output_directory, file)
+                      for file in os.listdir(self.output_directory)
+                      if file.endswith('.pkl')]
+
         print(f"Found {len(file_paths)} .pkl files to process")
-        
+
         processed_count = 0
         error_count = 0
 
-        # Process files sequentially for now (parallel processing can be added later)
-        with ThreadPoolExecutor(max_workers=4) as executor:  # Adjust max_workers as needed
+        # Process files using ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as executor:
             results = executor.map(self.process_file, file_paths)
-            
+
             for file_path, result in zip(file_paths, results):
                 if result:
                     processed_count += 1
@@ -129,6 +115,7 @@ class CleanFilesProcessor(HostPreferences):
         print(f"Successfully processed: {processed_count}")
         print(f"Errors: {error_count}")
 
+
 if __name__ == "__main__":
-    processor = CleanFilesProcessor()
+    processor = CoordinateProcessor()
     processor.run()

@@ -37,31 +37,22 @@ class CoordinateProcessor(HostPreferences):
                 continue
 
     def add_coordinate_columns(self, df):
-        """Add coordinate columns x_1 through x_125, y_1 through y_125, z_1 through z_125,
+        """Add coordinate columns vx_1 through vx_125, vy_1 through vy_125, vz_1 through vz_125,
         and latent_1 through latent_47."""
         if df is None:
             return None
 
-        # Create a dictionary with all new columns at once
-        new_columns = {}
-        
-        # Add coordinate columns
+        # Initialize all coordinate columns with zeros as float32
         for i in range(1, 126):
-            new_columns[f'vx_{i}'] = np.zeros(len(df), dtype=np.float32)
-            new_columns[f'vy_{i}'] = np.zeros(len(df), dtype=np.float32)
-            new_columns[f'vz_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'vx_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'vy_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'vz_{i}'] = np.zeros(len(df), dtype=np.float32)
 
-        # Add latent columns
+        # Initialize all latent columns with zeros as float32
         for i in range(1, 48):
-            new_columns[f'latent_{i}'] = np.zeros(len(df), dtype=np.float32)
+            df[f'latent_{i}'] = np.zeros(len(df), dtype=np.float32)
 
-        # Create a new DataFrame with all the new columns
-        new_df = pd.DataFrame(new_columns)
-        
-        # Combine the original DataFrame with the new columns
-        result_df = pd.concat([df, new_df], axis=1)
-        
-        return result_df
+        return df
 
     def process_file(self, file_path):
         """Process a single file: read and add coordinate columns."""

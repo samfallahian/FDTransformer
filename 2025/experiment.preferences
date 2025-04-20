@@ -1,6 +1,6 @@
 {
     "skirt": {
-        "root_path": "*BREAK*",
+        "root_path": "/Users/kkreth/PycharmProjects/data/all_data_cleaned_dtype_correct/",
         "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/Users/kkreth/PycharmProjects/data/logs_for_jobs/",
         "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",

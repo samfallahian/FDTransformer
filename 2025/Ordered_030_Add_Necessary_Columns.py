@@ -42,17 +42,26 @@ class CoordinateProcessor(HostPreferences):
         if df is None:
             return None
 
-        # Initialize all coordinate columns with zeros as float32
+        # Create a dictionary with all new columns at once
+        new_columns = {}
+        
+        # Add coordinate columns
         for i in range(1, 126):
-            df[f'x_{i}'] = np.zeros(len(df), dtype=np.float32)
-            df[f'y_{i}'] = np.zeros(len(df), dtype=np.float32)
-            df[f'z_{i}'] = np.zeros(len(df), dtype=np.float32)
+            new_columns[f'vx_{i}'] = np.zeros(len(df), dtype=np.float32)
+            new_columns[f'vy_{i}'] = np.zeros(len(df), dtype=np.float32)
+            new_columns[f'vz_{i}'] = np.zeros(len(df), dtype=np.float32)
 
-        # Initialize all latent columns with zeros as float32
+        # Add latent columns
         for i in range(1, 48):
-            df[f'latent_{i}'] = np.zeros(len(df), dtype=np.float32)
+            new_columns[f'latent_{i}'] = np.zeros(len(df), dtype=np.float32)
 
-        return df
+        # Create a new DataFrame with all the new columns
+        new_df = pd.DataFrame(new_columns)
+        
+        # Combine the original DataFrame with the new columns
+        result_df = pd.concat([df, new_df], axis=1)
+        
+        return result_df
 
     def process_file(self, file_path):
         """Process a single file: read and add coordinate columns."""

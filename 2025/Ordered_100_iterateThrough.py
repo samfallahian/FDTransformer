@@ -324,7 +324,7 @@ if __name__ == "__main__":
 
         # For testing, process only a few files with a limited number of rows
         # Remove these limits for production runs
-        iterator.run(max_files=2, max_rows_per_file=5)
+        iterator.run(max_files=6, max_rows_per_file=5000)
 
         # For full processing, use:
         # iterator.run()

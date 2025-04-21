@@ -1,5 +1,11 @@
 import socket
 import ast
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class HostPreferences:
@@ -17,7 +23,7 @@ class HostPreferences:
     def get_hostname(self):
         """Get the hostname of the current machine."""
         hostname = socket.gethostname()
-        print(f"Current hostname: {hostname}")  # Debug line
+        logger.debug(f"Current hostname: {hostname}")  # Now a debug log message
         return hostname.lower()  # Convert to lowercase for case-insensitive matching
 
     def load_preferences(self):

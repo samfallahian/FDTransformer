@@ -148,7 +148,7 @@ if __name__ == "__main__":
     converter = PickleToCsvConverter(debug=True)  # Enable debug logging
 
     # Convert a pickle file to CSV
-    pickle_path = "/Users/kkreth/PycharmProjects/data/output/10p4.pkl"
+    pickle_path = "/Users/kkreth/PycharmProjects/data/all_data_cleaned_dtype_correct/10p4.pkl"
 
     # Without specifying CSV path (will use same name as pickle file but with .csv extension)
     converter.convert(pickle_path)

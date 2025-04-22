@@ -22,8 +22,12 @@ class DataIterator(HostPreferences):
     and connect with original data for CoordinateSpace processing.
     """
 
+    # Don't change the logging level directly
+    # Instead, check if DEBUG level messages should be logged
+
     def __init__(self, filename="experiment.preferences"):
         """Initialize with preferences file"""
+        start_time = time.time()
         super().__init__(filename)
         # Validate required paths
         if not hasattr(self, 'output_directory') or not self.output_directory:
@@ -40,6 +44,7 @@ class DataIterator(HostPreferences):
             raise FileNotFoundError(f"Root path not found: {self.root_path}")
 
         # Load metadata
+        metadata_load_start = time.time()
         if os.path.exists(self.metadata_location):
             try:
                 with open(self.metadata_location, 'r') as f:
@@ -50,9 +55,22 @@ class DataIterator(HostPreferences):
                 raise
         else:
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_location}")
-
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"DEBUG: Metadata loading time: {time.time() - metadata_load_start:.4f}s")
+        
         # Cache for original dataframes
         self.original_df_cache = {}
+        
+        # Set the logging level from preferences if available
+        if hasattr(self, 'logging_level'):
+            level = getattr(logging, self.logging_level.upper(), None)
+            if level is not None:
+                logger.setLevel(level)
+                logger.debug(f"Set logging level to {self.logging_level.upper()}")
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"DEBUG: Initialization time: {time.time() - start_time:.4f}s")
 
     def get_output_files(self) -> List[str]:
         """Get list of pickle files in the output directory"""
@@ -222,23 +240,25 @@ class DataIterator(HostPreferences):
     def update_output_with_velocities(self, filename: str, processed_data: List[Dict]) -> bool:
         """
         Update the output dataframe with processed velocity data.
-
-        Args:
-            filename: Pickle filename in output directory
-            processed_data: List of dictionaries with processed data
-
-        Returns:
-            True if successful, False otherwise
+        Uses batch updates instead of individual assignments.
         """
+        update_start_time = time.time()
         try:
             # Load dataframe from output directory
+            load_start = time.time()
             output_path = os.path.join(self.output_directory, filename)
             df = self.load_pickle_file(output_path)
+            logger.debug(f"Load time for update: {time.time() - load_start:.4f}s")
+        
             if df is None:
                 logger.error(f"Failed to load output file for updating: {output_path}")
                 return False
 
-            # Update each row
+            # Update rows in batches
+            update_rows_start = time.time()
+            rows_updated = 0
+        
+            # Prepare a list of updates to be applied at once
             for data in processed_data:
                 # Ensure we have valid data
                 if 'error' in data or not data.get('velocities'):
@@ -262,36 +282,34 @@ class DataIterator(HostPreferences):
 
                 # Get index of the row
                 idx = df[mask].index[0]
-
-                # Debug logging to show values being updated
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Updating row at index {idx} for coordinate (time={time_val}, x={x_val}, y={y_val}, z={z_val})")
-                
-                # Update vx_i, vy_i, vz_i columns with velocities
+            
+                # Create a dictionary of all updates for this row
+                updates = {}
                 velocities = data['velocities']
                 for i, (vx, vy, vz) in enumerate(velocities, 1):
                     if i <= 125:  # Ensure we don't exceed column count
-                        df.at[idx, f'vx_{i}'] = vx
-                        df.at[idx, f'vy_{i}'] = vy
-                        df.at[idx, f'vz_{i}'] = vz
-                        
-                        # Add detailed debug logging for each velocity value being inserted
-                        if logger.isEnabledFor(logging.DEBUG):
-                            logger.debug(f"  Setting velocity {i} at (time={time_val}, x={x_val}, y={y_val}, z={z_val}): "
-                                         f"vx_{i}={vx}, vy_{i}={vy}, vz_{i}={vz}")
-
-                # Log a summary of the update for this row at DEBUG level
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(f"Completed update for row at coordinate (time={time_val}, x={x_val}, y={y_val}, z={z_val}) "
-                                 f"with {len(velocities)} velocity points")
+                        updates[f'vx_{i}'] = vx
+                        updates[f'vy_{i}'] = vy
+                        updates[f'vz_{i}'] = vz
+            
+                # Apply all updates for this row at once
+                df.loc[idx, list(updates.keys())] = list(updates.values())
+                rows_updated += 1
+            
+            logger.debug(f"Total rows update time ({rows_updated} rows): {time.time() - update_rows_start:.4f}s")
 
             # Save updated dataframe
+            save_start = time.time()
             df.to_pickle(output_path, compression='gzip')
+            logger.debug(f"Save time for updated dataframe: {time.time() - save_start:.4f}s")
+        
             logger.info(f"Updated {output_path} with velocity data")
+            logger.debug(f"Total update time: {time.time() - update_start_time:.4f}s")
             return True
 
         except Exception as e:
             logger.error(f"Error updating output file: {str(e)}")
+            logger.debug(f"Update failed after {time.time() - update_start_time:.4f}s")
             return False
 
     def run(self, max_files: int = None, max_rows_per_file: int = None):
@@ -339,8 +357,8 @@ if __name__ == "__main__":
 
         # For testing, process only a few files with a limited number of rows
         # Remove these limits for production runs
-        iterator.run(max_files=6, max_rows_per_file=500)
-
+        #iterator.run(max_files=1, max_rows_per_file=500)
+        iterator.run()
         # For full processing, use:
         # iterator.run()
 

@@ -149,9 +149,10 @@ class DataIterator(HostPreferences):
                     vz = float(match['vz'].iloc[0])
                     velocity_data.append((vx, vy, vz))
                 else:
-                    logger.warning(f"Found {len(match)} matches for coordinate {coord} at time {time_val}")
-                    # Use NaN for missing values
-                    velocity_data.append((np.nan, np.nan, np.nan))
+                    # Log as critical error instead of warning
+                    logger.critical(f"Found {len(match)} matches for coordinate {coord} at time {time_val}")
+                    # Exit the program with error code 1
+                    sys.exit(1)
 
             # Return processed data
             return {
@@ -262,6 +263,10 @@ class DataIterator(HostPreferences):
                 # Get index of the row
                 idx = df[mask].index[0]
 
+                # Debug logging to show values being updated
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Updating row at index {idx} for coordinate (time={time_val}, x={x_val}, y={y_val}, z={z_val})")
+                
                 # Update vx_i, vy_i, vz_i columns with velocities
                 velocities = data['velocities']
                 for i, (vx, vy, vz) in enumerate(velocities, 1):
@@ -269,6 +274,16 @@ class DataIterator(HostPreferences):
                         df.at[idx, f'vx_{i}'] = vx
                         df.at[idx, f'vy_{i}'] = vy
                         df.at[idx, f'vz_{i}'] = vz
+                        
+                        # Add detailed debug logging for each velocity value being inserted
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(f"  Setting velocity {i} at (time={time_val}, x={x_val}, y={y_val}, z={z_val}): "
+                                         f"vx_{i}={vx}, vy_{i}={vy}, vz_{i}={vz}")
+
+                # Log a summary of the update for this row at DEBUG level
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Completed update for row at coordinate (time={time_val}, x={x_val}, y={y_val}, z={z_val}) "
+                                 f"with {len(velocities)} velocity points")
 
             # Save updated dataframe
             df.to_pickle(output_path, compression='gzip')
@@ -324,7 +339,7 @@ if __name__ == "__main__":
 
         # For testing, process only a few files with a limited number of rows
         # Remove these limits for production runs
-        iterator.run(max_files=6, max_rows_per_file=5000)
+        iterator.run(max_files=6, max_rows_per_file=500)
 
         # For full processing, use:
         # iterator.run()

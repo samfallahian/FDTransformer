@@ -66,8 +66,9 @@ class ExtremeValueProcessor(HostPreferences):
             if f'{coord}_enumerated' in file_metadata:
                 values = file_metadata[f'{coord}_enumerated']
                 # Add two lowest and two highest values
-                extreme_values.update(values[:2])  # Two lowest
-                extreme_values.update(values[-2:])  # Two highest
+#TODO Increase this to 3 for the below to values to avoid errors we were seeing (look at 4/21 8:33 AM commit logs for details)
+                extreme_values.update(values[:3])  # Two lowest
+                extreme_values.update(values[-3:])  # Two highest
 
         # Create a boolean mask for rows to keep
         mask = ~(df['x'].isin(extreme_values) |

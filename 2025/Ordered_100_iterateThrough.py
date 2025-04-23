@@ -16,32 +16,40 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 
-class DataIterator(HostPreferences):
+class DataProcessor(HostPreferences):
     """
-    Class to iterate through pickle files in the output directory, process rows,
+    Class to process a single pickle file, extract data based on coordinates,
     and connect with original data for CoordinateSpace processing.
     """
 
-    # Don't change the logging level directly
-    # Instead, check if DEBUG level messages should be logged
-
-    def __init__(self, filename="experiment.preferences"):
-        """Initialize with preferences file"""
+    def __init__(self, filename="experiment.preferences", input_path=None):
+        """Initialize with preferences file and input path"""
         start_time = time.time()
         super().__init__(filename)
+        
+        if input_path is None:
+            if len(sys.argv) > 1:
+                input_path = sys.argv[1]
+            else:
+                raise ValueError("Input file path must be specified either as an argument or via command line")
+        
+        self.input_path = input_path
+        logger.info(f"Processing input file: {self.input_path}")
+        
+        # Extract experiment name from the second-to-last directory in the path
+        path_parts = os.path.normpath(input_path).split(os.sep)
+        if len(path_parts) < 2:
+            raise ValueError(f"Input path doesn't have enough components to extract experiment name: {input_path}")
+        
+        # Extract experiment name from the second-to-last directory
+        self.experiment_name = path_parts[-2]
+        logger.info(f"Extracted experiment name: {self.experiment_name}")
+        
         # Validate required paths
-        if not hasattr(self, 'output_directory') or not self.output_directory:
-            raise ValueError("Output directory not specified in preferences")
         if not hasattr(self, 'root_path') or not self.root_path:
             raise ValueError("Root path not specified in preferences")
         if not hasattr(self, 'metadata_location') or not self.metadata_location:
             raise ValueError("Metadata location not specified in preferences")
-
-        # Ensure directories exist
-        if not os.path.exists(self.output_directory):
-            raise FileNotFoundError(f"Output directory not found: {self.output_directory}")
-        if not os.path.exists(self.root_path):
-            raise FileNotFoundError(f"Root path not found: {self.root_path}")
 
         # Load metadata
         metadata_load_start = time.time()
@@ -56,11 +64,8 @@ class DataIterator(HostPreferences):
         else:
             raise FileNotFoundError(f"Metadata file not found: {self.metadata_location}")
         
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"DEBUG: Metadata loading time: {time.time() - metadata_load_start:.4f}s")
-        
-        # Cache for original dataframes
-        self.original_df_cache = {}
+        # Cache for original dataframe
+        self.original_df = None
         
         # Set the logging level from preferences if available
         if hasattr(self, 'logging_level'):
@@ -71,17 +76,6 @@ class DataIterator(HostPreferences):
         
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"DEBUG: Initialization time: {time.time() - start_time:.4f}s")
-
-    def get_output_files(self) -> List[str]:
-        """Get list of pickle files in the output directory"""
-        try:
-            files = [f for f in os.listdir(self.output_directory)
-                     if f.endswith('.pkl')]
-            logger.info(f"Found {len(files)} pickle files in output directory")
-            return files
-        except Exception as e:
-            logger.error(f"Error listing files in output directory: {str(e)}")
-            raise
 
     def load_pickle_file(self, file_path: str) -> Optional[pd.DataFrame]:
         """Load a pickle file with different compression methods"""
@@ -98,39 +92,44 @@ class DataIterator(HostPreferences):
                     return None
                 continue
 
-    def get_original_dataframe(self, filename: str) -> Optional[pd.DataFrame]:
+    def get_original_dataframe(self) -> Optional[pd.DataFrame]:
         """
-        Get the original dataframe from the root path.
-        Uses caching to avoid reloading the same file.
+        Get the original dataframe from the root path based on experiment name.
         """
-        if filename in self.original_df_cache:
-            return self.original_df_cache[filename]
+        if self.original_df is not None:
+            return self.original_df
 
-        original_path = os.path.join(self.root_path, filename)
+        # Use experiment name to locate the original file
+        original_filename = f"{self.experiment_name}.pkl"
+        original_path = os.path.join(self.root_path, original_filename)
+        
         if not os.path.exists(original_path):
             logger.error(f"Original file not found: {original_path}")
             return None
 
         df = self.load_pickle_file(original_path)
         if df is not None:
-            self.original_df_cache[filename] = df
+            self.original_df = df
+            logger.info(f"Loaded original data from {original_path}")
 
-        return df
+        return self.original_df
 
-    def process_row(self, row: pd.Series, original_df: pd.DataFrame,
-                    filename: str) -> Dict:
+    def process_row(self, row: pd.Series) -> Dict:
         """
         Process a single row from the dataframe.
 
         Args:
             row: DataFrame row with time, x, y, z columns
-            original_df: Original dataframe from root_path
-            filename: Name of the file (for metadata lookup)
 
         Returns:
             Dictionary with processed data
         """
         try:
+            # Get original dataframe
+            original_df = self.get_original_dataframe()
+            if original_df is None:
+                raise RuntimeError("Failed to load original dataframe")
+
             # Extract time and coordinates (ensuring they are integers)
             time_val = int(row['time'])
             x_val = int(row['x'])
@@ -139,7 +138,7 @@ class DataIterator(HostPreferences):
 
             # Initialize coordinate space processor
             coord_processor = givenXYZreplyVelocityCube(
-                pickle_filename=filename,
+                pickle_filename=f"{self.experiment_name}.pkl",
                 x=x_val,
                 y=y_val,
                 z=z_val
@@ -192,66 +191,20 @@ class DataIterator(HostPreferences):
                 'error': str(e)
             }
 
-    def process_file(self, filename: str, max_rows: int = None) -> List[Dict]:
+    def update_output_with_velocities(self, processed_data: List[Dict]) -> bool:
         """
-        Process a single file, iterating through rows.
-
-        Args:
-            filename: Pickle filename in output directory
-            max_rows: Maximum number of rows to process (for debugging)
-
-        Returns:
-            List of dictionaries with processed data for each row
-        """
-        start_time = time.time()
-        logger.info(f"Processing file: {filename}")
-
-        # Load file from output directory
-        output_path = os.path.join(self.output_directory, filename)
-        output_df = self.load_pickle_file(output_path)
-        if output_df is None:
-            logger.error(f"Failed to load output file: {output_path}")
-            return []
-
-        # Get original dataframe from root path
-        original_df = self.get_original_dataframe(filename)
-        if original_df is None:
-            logger.error(f"Failed to load original file: {filename}")
-            return []
-
-        # Process each row
-        results = []
-        row_count = len(output_df) if max_rows is None else min(max_rows, len(output_df))
-
-        logger.info(f"Processing {row_count} rows from {filename}")
-
-        for i, (_, row) in enumerate(output_df.head(row_count).iterrows()):
-            if i % 10 == 0:  # Log progress periodically
-                logger.info(f"Processing row {i + 1}/{row_count} in {filename}")
-
-            result = self.process_row(row, original_df, filename)
-            results.append(result)
-
-        elapsed = time.time() - start_time
-        logger.info(f"Processed {len(results)} rows from {filename} in {elapsed:.2f}s")
-
-        return results
-
-    def update_output_with_velocities(self, filename: str, processed_data: List[Dict]) -> bool:
-        """
-        Update the output dataframe with processed velocity data.
+        Update the input dataframe with processed velocity data.
         Uses batch updates instead of individual assignments.
         """
         update_start_time = time.time()
         try:
-            # Load dataframe from output directory
+            # Load dataframe from input path
             load_start = time.time()
-            output_path = os.path.join(self.output_directory, filename)
-            df = self.load_pickle_file(output_path)
+            df = self.load_pickle_file(self.input_path)
             logger.debug(f"Load time for update: {time.time() - load_start:.4f}s")
         
             if df is None:
-                logger.error(f"Failed to load output file for updating: {output_path}")
+                logger.error(f"Failed to load input file for updating: {self.input_path}")
                 return False
 
             # Update rows in batches
@@ -300,67 +253,77 @@ class DataIterator(HostPreferences):
 
             # Save updated dataframe
             save_start = time.time()
-            df.to_pickle(output_path, compression='gzip')
+            df.to_pickle(self.input_path, compression='gzip')
             logger.debug(f"Save time for updated dataframe: {time.time() - save_start:.4f}s")
         
-            logger.info(f"Updated {output_path} with velocity data")
+            logger.info(f"Updated {self.input_path} with velocity data for {rows_updated} rows")
             logger.debug(f"Total update time: {time.time() - update_start_time:.4f}s")
             return True
 
         except Exception as e:
-            logger.error(f"Error updating output file: {str(e)}")
+            logger.error(f"Error updating input file: {str(e)}")
             logger.debug(f"Update failed after {time.time() - update_start_time:.4f}s")
             return False
 
-    def run(self, max_files: int = None, max_rows_per_file: int = None):
+    def run(self, max_rows: int = None):
         """
-        Run the processing on all files.
+        Run the processing on the input file.
 
         Args:
-            max_files: Maximum number of files to process (for debugging)
-            max_rows_per_file: Maximum number of rows to process per file
+            max_rows: Maximum number of rows to process (for debugging)
         """
         start_time = time.time()
 
-        # Get list of files
-        files = self.get_output_files()
+        try:
+            # Load the input file
+            df = self.load_pickle_file(self.input_path)
+            if df is None:
+                logger.error(f"Failed to load input file: {self.input_path}")
+                return
 
-        # Limit number of files if requested
-        if max_files is not None:
-            files = files[:max_files]
+            # Limit number of rows if requested
+            if max_rows is not None:
+                df = df.head(max_rows)
+                
+            row_count = len(df)
+            logger.info(f"Processing {row_count} rows from {self.input_path}")
 
-        logger.info(f"Processing {len(files)} files with max {max_rows_per_file} rows per file")
+            # Process each row
+            processed_data = []
+            for i, (_, row) in enumerate(df.iterrows()):
+                if i % 10 == 0:  # Log progress periodically
+                    logger.info(f"Processing row {i + 1}/{row_count}")
 
-        # Process each file
-        for i, filename in enumerate(files):
-            logger.info(f"Processing file {i + 1}/{len(files)}: {filename}")
+                result = self.process_row(row)
+                processed_data.append(result)
 
-            # Process the file
-            processed_data = self.process_file(filename, max_rows=max_rows_per_file)
-
-            # Update output file with results
+            # Update input file with results
             if processed_data:
-                success = self.update_output_with_velocities(filename, processed_data)
+                success = self.update_output_with_velocities(processed_data)
                 if success:
-                    logger.info(f"Successfully updated {filename}")
+                    logger.info(f"Successfully updated {self.input_path}")
                 else:
-                    logger.error(f"Failed to update {filename}")
+                    logger.error(f"Failed to update {self.input_path}")
 
-        elapsed = time.time() - start_time
-        logger.info(f"Completed processing {len(files)} files in {elapsed:.2f}s")
+            elapsed = time.time() - start_time
+            logger.info(f"Completed processing {row_count} rows in {elapsed:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Error processing file: {str(e)}")
+            raise
 
 
 if __name__ == "__main__":
     try:
-        # Create iterator instance
-        iterator = DataIterator()
-
-        # For testing, process only a few files with a limited number of rows
-        # Remove these limits for production runs
-        #iterator.run(max_files=1, max_rows_per_file=500)
-        iterator.run()
-        # For full processing, use:
-        # iterator.run()
+        # Create processor instance with input path from command line if provided
+        input_path = sys.argv[1] if len(sys.argv) > 1 else None
+        processor = DataProcessor(input_path=input_path)
+        
+        # For testing, process only a limited number of rows
+        # processor.run(max_rows=500)
+        
+        # For full processing
+        processor.run()
 
     except Exception as e:
         logger.error(f"Error in main: {str(e)}")

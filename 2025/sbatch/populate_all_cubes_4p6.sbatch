@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -c 1
-#SBATCH --mem=32gb
+#SBATCH --mem=16gb
 #SBATCH --job-name=4p6
 #SBATCH -t 21:55:00  # Job time limit
 #SBATCH --array=1-1200
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4
+#SBATCH --ntasks-per-node=1
 #SBATCH -o /home/kkreth_umassd_edu/DL-PTV/logs/%x.%A.%a.out
 
 source /home/kkreth_umassd_edu/_virtual_python_3/bin/activate

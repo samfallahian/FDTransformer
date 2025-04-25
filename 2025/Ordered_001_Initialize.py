@@ -21,9 +21,22 @@ class HostPreferences:
         self.load_preferences()
 
     def get_hostname(self):
-        """Get the hostname of the current machine."""
-        hostname = socket.gethostname()
-        logger.debug(f"Current hostname: {hostname}")  # Now a debug log message
+        """Get the fully qualified domain name of the current machine."""
+        try:
+            # Try to get the fully qualified hostname using the system's hostname command
+            import subprocess
+            result = subprocess.run(['hostname', '-f'], capture_output=True, text=True, check=True)
+            hostname = result.stdout.strip()
+        
+            # If the hostname command returns an empty string, fall back to socket methods
+            if not hostname:
+                hostname = socket.getfqdn()
+            
+        except (subprocess.SubprocessError, FileNotFoundError):
+            # If the hostname command fails, fall back to socket.getfqdn()
+            hostname = socket.getfqdn()
+        
+        logger.debug(f"Current FQDN hostname: {hostname}")
         return hostname.lower()  # Convert to lowercase for case-insensitive matching
 
     def load_preferences(self):
@@ -39,13 +52,21 @@ class HostPreferences:
             # Convert all host keys to lowercase for case-insensitive matching
             config = {k.lower(): v for k, v in config.items()}
 
-            # Verify the current host exists in the configuration
-            if self.hostname not in config:
-                available_hosts = ", ".join(config.keys())
-                raise ValueError(f"Host '{self.hostname}' not found. Available hosts: {available_hosts}")
+            # Find matching configuration using regex
+            import re
+            matched_key = None
+            for host_pattern in config.keys():
+                if re.search(host_pattern, self.hostname):
+                    matched_key = host_pattern
+                    break
 
-            # Get the configuration for the current host
-            host_config = config[self.hostname]
+            # Verify a matching host pattern exists in the configuration
+            if matched_key is None:
+                available_hosts = ", ".join(config.keys())
+                raise ValueError(f"No matching host pattern for '{self.hostname}'. Available patterns: {available_hosts}")
+
+            # Get the configuration for the matched host pattern
+            host_config = config[matched_key]
 
             # Set all configuration values
             self.root_path = host_config['root_path']

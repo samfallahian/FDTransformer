@@ -7,11 +7,12 @@
         "output_directory": "/Users/kkreth/PycharmProjects/data/output/",
         "logging_level": "DEBUG"
     },
-    "development-server": {
-        "root_path": "*FILLOUT*",
-        "logging_path": "*FILLOUT*",
-        "raw_input": "*FILLOUT*",
-        "output_directory": "*FILLOUT*",
-        "logging_level": "*FILLOUT*"
+    "umass.edu": {
+        "root_path": "/home/kkreth_umassd_edu/DL-PTV/all_data_cleaned_dtype_correct/",
+        "metadata_location": "/home/kkreth_umassd_edu/cgan/configs/Experiment_MetaData.json",
+        "logging_path": "/home/kkreth_umassd_edu/logs/",
+        "raw_input": "/home/kkreth_umassd_edu/DL-PTV/*FILLOUT*",
+        "output_directory": "/home/kkreth_umassd_edu/DL-PTV/all_data_broken_down_1200_each_directory/",
+        "logging_level": "DEBUG"
     }
 }

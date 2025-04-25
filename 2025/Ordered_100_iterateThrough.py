@@ -78,19 +78,68 @@ class DataProcessor(HostPreferences):
             logger.debug(f"DEBUG: Initialization time: {time.time() - start_time:.4f}s")
 
     def load_pickle_file(self, file_path: str) -> Optional[pd.DataFrame]:
-        """Load a pickle file with different compression methods"""
-        for compression in [None, 'zip', 'gzip']:
-            try:
-                start_time = time.time()
-                df = pd.read_pickle(file_path, compression=compression)
-                logger.debug(
-                    f"Loaded {file_path} with {compression or 'no'} compression in {time.time() - start_time:.2f}s")
-                return df
-            except Exception as e:
-                if compression == 'gzip':  # If we've tried all methods
-                    logger.error(f"Failed to load {file_path}: {str(e)}")
-                    return None
-                continue
+        """
+        Load a pickle file with intelligent detection of compression method.
+        Handles cross-platform differences between macOS and Linux pickle files.
+        
+        Args:
+            file_path: Path to the pickle file
+        
+        Returns:
+            Pandas DataFrame or None if loading fails
+        """
+        # First, examine the file header to determine if it's compressed
+        try:
+            with open(file_path, 'rb') as f:
+                # Read first few bytes to check the file signature
+                header = f.read(2)
+                f.seek(0)  # Reset file position
+                
+                # Standard gzip files start with magic number b'\x1f\x8b'
+                if header == b'\x1f\x8b':
+                    # File has gzip header
+                    compression = 'gzip'
+                    logger.debug(f"Detected gzip compression for {file_path} based on header")
+                elif header.startswith(b'PK'):
+                    # ZIP files start with 'PK' signature
+                    compression = 'zip'
+                    logger.debug(f"Detected zip compression for {file_path} based on header")
+                else:
+                    # File appears to be a raw pickle file (not compressed)
+                    # b'\x80\x05' is the signature for pickle protocol 5
+                    compression = None
+                    logger.debug(f"Detected uncompressed pickle file {file_path} with header: {header}")
+                
+            # First try with the detected compression method
+            start_time = time.time()
+            logger.info(f"Loading {file_path} with {compression or 'no'} compression")
+            df = pd.read_pickle(file_path, compression=compression)
+            logger.debug(f"Successfully loaded {file_path} in {time.time() - start_time:.2f}s")
+            return df
+        
+        except Exception as e:
+            # If auto-detection fails, try all possible compression methods as fallback
+            logger.warning(f"Auto-detection failed for {file_path}: {str(e)}")
+            logger.info("Trying all compression methods as fallback")
+            
+            for comp in [None, 'gzip', 'zip']:
+                try:
+                    start_time = time.time()
+                    logger.debug(f"Trying to load {file_path} with {comp or 'no'} compression")
+                    df = pd.read_pickle(file_path, compression=comp)
+                    logger.info(
+                        f"Successfully loaded {file_path} with {comp or 'no'} compression in {time.time() - start_time:.2f}s")
+                    return df
+                except Exception as retry_e:
+                    # Log the specific error for debugging
+                    logger.debug(f"Failed loading with {comp or 'no'} compression: {str(retry_e)}")
+                    
+                    # Only log as error when we've exhausted all options
+                    if comp == 'zip':  # Last option in our list
+                        logger.error(f"Failed to load {file_path} with any compression method: {str(retry_e)}")
+            
+            # If we've tried all methods and none worked
+            return None
 
     def get_original_dataframe(self) -> Optional[pd.DataFrame]:
         """

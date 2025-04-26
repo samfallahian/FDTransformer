@@ -18,6 +18,7 @@ class HostPreferences:
         self.raw_input = None
         self.output_directory = None
         self.logging_level = None
+        self.training_data_path = None  # New field
         self.load_preferences()
 
     def get_hostname(self):
@@ -68,13 +69,14 @@ class HostPreferences:
             # Get the configuration for the matched host pattern
             host_config = config[matched_key]
 
-            # Set all configuration values
+            # Set all configuration values (add training_data_path)
             self.root_path = host_config['root_path']
             self.metadata_location = host_config['metadata_location']
             self.logging_path = host_config['logging_path']
             self.raw_input = host_config['raw_input']
             self.output_directory = host_config['output_directory']
             self.logging_level = host_config['logging_level']
+            self.training_data_path = host_config['training_data_path']  # NEW
 
         except FileNotFoundError:
             raise FileNotFoundError(f"Configuration file '{self.filename}' not found.")
@@ -96,5 +98,6 @@ if __name__ == "__main__":
         print(f"Raw Input: {preferences.raw_input}")
         print(f"Output Directory: {preferences.output_directory}")
         print(f"Logging Level: {preferences.logging_level}")
+        print(f"Training Data Path: {preferences.training_data_path}")  # NEW
     except Exception as e:
         print(f"Error: {e}")

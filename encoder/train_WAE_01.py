@@ -46,6 +46,7 @@ NUM_WORKERS = 10
 SAVE_INTERVAL = 10
 BATCHES_PER_EPOCH = 100
 CACHE_SIZE = 25
+MODEL_NAME = "WAE_01"  # Add at the top of the file or next to your config constants
 
 # Configure logging
 logging.basicConfig(
@@ -177,7 +178,7 @@ def main():
         
         # Save model checkpoint
         if (epoch + 1) % SAVE_INTERVAL == 0:
-            checkpoint_path = os.path.join(save_dir, f"wae_epoch_{epoch+1}.pt")
+            checkpoint_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
@@ -187,7 +188,7 @@ def main():
             logger.info(f"Saved model checkpoint to {checkpoint_path}")
     
     # Save final model
-    final_model_path = os.path.join(save_dir, "wae_final.pt")
+    final_model_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),

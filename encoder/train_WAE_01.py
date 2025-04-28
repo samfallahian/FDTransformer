@@ -4,6 +4,7 @@
 """
 Train script for WAE model 01.
 This script trains the WAE model using either Apple Silicon or NVIDIA GPU if available.
+Supports loading from a saved model checkpoint with the --resume_checkpoint argument.
 """
 
 import os
@@ -13,6 +14,7 @@ import time
 import torch
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import argparse  # <---- NEW
 
 # Add parent directory to path so we can import modules
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,30 +25,23 @@ if parent_dir not in sys.path:
 from encoder.model_WAE_01 import WAE
 from EfficientDataLoader import EfficientDataLoader
 
-import os
-import sys
-
-# Figure out the project root directory (the directory containing experiment.preferences)
-project_root = os.path.dirname(os.path.abspath(__file__))  # If this is directly in the root
-# If this line is in encoder/train_WAE_01.py, fix to:
+# Figure out the project root directory
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 preferences_path = os.path.join(project_root, "experiment.preferences")
-
 from Ordered_001_Initialize import HostPreferences
 
 # When creating preferences, pass the resolved path:
 preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
-BATCH_SIZE = 32
-NUM_EPOCHS = 100
-LEARNING_RATE = 1e-4
-NUM_WORKERS = 10
-SAVE_INTERVAL = 10
+BATCH_SIZE = 16
+NUM_EPOCHS = 1000
+LEARNING_RATE = 1e-5
+NUM_WORKERS = 50
+SAVE_INTERVAL = 100
 BATCHES_PER_EPOCH = 100
-CACHE_SIZE = 25
-MODEL_NAME = "WAE_01"  # Add at the top of the file or next to your config constants
+CACHE_SIZE = 500
+MODEL_NAME = "WAE_01"
 
 # Configure logging
 logging.basicConfig(
@@ -74,11 +69,39 @@ def setup_device():
     else:
         device = torch.device("cpu")
         logger.info("No GPU detected, using CPU for training (this will be slow)")
-    
     return device
 
+import wandb
+
 def main():
-    """Main training function."""
+    # Parse command-line arguments for model checkpoint resuming (<---- NEW)
+    parser = argparse.ArgumentParser(description="Train WAE model 01 (with checkpoint resume support)")
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                        help="Path to checkpoint (.pt file) to resume training from (optional).")
+    args = parser.parse_args()
+
+    # Read model file for notes (adjust path as needed)
+    model_filepath = os.path.join(parent_dir, 'encoder', 'model_WAE_01.py')
+    notes_content = ""
+    try:
+        with open(model_filepath, 'r') as file:
+            notes_content = file.read()
+    except Exception as e:
+        notes_content = f"Failed to load model file: {e}"
+
+    # Start wandb run, use MODEL_NAME as project, add notes
+    wandb_run = wandb.init(
+        project=MODEL_NAME,
+        name=f"{MODEL_NAME}_run",
+        config={
+            "batch_size": BATCH_SIZE,
+            "epochs": NUM_EPOCHS,
+            "learning_rate": LEARNING_RATE,
+            "model": MODEL_NAME,
+        },
+        notes=notes_content
+    )
+
     # Setup device (GPU/CPU)
     device = setup_device()
     
@@ -91,12 +114,39 @@ def main():
     # Initialize tensorboard writer
     writer = SummaryWriter(log_dir=log_dir)
     
-    # Initialize model
+    # Initialize model and optimizer
     model = WAE().to(device)
-    logger.info(f"Initialized WAE model with latent dimension {model.fc4.out_features}")
-    
-    # Initialize optimizer
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    start_epoch = 0  # Default start at first epoch
+    
+    # === Load checkpoint if provided ===  (<---- NEW)
+    if args.resume_checkpoint is not None:
+        resume_path = args.resume_checkpoint
+    else:
+        # Convenience: If wae_final.pt exists and not specified, can default to that (optional)
+        default_final = os.path.join(save_dir, f"wae_final.pt")
+        resume_path = default_final if os.path.isfile(default_final) else None
+
+    if resume_path and os.path.isfile(resume_path):
+        try:
+            logger.info(f"Loading checkpoint from {resume_path}")
+            checkpoint = torch.load(resume_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch']  # Resume from next epoch
+                logger.info(f"Resuming training from epoch {start_epoch}")
+            else:
+                logger.info("Checkpoint does not contain epoch info, starting from epoch 0")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            logger.error("Training will start from scratch.")
+    else:
+        if args.resume_checkpoint is not None:
+            logger.warning(f"Checkpoint {args.resume_checkpoint} does not exist, will start from scratch.")
+
+    logger.info(f"Initialized WAE model with latent dimension {model.fc4.out_features}")
     
     # Initialize data loader
     dataloader = EfficientDataLoader(
@@ -106,14 +156,13 @@ def main():
         cache_size=CACHE_SIZE,
         shuffle=True
     )
-    
     logger.info(f"Found {len(dataloader.file_metadata)} valid files with velocity data")
     
     # Training loop
     start_time = time.time()
     global_step = 0
     
-    for epoch in range(NUM_EPOCHS):
+    for epoch in range(start_epoch, NUM_EPOCHS):
         epoch_loss = 0
         epoch_recon_loss = 0
         epoch_mmd_loss = 0
@@ -154,6 +203,15 @@ def main():
             writer.add_scalar('Loss/recon_step', recon_loss.item(), global_step)
             writer.add_scalar('Loss/mmd_step', mmd_loss.item(), global_step)
             writer.add_scalar('Loss/triplet_step', triplet_loss.item(), global_step)
+
+            # Log metrics to wandb
+            wandb.log({
+                "Loss/train_step": loss.item(),
+                "Loss/recon_step": recon_loss.item(),
+                "Loss/mmd_step": mmd_loss.item(),
+                "Loss/triplet_step": triplet_loss.item(),
+                "global_step": global_step
+            })
         
         # Compute epoch average losses
         avg_loss = epoch_loss / num_batches
@@ -175,6 +233,15 @@ def main():
         writer.add_scalar('Loss/recon_epoch', avg_recon_loss, epoch)
         writer.add_scalar('Loss/mmd_epoch', avg_mmd_loss, epoch)
         writer.add_scalar('Loss/triplet_epoch', avg_triplet_loss, epoch)
+
+        # Epoch summary to wandb
+        wandb.log({
+            "Loss/train_epoch": avg_loss,
+            "Loss/recon_epoch": avg_recon_loss,
+            "Loss/mmd_epoch": avg_mmd_loss,
+            "Loss/triplet_epoch": avg_triplet_loss,
+            "epoch": epoch
+        })
         
         # Save model checkpoint
         if (epoch + 1) % SAVE_INTERVAL == 0:
@@ -186,6 +253,7 @@ def main():
                 'loss': avg_loss,
             }, checkpoint_path)
             logger.info(f"Saved model checkpoint to {checkpoint_path}")
+            wandb.save(checkpoint_path)
     
     # Save final model
     final_model_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")
@@ -194,6 +262,7 @@ def main():
         'optimizer_state_dict': optimizer.state_dict(),
     }, final_model_path)
     logger.info(f"Saved final model to {final_model_path}")
+    wandb.save(final_model_path)
     
     # Training summary
     total_time = time.time() - start_time
@@ -201,6 +270,7 @@ def main():
     logger.info(f"Final loss: {avg_loss:.6f}")
     
     writer.close()
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

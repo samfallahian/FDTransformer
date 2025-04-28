@@ -10,6 +10,7 @@
     },
     "umass.edu": {
         "root_path": "/home/kkreth_umassd_edu/DL-PTV/all_data_cleaned_dtype_correct/",
+        "training_data_path": "/home/kkreth_umassd_edu/DL-PTV/all_data_broken_down_1200_each_directory/",
         "metadata_location": "/home/kkreth_umassd_edu/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/home/kkreth_umassd_edu/logs/",
         "raw_input": "/home/kkreth_umassd_edu/DL-PTV/*FILLOUT*",

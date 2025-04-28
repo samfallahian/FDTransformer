@@ -22,5 +22,5 @@ cd /home/kkreth_umassd_edu/cgan/
 
 # Pass the input file as an argument to the Python script
 /home/kkreth_umassd_edu/_virtual_python_3/bin/python /home/kkreth_umassd_edu/cgan/encoder/train_WAE_01.py \
-    --resume_checkpoint saved_models/WAE_From_OSX.pt
+    --resume_checkpoint /home/kkreth_umassd_edu/cgan/encoder/saved_models/WAE_From_OSX.pt
 

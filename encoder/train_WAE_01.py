@@ -36,11 +36,11 @@ preferences = HostPreferences(filename=preferences_path)
 # Training configuration constants
 BATCH_SIZE = 16
 NUM_EPOCHS = 1000
-LEARNING_RATE = 1e-5
-NUM_WORKERS = 50
+LEARNING_RATE = 1e-6
+NUM_WORKERS = 250
 SAVE_INTERVAL = 100
 BATCHES_PER_EPOCH = 100
-CACHE_SIZE = 500
+CACHE_SIZE = 2500
 MODEL_NAME = "WAE_01"
 
 # Configure logging
@@ -246,6 +246,7 @@ def main():
         # Save model checkpoint
         if (epoch + 1) % SAVE_INTERVAL == 0:
             checkpoint_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),

@@ -246,7 +246,8 @@ def main():
         # Save model checkpoint
         if (epoch + 1) % SAVE_INTERVAL == 0:
             checkpoint_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
-            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            #checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            #This code is broken I believe...
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),

@@ -104,13 +104,18 @@ def calculate_statistics(original, reconstructed):
     # Calculate squared error
     squared_error = (original_grouped - recon_grouped) ** 2
     
+    # Calculate squared Euclidean distances for each sample
+    squared_euclidean_per_point = torch.sum(squared_error, dim=2)  # Sum across x,y,z dimensions
+    squared_euclidean_per_sample = torch.mean(squared_euclidean_per_point, dim=1)  # Mean across points
+    
     # Calculate statistics
     stats = {
         'mean_abs_error': torch.mean(abs_error).item(),
         'max_abs_error': torch.max(abs_error).item(),
         'mean_squared_error': torch.mean(squared_error).item(),
         'max_point_error': torch.max(torch.sum(squared_error, dim=2)).sqrt().item(),
-        'log_cosh_loss': WAE.log_cosh_loss(original_grouped, recon_grouped).item()
+        'log_cosh_loss': WAE.log_cosh_loss(original_grouped, recon_grouped).item(),
+        'squared_euclidean_distances': squared_euclidean_per_sample.cpu().tolist()
     }
     
     return stats
@@ -226,6 +231,19 @@ def main():
         print(f"  Mean Squared Error: {batch_stats['mean_squared_error']:.6f}")
         print(f"  Max Point Error: {batch_stats['max_point_error']:.6f}")
         print(f"  Log-Cosh Loss: {batch_stats['log_cosh_loss']:.6f}")
+        
+        # Print squared Euclidean distances in a nicely formatted table
+        print("\n  Squared Euclidean Distances for each sample:")
+        distances = batch_stats['squared_euclidean_distances']
+        
+        # Create a formatted table for squared Euclidean distances
+        table_data = []
+        for i in range(0, len(distances), 4):  # Display 4 values per row
+            row = [f"Sample {i+j+1}: {distances[i+j]:.6f}" for j in range(min(4, len(distances)-i))]
+            table_data.append(row)
+        
+        headers = [f"Batch {batch_idx+1} Distances"] + [""] * (len(table_data[0])-1) if table_data else []
+        print(tabulate(table_data, headers=headers, tablefmt="grid"))
         
         # Visualize a random sample from this batch
         print(f"\nSample {sample_idx} from Batch {batch_idx+1}:")

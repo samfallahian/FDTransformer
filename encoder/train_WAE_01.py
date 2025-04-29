@@ -34,13 +34,13 @@ from Ordered_001_Initialize import HostPreferences
 preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
-BATCH_SIZE = 16
+BATCH_SIZE = 160
 NUM_EPOCHS = 1000
-LEARNING_RATE = 1e-6
+LEARNING_RATE = 1e-4
 NUM_WORKERS = 250
-SAVE_INTERVAL = 100
+SAVE_INTERVAL = 10
 BATCHES_PER_EPOCH = 100
-CACHE_SIZE = 2500
+CACHE_SIZE = 1500
 MODEL_NAME = "WAE_01"
 
 # Configure logging

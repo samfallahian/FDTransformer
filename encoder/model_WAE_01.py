@@ -8,7 +8,7 @@ latent_dim = 47
 #MODEL_FILEPATH_TEMPLATE = "/Users/kkreth/PycharmProjects/cgan/saved_models/model_at_epoch_{}.pth"
 
 class WAE(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout_rate=0.2):  # Add dropout rate parameter with default value
         super(WAE, self).__init__()
 
         # Define the sizes for the hidden layers
@@ -19,35 +19,48 @@ class WAE(nn.Module):
         # Encoder
         self.fc1 = nn.Linear(original_dim, hidden_dim1)
         self.elu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout_rate)  # Add dropout after activation
+        
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
         self.elu2 = nn.ELU()
+        self.dropout2 = nn.Dropout(dropout_rate)  # Add dropout
+        
         self.fc3 = nn.Linear(hidden_dim2, hidden_dim3)
         self.elu3 = nn.ELU()
+        self.dropout3 = nn.Dropout(dropout_rate)  # Add dropout
+        
         self.fc4 = nn.Linear(hidden_dim3, latent_dim)
-        # Additional Tanh activation function layer
-        self.tanh = nn.Tanh()  # New layer
+        self.tanh = nn.Tanh()
 
         # Decoder
         self.fc5 = nn.Linear(latent_dim, hidden_dim3)
         self.elu4 = nn.ELU()
+        self.dropout4 = nn.Dropout(dropout_rate)  # Add dropout
+        
         self.fc6 = nn.Linear(hidden_dim3, hidden_dim2)
         self.elu5 = nn.ELU()
+        self.dropout5 = nn.Dropout(dropout_rate)  # Add dropout
+        
         self.fc7 = nn.Linear(hidden_dim2, hidden_dim1)
         self.elu6 = nn.ReLU()
+        self.dropout6 = nn.Dropout(dropout_rate)  # Add dropout
+        
         self.fc8 = nn.Linear(hidden_dim1, original_dim)
 
-
     def decode(self, z):
-        h1 = self.elu4(self.fc5(z))
-        h2 = self.elu5(self.fc6(h1))
-        h3 = self.elu6(self.fc7(h2))
+        h1 = self.dropout4(self.elu4(self.fc5(z)))
+        h2 = self.dropout5(self.elu5(self.fc6(h1)))
+        h3 = self.dropout6(self.elu6(self.fc7(h2)))
         return self.fc8(h3)
 
     def encode(self, x):
-        h1 = self.elu1(self.fc1(x))
-        h2 = self.elu2(self.fc2(h1))
-        h3 = self.elu3(self.fc3(h2))
+        h1 = self.dropout1(self.elu1(self.fc1(x)))
+        h2 = self.dropout2(self.elu2(self.fc2(h1)))
+        h3 = self.dropout3(self.elu3(self.fc3(h2)))
         return self.tanh(self.fc4(h3))
+    
+    # Rest of the code remains the same
+    # ...
 
     def forward(self, x):
         mu = self.encode(x.view(-1, original_dim))

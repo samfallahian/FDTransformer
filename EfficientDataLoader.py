@@ -33,7 +33,9 @@ class EfficientDataLoader:
         num_workers: int = 4,
         cache_size: int = 10,
         shuffle: bool = True,
-        seed: int = None
+        seed: int = None,
+        pin_memory: bool = False
+
     ):
         """
         Initialize the dataloader.
@@ -51,7 +53,8 @@ class EfficientDataLoader:
         self.num_workers = num_workers
         self.cache_size = cache_size
         self.shuffle = shuffle
-        
+        self.pin_memory = pin_memory  # Store the pin_memory parameter
+
         # Total number of velocity values expected (vx, vy, vz for 125 points)
         self.total_velocity_values = 375
         

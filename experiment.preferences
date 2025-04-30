@@ -6,7 +6,7 @@
         "logging_path": "/Users/kkreth/PycharmProjects/data/logs_for_jobs/",
         "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",
         "output_directory": "/Users/kkreth/PycharmProjects/data/output/",
-        "logging_level": "DEBUG"
+        "logging_level": "INFO"
     },
     "umass.edu": {
         "root_path": "/home/kkreth_umassd_edu/DL-PTV/all_data_cleaned_dtype_correct/",

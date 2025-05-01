@@ -16,6 +16,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import argparse
 import wandb
+from tqdm import tqdm
 
 # Add parent directory to path so we can import modules
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,13 +36,13 @@ from Ordered_001_Initialize import HostPreferences
 preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
-BATCH_SIZE = 128
+BATCH_SIZE = 1280
 NUM_EPOCHS = 1000
 LEARNING_RATE = 1e-4
-NUM_WORKERS = 12
+NUM_WORKERS = 64
 SAVE_INTERVAL = 10
-BATCHES_PER_EPOCH = 50
-CACHE_SIZE = 150
+BATCHES_PER_EPOCH = 5
+CACHE_SIZE = 1500
 MODEL_NAME = "VAE_01"
 ENHANCED_VAE = True  # Changed to False to use the basic model for first run
 
@@ -238,93 +239,83 @@ def main():
         epoch_kld_loss = 0
         num_batches = 0
 
-        epoch_start_time = time.time()
-        logger.info(f"Starting epoch {epoch + 1}/{NUM_EPOCHS}")
+        # Initialize tqdm progress bar for batches
+        with tqdm(total=BATCHES_PER_EPOCH, desc=f"Epoch {epoch + 1}/{NUM_EPOCHS}", unit="batch") as pbar:
+            for batch_idx in range(BATCHES_PER_EPOCH):
+                # Get batch from dataloader
+                batch = dataloader.get_batch(NUMBER_OF_ROWS=args.batch_size)
+                velocity_data = batch['velocity_data']
 
-        for batch_idx in range(BATCHES_PER_EPOCH):
-            logger.debug(f"Processing batch {batch_idx + 1}/{BATCHES_PER_EPOCH} in epoch {epoch + 1}")
+                # Convert to tensor and move to device
+                x = torch.tensor(velocity_data, dtype=torch.float32).to(device)
 
-            # Get batch from dataloader
-            batch = dataloader.get_batch(NUMBER_OF_ROWS=args.batch_size)
-            velocity_data = batch['velocity_data']
+                try:
+                    # Forward pass and loss calculation
+                    recon_x, mu, logvar = model(x)
+                    total_loss, recon_loss, kld_loss = model.loss_function(
+                        recon_x, x, mu, logvar, kld_weight=1.0
+                    )
 
-            # Log batch statistics
-            logger.debug(f"Batch shape: {velocity_data.shape}")
+                    # Backward pass and optimization
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    optimizer.step()
 
-            # Convert numpy array to tensor and move to device
-            x = torch.tensor(velocity_data, dtype=torch.float32).to(device)
-            logger.debug(f"Input tensor moved to device: {device}")
+                    # Update metrics
+                    epoch_loss += total_loss.item()
+                    epoch_recon_loss += recon_loss.item()
+                    epoch_kld_loss += kld_loss.item()
+                    num_batches += 1
+                    global_step += 1
 
-            try:
-                # Forward pass
-                logger.debug("Starting forward pass")
-                recon_x, mu, logvar = model(x)
-                logger.debug("Completed forward pass")
+                    # Update tqdm bar
+                    pbar.set_postfix({
+                        "Batch Loss": f"{total_loss.item():.6f}",
+                        "Recon Loss": f"{recon_loss.item():.6f}",
+                        "KLD Loss": f"{kld_loss.item():.6f}"
+                    })
+                    pbar.update(1)
 
-                # Calculate loss
-                logger.debug("Calculating loss")
-                total_loss, recon_loss, kld_loss = model.loss_function(
-                    recon_x, x, mu, logvar, kld_weight=1.0
-                )
-                logger.debug(f"Loss calculated: {total_loss.item()}")
+                    # Log to tensorboard and wandb
+                    writer.add_scalar('Loss/train_step', total_loss.item(), global_step)
+                    writer.add_scalar('Loss/recon_step', recon_loss.item(), global_step)
+                    writer.add_scalar('Loss/kld_step', kld_loss.item(), global_step)
 
-                # Backward pass and optimize
-                logger.debug("Starting backward pass")
-                optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
-                logger.debug("Completed backward pass and optimization step")
+                    wandb.log({
+                        "Loss/train_step": total_loss.item(),
+                        "Loss/recon_step": recon_loss.item(),
+                        "Loss/kld_step": kld_loss.item(),
+                        "global_step": global_step
+                    })
 
-                # Update metrics
-                epoch_loss += total_loss.item()
-                epoch_recon_loss += recon_loss.item()
-                epoch_kld_loss += kld_loss.item()
-                num_batches += 1
-                global_step += 1
+                    if (batch_idx + 1) % 10 == 0:  # Log every 10 batches
+                        logger.info(f"Epoch {epoch + 1}/{NUM_EPOCHS}, "
+                                    f"Batch {batch_idx + 1}/{BATCHES_PER_EPOCH}, "
+                                    f"Loss: {total_loss.item():.6f}, Recon: {recon_loss.item():.6f}, KLD: {kld_loss.item():.6f}")
 
-                # Log to tensorboard
-                writer.add_scalar('Loss/train_step', total_loss.item(), global_step)
-                writer.add_scalar('Loss/recon_step', recon_loss.item(), global_step)
-                writer.add_scalar('Loss/kld_step', kld_loss.item(), global_step)
+                except Exception as e:
+                    logger.error(f"Error during training loop: {str(e)}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    raise
 
-                # Log metrics to wandb
-                wandb.log({
-                    "Loss/train_step": total_loss.item(),
-                    "Loss/recon_step": recon_loss.item(),
-                    "Loss/kld_step": kld_loss.item(),
-                    "global_step": global_step
-                })
-
-                # Periodic batch status
-                if (batch_idx + 1) % 10 == 0:
-                    logger.info(
-                        f"Epoch {epoch + 1}, Batch {batch_idx + 1}/{BATCHES_PER_EPOCH}, Loss: {total_loss.item():.6f}")
-
-            except Exception as e:
-                logger.error(f"Error during training loop: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-                raise
-
-        # Compute epoch average losses
+        # Epoch average stats
         avg_loss = epoch_loss / num_batches
         avg_recon_loss = epoch_recon_loss / num_batches
         avg_kld_loss = epoch_kld_loss / num_batches
-
-        # Log epoch metrics
         epoch_time = time.time() - epoch_start_time
+
         logger.info(f"Epoch {epoch + 1}/{NUM_EPOCHS}, "
                     f"Loss: {avg_loss:.6f}, "
                     f"Recon: {avg_recon_loss:.6f}, "
                     f"KLD: {avg_kld_loss:.6f}, "
                     f"Time: {epoch_time:.2f}s")
 
-        # Log to tensorboard
+        # Tensorboard and wandb logging
         writer.add_scalar('Loss/train_epoch', avg_loss, epoch)
         writer.add_scalar('Loss/recon_epoch', avg_recon_loss, epoch)
         writer.add_scalar('Loss/kld_epoch', avg_kld_loss, epoch)
 
-        # Epoch summary to wandb
         wandb.log({
             "Loss/train_epoch": avg_loss,
             "Loss/recon_epoch": avg_recon_loss,

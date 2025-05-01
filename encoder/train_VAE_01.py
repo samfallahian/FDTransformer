@@ -36,13 +36,13 @@ from Ordered_001_Initialize import HostPreferences
 preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
-BATCH_SIZE = 1280
+BATCH_SIZE = 768
 NUM_EPOCHS = 1000
 LEARNING_RATE = 1e-4
-NUM_WORKERS = 64
+NUM_WORKERS = 32
 SAVE_INTERVAL = 10
 BATCHES_PER_EPOCH = 5
-CACHE_SIZE = 1500
+CACHE_SIZE = 150
 MODEL_NAME = "VAE_01"
 ENHANCED_VAE = True  # Changed to False to use the basic model for first run
 
@@ -234,6 +234,7 @@ def main():
     global_step = 0
 
     for epoch in range(start_epoch, NUM_EPOCHS):
+        epoch_start_time = time.time()  # Start the epoch timer
         epoch_loss = 0
         epoch_recon_loss = 0
         epoch_kld_loss = 0

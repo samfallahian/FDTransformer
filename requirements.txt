@@ -21,6 +21,7 @@ seaborn==0.13.2
 setuptools==78.1.0
 six==1.17.0
 sympy==1.13.1
-torch==2.6.0
+#torch==2.6.0
+-e git+https://github.com/mlaves/pytorch.git@3f843fe51872a002e90c38cd699033052b347c5e#egg=torch
 typing_extensions==4.13.2
 tzdata==2025.2

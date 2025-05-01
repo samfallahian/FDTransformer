@@ -187,22 +187,25 @@ class EfficientDataLoader:
         return valid_files
     
     def _load_file(self, file_path: str) -> pd.DataFrame:
-        """Load a file into the cache if needed and return the dataframe."""
-        # Check if already in cache
+        """
+        Preload file into the cache if it's not already loaded and shuffle the data once.
+        """
         if file_path in self.file_cache:
             return self.file_cache[file_path]
-        
-        # If cache is full, remove least recently used item
-        if len(self.file_cache) >= self.cache_size:
-            # Simple LRU strategy: remove the first item added
-            self.file_cache.pop(next(iter(self.file_cache)))
-        
-        # Load the file with automatic compression detection
+
+        # Load the file fully or partially, depending on mode
         df = self._load_pickle_file(file_path)
-        
+
+        if self.shuffle:
+            # Shuffle data initially to avoid repeated shuffles
+            df = df.sample(frac=1, random_state=42)
+
         # Store in cache
+        if len(self.file_cache) >= self.cache_size:
+            # Remove the oldest cached file to respect the cache size
+            self.file_cache.pop(next(iter(self.file_cache)))
         self.file_cache[file_path] = df
-        
+
         return df
     
     def _sample_rows_from_file(self, file_metadata: Dict[str, Any], num_rows: int) -> Tuple[np.ndarray, str]:

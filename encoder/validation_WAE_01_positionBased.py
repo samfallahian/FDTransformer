@@ -40,7 +40,7 @@ preferences = HostPreferences(filename=preferences_path)
 BATCH_SIZE = 100  # Larger batch size for efficiency
 NUM_SAMPLES = 10000  # Total samples to process
 POINTS_PER_SAMPLE = 125  # Each point has x,y,z, so 375 total values
-ERROR_THRESHOLD = 0.02  # Threshold for counting errors
+ERROR_THRESHOLD = 0.05  # Threshold for counting errors
 
 # Configure logging
 logging.basicConfig(

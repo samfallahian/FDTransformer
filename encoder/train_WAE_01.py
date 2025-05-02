@@ -35,12 +35,12 @@ preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
 BATCH_SIZE = 160
-NUM_EPOCHS = 1000
-LEARNING_RATE = 1e-4
-NUM_WORKERS = 250
+NUM_EPOCHS = 5000
+LEARNING_RATE = 1e-5
+NUM_WORKERS = 20
 SAVE_INTERVAL = 10
 BATCHES_PER_EPOCH = 100
-CACHE_SIZE = 1500
+CACHE_SIZE = 100
 MODEL_NAME = "WAE_01"
 
 # Configure logging

@@ -225,66 +225,79 @@ class EfficientDataLoader:
         
         return velocity_data, file_path
     
-    def get_batch(self, NUMBER_OF_ROWS: int) -> Dict[str, Union[np.ndarray, List[str]]]:
+    def get_batch(self, NUMBER_OF_ROWS: int, ROW_FLOOR: int = 20) -> Dict[str, Union[np.ndarray, List[str]]]:
         """
-        Get a batch of randomly sampled rows from random files.
-        
+        Get a batch of randomly sampled rows from random files, ensuring a minimum number of
+        rows (`ROW_FLOOR`) are sampled from any given file.
+
         Args:
-            NUMBER_OF_ROWS: Total number of rows to sample
-            
+            NUMBER_OF_ROWS: Total number of rows to sample in the batch.
+            ROW_FLOOR: Minimum number of rows to sample from any file.
+        
         Returns:
             Dictionary with:
                 'velocity_data': Numpy array of shape (NUMBER_OF_ROWS, 375)
-                'source_files': List of source file paths for each row
+                'source_files': List of source file paths for each row.
         """
-        # Calculate weights for file selection based on row counts
+        # Calculate file sampling weights based on row counts
         weights = [m['row_count'] for m in self.file_metadata]
         total_weight = sum(weights)
-        weights = [w/total_weight for w in weights]
+        weights = [w / total_weight for w in weights]
         
-        # Randomly select files to sample from, weighted by row count
-        selected_files = np.random.choice(
+        # Select files for the current batch
+        max_files = NUMBER_OF_ROWS // ROW_FLOOR  # Max number of files to sample from
+        selected_file_indices = np.random.choice(
             len(self.file_metadata),
-            size=min(NUMBER_OF_ROWS, len(self.file_metadata)),
-            replace=True,
+            size=min(max_files, len(self.file_metadata)),
+            replace=False,
             p=weights
         )
-        
-        # Count how many rows to sample from each file
+
+        # Determine rows to sample from each selected file
         file_sample_counts = {}
-        for idx in selected_files:
-            file_sample_counts[idx] = file_sample_counts.get(idx, 0) + 1
-        
+        leftover_rows = NUMBER_OF_ROWS
+
+        # Assign at least ROW_FLOOR rows to each selected file
+        for idx in selected_file_indices:
+            rows_to_sample = min(self.file_metadata[idx]['row_count'], ROW_FLOOR)
+            file_sample_counts[idx] = rows_to_sample
+            leftover_rows -= rows_to_sample
+
+        # Distribute any remaining rows among the selected files
+        if leftover_rows > 0:
+            for idx in selected_file_indices:
+                if leftover_rows == 0:
+                    break
+                extra_rows = min(self.file_metadata[idx]['row_count'] - file_sample_counts[idx], leftover_rows)
+                file_sample_counts[idx] += extra_rows
+                leftover_rows -= extra_rows
+
         # Sample rows from each selected file
         all_velocity_data = []
         source_files = []
-        
+
         for file_idx, num_rows in file_sample_counts.items():
             velocity_data, file_path = self._sample_rows_from_file(
-                self.file_metadata[file_idx], num_rows)
-            
+                self.file_metadata[file_idx], num_rows
+            )
             all_velocity_data.append(velocity_data)
             source_files.extend([file_path] * len(velocity_data))
-        
+
         # Combine all sampled data
         combined_velocity_data = np.vstack(all_velocity_data)
-        
-        # If we didn't get exactly NUMBER_OF_ROWS (due to small files)
-        # adjust by sampling or truncating
-        if len(combined_velocity_data) < NUMBER_OF_ROWS:
-            print(f"Warning: Could only sample {len(combined_velocity_data)} rows instead of requested {NUMBER_OF_ROWS}")
-        elif len(combined_velocity_data) > NUMBER_OF_ROWS:
-            # Truncate to exactly NUMBER_OF_ROWS
+
+        # Adjust to exactly NUMBER_OF_ROWS if more rows were sampled
+        if len(combined_velocity_data) > NUMBER_OF_ROWS:
             indices = np.random.choice(len(combined_velocity_data), NUMBER_OF_ROWS, replace=False)
             combined_velocity_data = combined_velocity_data[indices]
             source_files = [source_files[i] for i in indices]
-        
+
         # Shuffle the data if requested
         if self.shuffle:
             shuffle_indices = np.random.permutation(len(combined_velocity_data))
             combined_velocity_data = combined_velocity_data[shuffle_indices]
             source_files = [source_files[i] for i in shuffle_indices]
-        
+
         return {
             'velocity_data': combined_velocity_data,
             'source_files': source_files
@@ -317,7 +330,7 @@ def format_file_path(file_path):
 # Example usage:
 if __name__ == "__main__":
     # Define the root directory containing .pkl files
-    root_dir = "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training"
+    root_dir = "/Users/kkreth/PycharmProjects/data/all_data_broken_down_1200_each_directory_PARTIAL"
     
     # Create the dataloader
     start_time = time.time()

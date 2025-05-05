@@ -34,7 +34,7 @@ from Ordered_001_Initialize import HostPreferences
 preferences = HostPreferences(filename=preferences_path)
 
 # Validation configuration constants
-BATCH_SIZE = 16
+BATCH_SIZE = 20
 NUM_BATCHES = 10
 
 # Configure logging

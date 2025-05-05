@@ -34,7 +34,7 @@ from Ordered_001_Initialize import HostPreferences
 preferences = HostPreferences(filename=preferences_path)
 
 # Training configuration constants
-BATCH_SIZE = 160
+BATCH_SIZE = 320
 NUM_EPOCHS = 5000
 LEARNING_RATE = 1e-5
 NUM_WORKERS = 20

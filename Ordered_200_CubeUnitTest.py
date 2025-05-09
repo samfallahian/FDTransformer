@@ -1,3 +1,9 @@
+'''
+I'm not sure that this code is worth keeping/maintaining, it doesn't do what I wanted
+and is poorly written. This will likely be expunged.
+'''
+
+
 import os
 import sys
 import logging

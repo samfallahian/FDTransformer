@@ -4,7 +4,7 @@
         "training_data_path": "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training",
         "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/Users/kkreth/PycharmProjects/data/logs_for_jobs/",
-        "raw_input": "/Users/kkreth/PycharmProjects/data/DL-PTV.backup/",
+        "raw_input": "/Users/kkreth/PycharmProjects/data/all_data_empty_columns_added.",
         "output_directory": "/Users/kkreth/PycharmProjects/data/output/",
         "logging_level": "INFO"
     },

@@ -265,10 +265,10 @@ def main(picklefile):
         # 5. Process the dataframe
         df = process_dataframe(df, wae_model, device, time_value)
         
-        # 6. Save updated DataFrame
+        # 6. Save updated DataFrame with gzip compression
         output_path = os.path.splitext(picklefile)[0] + "_with_latent.pkl"
-        df.to_pickle(output_path)
-        logger.info(f"Saved DataFrame with latent features to: {output_path}")
+        df.to_pickle(output_path, compression='gzip')  # Added compression parameter
+        logger.info(f"Saved compressed DataFrame with latent features to: {output_path}")
         
         # Log row count for verification
         logger.info(f"Processed {len(df)} rows with latent space values")

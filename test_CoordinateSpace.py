@@ -21,7 +21,7 @@ PICKLE_FILENAME = "3p6.pkl"
 CENTER_X = -113
 CENTER_Y = 35
 CENTER_Z = 3
-PICKLE_PATH = "/Users/kkreth/PycharmProjects/data/all_data_cleaned_dtype_correct"
+PICKLE_PATH = "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,

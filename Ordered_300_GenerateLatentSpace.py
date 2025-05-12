@@ -50,21 +50,48 @@ def load_pickle_file(file_path):
     """
     logger.info(f"Loading pickle file: {file_path}")
     
-    # Try different compression formats
-    for compression in ['gzip', None]:
+    # Check if file exists
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    # Try different approaches to load the file
+    compression_errors = []
+    
+    # First, check file signature to detect gzip
+    with open(file_path, 'rb') as f:
+        header = f.read(2)
+        # Check for gzip magic number (0x1f, 0x8b)
+        is_likely_gzip = header == b'\x1f\x8b'
+    
+    # First try with gzip if it looks like gzip
+    if is_likely_gzip:
         try:
-            if compression == 'gzip':
-                with gzip.open(file_path, 'rb') as f:
-                    data = pickle.load(f)
-            else:
-                with open(file_path, 'rb') as f:
-                    data = pickle.load(f)
-            return data
+            with gzip.open(file_path, 'rb') as f:
+                return pickle.load(f)
         except Exception as e:
-            if compression is None:
-                logger.error(f"Failed to load file {file_path}: {e}")
-                raise
-            # If gzip fails, try without compression
+            compression_errors.append(f"gzip error: {str(e)}")
+    
+    # Try without compression
+    try:
+        with open(file_path, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        compression_errors.append(f"uncompressed error: {str(e)}")
+    
+    # If the file header matches gzip but normal gzip.open failed, try with a custom approach
+    if is_likely_gzip:
+        try:
+            import zlib
+            with open(file_path, 'rb') as f:
+                compressed_data = f.read()
+                # Skip the first 10 bytes (gzip header) and the last 8 bytes (CRC and size)
+                decompressed_data = zlib.decompress(compressed_data[10:-8], -zlib.MAX_WBITS)
+                return pickle.loads(decompressed_data)
+        except Exception as e:
+            compression_errors.append(f"manual gzip decompression error: {str(e)}")
+    
+    # If all approaches failed, raise an error with details
+    raise ValueError(f"Failed to load file {file_path} with any method. Errors: {compression_errors}")
 
 def extract_time_from_filename(file_path):
     """

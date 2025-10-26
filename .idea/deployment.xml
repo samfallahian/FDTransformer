@@ -6,7 +6,7 @@
       <paths name="unity.rc.umass.edu">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/kkreth_umassd_edu/cgan/" local="$PROJECT_DIR$/" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

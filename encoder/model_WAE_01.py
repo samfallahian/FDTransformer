@@ -134,7 +134,7 @@ class WAE(nn.Module):
         recon_loss = self.log_cosh_loss(recon_x_grouped, x_grouped)
 
         # MMD loss: enforcing prior = posterior in the latent space
-        true_samples = torch.randn(mu.shape)
+        true_samples = torch.randn_like(mu)
         mmd_loss = self._compute_mmd(mu, true_samples)
 
         # Previous code was assuming there are 63 examples / batch_size

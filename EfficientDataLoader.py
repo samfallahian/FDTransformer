@@ -10,6 +10,8 @@ import gzip
 import re
 import time
 from collections import Counter
+import hashlib
+from threading import RLock
 
 
 # ANSI color codes
@@ -34,7 +36,10 @@ class EfficientDataLoader:
         cache_size: int = 10,
         shuffle: bool = True,
         seed: int = None,
-        pin_memory: bool = False
+        pin_memory: bool = False,
+        enable_manifest_cache: bool = True,
+        cache_filename: str = ".efficient_dataloader_cache.pkl",
+        enable_profiling: bool = True
 
     ):
         """
@@ -54,6 +59,14 @@ class EfficientDataLoader:
         self.cache_size = cache_size
         self.shuffle = shuffle
         self.pin_memory = pin_memory  # Store the pin_memory parameter
+        self.enable_manifest_cache = enable_manifest_cache
+        self.cache_path = os.path.join(self.root_directory, cache_filename)
+        self.enable_profiling = enable_profiling
+        self.profiling: Dict[str, Any] = {"timings": {}, "notes": {}}
+        # Thread-safety for in-memory cache
+        self.cache_lock = RLock()
+
+        t0 = time.perf_counter()
 
         # Total number of velocity values expected (vx, vy, vz for 125 points)
         self.total_velocity_values = 375
@@ -63,20 +76,106 @@ class EfficientDataLoader:
             random.seed(seed)
             np.random.seed(seed)
         
-        # Find all pickle files in subdirectories
-        self.all_files = self._find_all_pkl_files()
-        if not self.all_files:
-            raise ValueError(f"No .pkl files found in {root_directory} or its subdirectories")
-        
-        # Initialize file cache
-        self.file_cache = {}  # {file_path: (dataframe, metadata)}
-        
-        # Pre-compute file metadata for better sampling
-        self.file_metadata = self._compute_file_metadata()
+        # Try to load cached manifest/metadata if enabled
+        self.all_files = None
+        self.file_metadata = None
+        cache_loaded = False
+        if self.enable_manifest_cache and os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                if isinstance(cached, dict) and cached.get("root_directory") == self.root_directory:
+                    # Recompute current manifest hash quickly (stat only) and compare
+                    current_manifest = self._build_directory_manifest()
+                    current_hash = self._hash_manifest(current_manifest)
+                    if cached.get("manifest_hash") == current_hash:
+                        self.all_files = [item["path"] for item in current_manifest]
+                        self.file_metadata = cached.get("file_metadata")
+                        cache_loaded = True
+                        self.profiling["notes"]["cache"] = "Loaded metadata from cache (hash match)."
+                    else:
+                        self.profiling["notes"]["cache"] = "Cache invalid: manifest hash mismatch. Recomputing."
+                else:
+                    self.profiling["notes"]["cache"] = "Cache file exists but is incompatible. Recomputing."
+            except Exception as e:
+                self.profiling["notes"]["cache_error"] = f"Failed to load cache: {e}"
+
+        t1 = time.perf_counter()
+        if self.enable_profiling:
+            self.profiling["timings"]["cache_check_seconds"] = t1 - t0
+
+        if not cache_loaded:
+            # Find all pickle files in subdirectories (manifest)
+            t_start_list = time.perf_counter()
+            manifest = self._build_directory_manifest()
+            self.all_files = [item["path"] for item in manifest]
+            t_end_list = time.perf_counter()
+            if not self.all_files:
+                raise ValueError(f"No .pkl files found in {root_directory} or its subdirectories")
+            if self.enable_profiling:
+                self.profiling["timings"]["list_files_seconds"] = t_end_list - t_start_list
+            
+            # Initialize file cache
+            self.file_cache = {}  # {file_path: dataframe}
+            
+            # Pre-compute file metadata for better sampling
+            t_start_meta = time.perf_counter()
+            self.file_metadata = self._compute_file_metadata()
+            t_end_meta = time.perf_counter()
+            if self.enable_profiling:
+                self.profiling["timings"]["metadata_seconds"] = t_end_meta - t_start_meta
+
+            # Save cache
+            if self.enable_manifest_cache:
+                try:
+                    cache_payload = {
+                        "root_directory": self.root_directory,
+                        "manifest": manifest,
+                        "manifest_hash": self._hash_manifest(manifest),
+                        "file_metadata": self.file_metadata,
+                        "created_at": time.time(),
+                    }
+                    with open(self.cache_path, "wb") as f:
+                        pickle.dump(cache_payload, f)
+                except Exception as e:
+                    self.profiling["notes"]["cache_save_error"] = f"Failed to save cache: {e}"
+        else:
+            # Ensure runtime structures are present when loading from cache
+            self.file_cache = {}
+            if not self.file_metadata or not self.all_files:
+                raise ValueError("Cache loaded but missing required entries 'file_metadata' or 'all_files'.")
     
     def _find_all_pkl_files(self) -> List[str]:
         """Find all .pkl files in the root directory and subdirectories."""
         return glob.glob(os.path.join(self.root_directory, "**/*.pkl"), recursive=True)
+
+    def _build_directory_manifest(self) -> List[Dict[str, Any]]:
+        """Build a manifest of .pkl files with lightweight attributes for change detection."""
+        files = self._find_all_pkl_files()
+        manifest: List[Dict[str, Any]] = []
+        for p in files:
+            try:
+                st = os.stat(p)
+                manifest.append({
+                    "path": p,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                })
+            except FileNotFoundError:
+                # File disappeared between listing and stat; skip
+                continue
+        # Sort manifest deterministically by path to ensure stable hashing
+        manifest.sort(key=lambda x: x["path"])
+        return manifest
+
+    def _hash_manifest(self, manifest: List[Dict[str, Any]]) -> str:
+        """Hash the manifest content to detect changes without opening files."""
+        hasher = hashlib.sha256()
+        for item in manifest:
+            hasher.update(item["path"].encode("utf-8", errors="ignore"))
+            hasher.update(str(item["size"]).encode("ascii"))
+            hasher.update(str(item["mtime"]).encode("ascii"))
+        return hasher.hexdigest()
     
     def _is_gzipped(self, file_path: str) -> bool:
         """Check if a file is gzipped by examining its magic number."""
@@ -189,9 +288,19 @@ class EfficientDataLoader:
     def _load_file(self, file_path: str) -> pd.DataFrame:
         """
         Preload file into the cache if it's not already loaded and shuffle the data once.
+        Thread-safe around cache access.
         """
-        if file_path in self.file_cache:
-            return self.file_cache[file_path]
+        t0 = time.perf_counter() if self.enable_profiling else None
+        with self.cache_lock:
+            cached = self.file_cache.get(file_path)
+        if cached is not None:
+            if self.enable_profiling:
+                dt = time.perf_counter() - t0
+                self.profiling["timings"].setdefault("_load_file_seconds_total", 0.0)
+                self.profiling["timings"]["_load_file_seconds_total"] += dt
+                self.profiling["timings"].setdefault("_load_file_calls", 0)
+                self.profiling["timings"]["_load_file_calls"] += 1
+            return cached
 
         # Load the file fully or partially, depending on mode
         df = self._load_pickle_file(file_path)
@@ -200,16 +309,27 @@ class EfficientDataLoader:
             # Shuffle data initially to avoid repeated shuffles
             df = df.sample(frac=1, random_state=42)
 
-        # Store in cache
-        if len(self.file_cache) >= self.cache_size:
-            # Remove the oldest cached file to respect the cache size
-            self.file_cache.pop(next(iter(self.file_cache)))
-        self.file_cache[file_path] = df
+        # Store in cache with eviction
+        with self.cache_lock:
+            if len(self.file_cache) >= self.cache_size:
+                # Remove the oldest cached file to respect the cache size
+                try:
+                    self.file_cache.pop(next(iter(self.file_cache)))
+                except StopIteration:
+                    pass
+            self.file_cache[file_path] = df
 
+        if self.enable_profiling:
+            dt = time.perf_counter() - t0
+            self.profiling["timings"].setdefault("_load_file_seconds_total", 0.0)
+            self.profiling["timings"]["_load_file_seconds_total"] += dt
+            self.profiling["timings"].setdefault("_load_file_calls", 0)
+            self.profiling["timings"]["_load_file_calls"] += 1
         return df
     
     def _sample_rows_from_file(self, file_metadata: Dict[str, Any], num_rows: int) -> Tuple[np.ndarray, str]:
         """Sample a specific number of rows from a file."""
+        t0 = time.perf_counter() if self.enable_profiling else None
         file_path = file_metadata['file_path']
         row_count = file_metadata['row_count']
         
@@ -223,6 +343,12 @@ class EfficientDataLoader:
         vel_columns = file_metadata['velocity_columns']
         velocity_data = df.iloc[row_indices][vel_columns].values
         
+        if self.enable_profiling:
+            dt = time.perf_counter() - t0
+            self.profiling["timings"].setdefault("_sample_rows_seconds_total", 0.0)
+            self.profiling["timings"]["_sample_rows_seconds_total"] += dt
+            self.profiling["timings"].setdefault("_sample_rows_calls", 0)
+            self.profiling["timings"]["_sample_rows_calls"] += 1
         return velocity_data, file_path
     
     def get_batch(self, NUMBER_OF_ROWS: int, ROW_FLOOR: int = 20) -> Dict[str, Union[np.ndarray, List[str]]]:
@@ -239,7 +365,9 @@ class EfficientDataLoader:
                 'velocity_data': Numpy array of shape (NUMBER_OF_ROWS, 375)
                 'source_files': List of source file paths for each row.
         """
+        t_total0 = time.perf_counter() if self.enable_profiling else None
         # Calculate file sampling weights based on row counts
+        t0 = time.perf_counter() if self.enable_profiling else None
         weights = [m['row_count'] for m in self.file_metadata]
         total_weight = sum(weights)
         weights = [w / total_weight for w in weights]
@@ -252,8 +380,14 @@ class EfficientDataLoader:
             replace=False,
             p=weights
         )
+        if self.enable_profiling:
+            self.profiling['timings'].setdefault('get_batch_select_seconds_total', 0.0)
+            self.profiling['timings']['get_batch_select_seconds_total'] += (time.perf_counter() - t0)
+            self.profiling['timings'].setdefault('get_batch_calls', 0)
+            self.profiling['timings']['get_batch_calls'] += 1
 
         # Determine rows to sample from each selected file
+        t1 = time.perf_counter() if self.enable_profiling else None
         file_sample_counts = {}
         leftover_rows = NUMBER_OF_ROWS
 
@@ -271,19 +405,34 @@ class EfficientDataLoader:
                 extra_rows = min(self.file_metadata[idx]['row_count'] - file_sample_counts[idx], leftover_rows)
                 file_sample_counts[idx] += extra_rows
                 leftover_rows -= extra_rows
+        if self.enable_profiling:
+            self.profiling['timings'].setdefault('get_batch_allocation_seconds_total', 0.0)
+            self.profiling['timings']['get_batch_allocation_seconds_total'] += (time.perf_counter() - t1)
 
-        # Sample rows from each selected file
+        # Sample rows from each selected file (parallelized across files)
+        t2 = time.perf_counter() if self.enable_profiling else None
         all_velocity_data = []
         source_files = []
 
-        for file_idx, num_rows in file_sample_counts.items():
-            velocity_data, file_path = self._sample_rows_from_file(
-                self.file_metadata[file_idx], num_rows
-            )
-            all_velocity_data.append(velocity_data)
-            source_files.extend([file_path] * len(velocity_data))
+        if file_sample_counts:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = []
+                for file_idx, num_rows in file_sample_counts.items():
+                    futures.append(executor.submit(
+                        self._sample_rows_from_file,
+                        self.file_metadata[file_idx],
+                        num_rows
+                    ))
+                for fut in futures:
+                    velocity_data, file_path = fut.result()
+                    all_velocity_data.append(velocity_data)
+                    source_files.extend([file_path] * len(velocity_data))
+        if self.enable_profiling:
+            self.profiling['timings'].setdefault('get_batch_sampling_seconds_total', 0.0)
+            self.profiling['timings']['get_batch_sampling_seconds_total'] += (time.perf_counter() - t2)
 
         # Combine all sampled data
+        t3 = time.perf_counter() if self.enable_profiling else None
         combined_velocity_data = np.vstack(all_velocity_data)
 
         # Adjust to exactly NUMBER_OF_ROWS if more rows were sampled
@@ -297,7 +446,13 @@ class EfficientDataLoader:
             shuffle_indices = np.random.permutation(len(combined_velocity_data))
             combined_velocity_data = combined_velocity_data[shuffle_indices]
             source_files = [source_files[i] for i in shuffle_indices]
+        if self.enable_profiling:
+            self.profiling['timings'].setdefault('get_batch_concat_shuffle_seconds_total', 0.0)
+            self.profiling['timings']['get_batch_concat_shuffle_seconds_total'] += (time.perf_counter() - t3)
 
+        if self.enable_profiling:
+            self.profiling['timings'].setdefault('get_batch_seconds_total', 0.0)
+            self.profiling['timings']['get_batch_seconds_total'] += (time.perf_counter() - t_total0)
         return {
             'velocity_data': combined_velocity_data,
             'source_files': source_files

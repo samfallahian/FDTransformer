@@ -18,7 +18,7 @@
         "logging_level": "DEBUG"
     },
         "Larian": {
-        "root_path": "/home/kkreth_umassd_edu/DL-PTV/all_data_cleaned_dtype_correct/",
+        "root_path": "S:\\",
         "training_data_path": "S:\\all_data_ready_for_training",
         "metadata_location": "/home/kkreth_umassd_edu/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/home/kkreth_umassd_edu/logs/",

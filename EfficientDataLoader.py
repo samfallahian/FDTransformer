@@ -62,7 +62,7 @@ class EfficientDataLoader:
         self.enable_manifest_cache = enable_manifest_cache
         self.cache_path = os.path.join(self.root_directory, cache_filename)
         self.enable_profiling = enable_profiling
-        self.profiling: Dict[str, Any] = {"timings": {}, "notes": {}}
+        self.profiling: Dict[str, Any] = {"timings": {}, "notes": {}, "counters": {}}
         # Thread-safety for in-memory cache
         self.cache_lock = RLock()
 
@@ -183,19 +183,51 @@ class EfficientDataLoader:
             return f.read(2) == b'\x1f\x8b'
     
     def _load_pickle_file(self, file_path: str) -> Any:
-        """Load a pickle file, automatically detecting if it's compressed."""
+        """Load a pickle file, automatically detecting if it's compressed. Collect sub-stage timings."""
+        t_total0 = time.perf_counter() if self.enable_profiling else None
         try:
             # First check if the file is gzipped
             is_gzipped = self._is_gzipped(file_path)
             
             if is_gzipped:
+                t_open0 = time.perf_counter() if self.enable_profiling else None
                 with gzip.open(file_path, 'rb') as f:
-                    return pickle.load(f)
+                    if self.enable_profiling:
+                        t_open1 = time.perf_counter()
+                        self.profiling["timings"].setdefault("gzip_open_seconds_total", 0.0)
+                        self.profiling["timings"]["gzip_open_seconds_total"] += (t_open1 - t_open0)
+                    t_pick0 = time.perf_counter() if self.enable_profiling else None
+                    obj = pickle.load(f)
+                    if self.enable_profiling:
+                        t_pick1 = time.perf_counter()
+                        self.profiling["timings"].setdefault("pickle_load_seconds_total", 0.0)
+                        self.profiling["timings"]["pickle_load_seconds_total"] += (t_pick1 - t_pick0)
+                        self.profiling["timings"].setdefault("pickle_load_calls", 0)
+                        self.profiling["timings"]["pickle_load_calls"] += 1
+                return obj
             else:
+                t_open0 = time.perf_counter() if self.enable_profiling else None
                 with open(file_path, 'rb') as f:
-                    return pickle.load(f)
+                    if self.enable_profiling:
+                        t_open1 = time.perf_counter()
+                        self.profiling["timings"].setdefault("file_open_seconds_total", 0.0)
+                        self.profiling["timings"]["file_open_seconds_total"] += (t_open1 - t_open0)
+                    t_pick0 = time.perf_counter() if self.enable_profiling else None
+                    obj = pickle.load(f)
+                    if self.enable_profiling:
+                        t_pick1 = time.perf_counter()
+                        self.profiling["timings"].setdefault("pickle_load_seconds_total", 0.0)
+                        self.profiling["timings"]["pickle_load_seconds_total"] += (t_pick1 - t_pick0)
+                        self.profiling["timings"].setdefault("pickle_load_calls", 0)
+                        self.profiling["timings"]["pickle_load_calls"] += 1
+                return obj
         except Exception as e:
             raise ValueError(f"Could not load {file_path}: {e}")
+        finally:
+            if self.enable_profiling and t_total0 is not None:
+                t_total1 = time.perf_counter()
+                self.profiling["timings"].setdefault("_load_pickle_file_seconds_total", 0.0)
+                self.profiling["timings"]["_load_pickle_file_seconds_total"] += (t_total1 - t_total0)
     
     def _get_ordered_velocity_columns(self, df) -> List[str]:
         """
@@ -300,10 +332,15 @@ class EfficientDataLoader:
                 self.profiling["timings"]["_load_file_seconds_total"] += dt
                 self.profiling["timings"].setdefault("_load_file_calls", 0)
                 self.profiling["timings"]["_load_file_calls"] += 1
+                self.profiling["counters"].setdefault("cache_hits", 0)
+                self.profiling["counters"]["cache_hits"] += 1
             return cached
 
         # Load the file fully or partially, depending on mode
         df = self._load_pickle_file(file_path)
+        if self.enable_profiling:
+            self.profiling["counters"].setdefault("cache_misses", 0)
+            self.profiling["counters"]["cache_misses"] += 1
 
         if self.shuffle:
             # Shuffle data initially to avoid repeated shuffles

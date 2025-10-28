@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 Train WAE model 01 using prebuilt cached datasets (pickled NumPy arrays).
-
 Overview
 --------
 This script is a sibling of `encoder/train_WAE_01.py` but, instead of

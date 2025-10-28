@@ -54,6 +54,8 @@ import time
 import logging
 import argparse
 import pickle
+import re
+import glob
 from typing import Optional, Tuple
 
 import numpy as np
@@ -77,7 +79,8 @@ MODEL_NAME = "WAE_Cached_002"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 5000
 DEFAULT_LR = 1e-5
-SAVE_INTERVAL = 1  # save every N epochs
+SAVE_INTERVAL = 10  # save every N epochs
+CHECKPOINTS_TO_KEEP = 5  # keep last K rolling checkpoints
 
 # ----------
 # Logging
@@ -162,6 +165,81 @@ def accelerator_report() -> Tuple[torch.device, dict]:
 # wandb
 # ---------
 import wandb  # noqa: E402
+
+
+def _parse_epoch_from_filename(filename: str, model_name: str) -> Optional[int]:
+    """Extract epoch number from a checkpoint filename of the form
+    f"{model_name}_epoch_<N>.pt". Returns None if no match.
+    """
+    try:
+        base = os.path.basename(filename)
+        m = re.match(rf"{re.escape(model_name)}_epoch_(\d+)\.pt$", base)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+essential_ckpt_patterns = (
+    # anything named *_final.pt should never be pruned
+    "_final.pt",
+)
+
+
+def prune_checkpoints(dir_path: str, model_name: str, keep: int) -> None:
+    """Keep only the newest `keep` epoch checkpoints in `dir_path` for `model_name`.
+
+    - Matches files like f"{model_name}_epoch_*.pt"
+    - Excludes any file that ends with "_final.pt"
+    - Deletes oldest files first, keeping at most `keep` newest.
+    - Best-effort; logs and continues on errors.
+    """
+    try:
+        pattern = os.path.join(dir_path, f"{model_name}_epoch_*.pt")
+        files = glob.glob(pattern)
+        if not files:
+            return
+        # Exclude any accidental finals
+        files = [f for f in files if not f.endswith("_final.pt")]
+        # Build list of (epoch, path)
+        items = []
+        for fpath in files:
+            ep = _parse_epoch_from_filename(fpath, model_name)
+            if ep is not None:
+                items.append((ep, fpath))
+        if not items:
+            return
+        items.sort(key=lambda x: x[0])  # ascending by epoch
+        # Determine which to delete
+        to_delete = items[:-keep] if keep > 0 else items
+        for ep, fpath in to_delete:
+            try:
+                os.remove(fpath)
+                logger.info(f"Pruned old checkpoint (epoch {ep}): {fpath}")
+            except Exception as e:
+                logger.warning(f"Failed to remove old checkpoint {fpath}: {e}")
+    except Exception as e:
+        logger.warning(f"prune_checkpoints failed for {dir_path}: {e}")
+
+
+def prune_wandb_checkpoints_if_present(model_name: str, keep: int) -> None:
+    """Prune checkpoint copies inside the current W&B run directory (Windows copy fallback).
+
+    We mirror the location used in the fallback copy: wandb.run.dir/files/saved_models
+    """
+    try:
+        run = getattr(wandb, 'run', None)
+        if not run:
+            return
+        run_dir = getattr(run, 'dir', None)
+        if not run_dir:
+            return
+        dst_dir = os.path.join(run_dir, 'files', 'saved_models')
+        if os.path.isdir(dst_dir):
+            prune_checkpoints(dst_dir, model_name, keep)
+    except Exception as e:
+        logger.warning(f"prune_wandb_checkpoints_if_present failed: {e}")
 
 
 def _load_preferences(path: Optional[str]) -> HostPreferences:
@@ -668,6 +746,8 @@ def main():
                 'val_loss': val_loss,
             }, ckpt_path)
             logger.info(f"Saved model checkpoint to {ckpt_path}")
+            # Prune local checkpoints to keep a rolling window
+            prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
             if not args.no_wandb:
                 try:
                     wandb.save(ckpt_path)
@@ -684,6 +764,8 @@ def main():
                             logger.info(f"Copied checkpoint to W&B files dir: {dst_path}")
                     except Exception as e2:
                         logger.error(f"Failed to copy checkpoint into W&B dir: {e2}")
+                # Also prune any checkpoint copies inside the W&B run directory
+                prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
 
     # Final save
     final_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")

@@ -74,11 +74,11 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_001"
+MODEL_NAME = "WAE_Cached_002"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 5000
 DEFAULT_LR = 1e-5
-SAVE_INTERVAL = 10  # save every N epochs
+SAVE_INTERVAL = 1  # save every N epochs
 
 # ----------
 # Logging
@@ -199,17 +199,39 @@ def _load_cached_array(file_path: str, limit: Optional[int] = None) -> np.ndarra
     return arr
 
 
-def _make_loader(arr: np.ndarray, batch_size: int, shuffle: bool) -> DataLoader:
+def _make_loader(
+        arr: np.ndarray,
+        batch_size: int,
+        shuffle: bool,
+        num_workers: int = 0,
+        prefetch_factor: int = 2,
+        persistent_workers: bool = False,
+        pin_memory: bool = True,
+    ) -> DataLoader:
     """Wrap a NumPy array into a TensorDataset/DataLoader.
 
     - Uses pinned memory tensors on CUDA for faster H2D transfers.
     - Drop last is False to keep as many samples as possible per epoch.
+    - Supports multi-worker prefetch to keep the GPU fed.
     """
     # Create a torch tensor view (copies once from NumPy into a single big tensor)
     x_tensor = torch.from_numpy(arr)  # float32 ensured earlier
     dataset = TensorDataset(x_tensor)
-    # We set pin_memory True; it is a no-op on CPU but accelerates CUDA H2D.
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, pin_memory=True, drop_last=False)
+
+    # persistent_workers is only valid when num_workers > 0
+    use_persistent = bool(persistent_workers and num_workers > 0)
+
+    # On CPU-only runs, pin_memory has no effect; on CUDA it accelerates H2D
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        pin_memory=pin_memory,
+        drop_last=False,
+        num_workers=max(0, int(num_workers)),
+        prefetch_factor=int(prefetch_factor) if int(num_workers) > 0 else None,
+        persistent_workers=use_persistent,
+    )
     return loader
 
 
@@ -231,6 +253,27 @@ def main():
     parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
     parser.add_argument('--learning_rate', type=float, default=DEFAULT_LR)
     parser.add_argument('--save_interval', type=int, default=SAVE_INTERVAL)
+
+    # DataLoader performance controls (be careful with num_workers on Windows)
+    parser.add_argument('--num_workers', type=int, default=0,
+                        help='DataLoader workers. WARNING: On Windows with a large in-memory TensorDataset,\n'
+                             'setting this >0 can duplicate the dataset in each worker and blow up RAM. Use with care.')
+    parser.add_argument('--prefetch_factor', type=int, default=2,
+                        help='Number of batches prefetched per worker when num_workers>0.')
+    parser.add_argument('--persistent_workers', action='store_true',
+                        help='Keep DataLoader workers alive between epochs (requires num_workers>0).')
+    parser.add_argument('--no_pin_memory', action='store_true',
+                        help='Disable pinned memory for host-to-device copies.')
+
+    # Perf/instrumentation
+    parser.add_argument('--profile_steps', type=int, default=0,
+                        help='If >0, log per-step detailed timings for the first N steps of each epoch.')
+    parser.add_argument('--sync_profile', action='store_true',
+                        help='Force CUDA synchronize around profiled regions for accurate timings (slower).')
+    parser.add_argument('--amp', action='store_true',
+                        help='Enable torch.cuda.amp mixed precision for faster training on NVIDIA GPUs.')
+    parser.add_argument('--compile', action='store_true',
+                        help='Enable torch.compile to fuse/optimize model for PyTorch 2.x (may require warmup).')
 
     # Fast debug / limits
     parser.add_argument('--fast_debug', action='store_true', help='Use tiny settings for quick runs')
@@ -334,8 +377,24 @@ def main():
     train_np = _load_cached_array(train_path, limit=args.train_limit)
     val_np = _load_cached_array(val_path, limit=args.val_limit)
 
-    train_loader = _make_loader(train_np, batch_size=batch_size, shuffle=True)
-    val_loader = _make_loader(val_np, batch_size=batch_size, shuffle=False)
+    train_loader = _make_loader(
+        train_np,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=int(args.num_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        persistent_workers=bool(args.persistent_workers),
+        pin_memory=not args.no_pin_memory,
+    )
+    val_loader = _make_loader(
+        val_np,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=int(args.num_workers),
+        prefetch_factor=int(args.prefetch_factor),
+        persistent_workers=bool(args.persistent_workers),
+        pin_memory=not args.no_pin_memory,
+    )
 
     # Free NumPy arrays early to reduce memory pressure; data now lives in tensors.
     del train_np
@@ -345,12 +404,38 @@ def main():
     # Model & optim
     # ---------------
     model = WAE().to(device)
+
+    # Optional compile for PyTorch 2.x
+    if getattr(args, 'compile', False):
+        try:
+            model = torch.compile(model, mode='max-autotune')
+            logger.info("Enabled torch.compile(max-autotune) for model")
+        except Exception as e:
+            logger.warning(f"torch.compile requested but failed: {e}")
+
     try:
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
     except Exception:
         pass
+    # Prefer TensorFloat-32 / high-precision matmul for speed on Ampere+ GPUs when appropriate
+    try:
+        if device.type == 'cuda':
+            torch.set_float32_matmul_precision('high')  # allowed: highest, high, medium
+    except Exception:
+        pass
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # AMP mixed precision support
+    use_amp = bool(args.amp and device.type == 'cuda')
+    try:
+        from torch.cuda.amp import GradScaler, autocast
+    except Exception:
+        GradScaler = None
+        autocast = None
+        use_amp = False
+    scaler = GradScaler(enabled=use_amp) if GradScaler is not None else None
 
     start_epoch = 0
 
@@ -392,21 +477,55 @@ def main():
         num_batches = 0
         epoch_t0 = time.time()
 
+        # Profiling controls
+        profile_n = int(getattr(args, 'profile_steps', 0) or 0)
+        sync_profile = bool(getattr(args, 'sync_profile', False)) and (device.type == 'cuda')
+        step_idx = 0
+
         for batch in train_loader:
+            step_wall_t0 = time.time()
             # batch is a tuple from TensorDataset
             x_cpu = batch[0]
+
             # Move to device; `pin_memory=True` at loader level enables non_blocking
+            t_h2d0 = time.time()
             x = x_cpu.to(device, non_blocking=(device.type == 'cuda'))
+            if sync_profile:
+                torch.cuda.synchronize()
+            t_h2d1 = time.time()
 
             # Forward
-            recon_x, z = model(x)
-            # Loss
-            loss, recon_loss, mmd_loss, triplet_loss = model.loss_function(recon_x, x, z)
+            t_fwd0 = time.time()
+            if use_amp:
+                with autocast():
+                    recon_x, z = model(x)
+                    loss, recon_loss, mmd_loss, triplet_loss = model.loss_function(recon_x, x, z)
+            else:
+                recon_x, z = model(x)
+                loss, recon_loss, mmd_loss, triplet_loss = model.loss_function(recon_x, x, z)
+            if sync_profile:
+                torch.cuda.synchronize()
+            t_fwd1 = time.time()
 
-            # Backward
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            # Backward + step
+            t_bwd0 = time.time()
+            optimizer.zero_grad(set_to_none=True)
+            if use_amp and scaler is not None:
+                scaler.scale(loss).backward()
+                if sync_profile:
+                    torch.cuda.synchronize()
+                t_bwd1 = time.time()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if sync_profile:
+                    torch.cuda.synchronize()
+                t_bwd1 = time.time()
+                optimizer.step()
+            if sync_profile:
+                torch.cuda.synchronize()
+            t_step1 = time.time()
 
             # Metrics
             l = float(loss.item())
@@ -419,6 +538,48 @@ def main():
             epoch_triplet += t
             num_batches += 1
             global_step += 1
+
+            # Optional per-step profiling for first N steps
+            if profile_n > 0 and step_idx < profile_n:
+                bs = int(x.size(0))
+                # Times
+                dt_h2d = max(1e-9, t_h2d1 - t_h2d0)
+                dt_fwd = max(1e-9, t_fwd1 - t_fwd0)
+                dt_bwd = max(1e-9, t_bwd1 - t_bwd0)
+                dt_wall = max(1e-9, t_step1 - step_wall_t0)
+                # Throughputs
+                samples_per_s = bs / dt_wall
+                mb_h2d = (x.numel() * x.element_size()) / 1e6
+                h2d_gbps = (mb_h2d / dt_h2d) / 1024.0  # GB/s
+                # CUDA memory stats (if CUDA)
+                mem_alloc_mb = mem_max_mb = None
+                if device.type == 'cuda':
+                    try:
+                        mem_alloc_mb = torch.cuda.memory_allocated() / (1024**2)
+                        mem_max_mb = torch.cuda.max_memory_allocated() / (1024**2)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[Profile] epoch={epoch+1} step={step_idx+1} bs={bs} "
+                    f"h2d={dt_h2d*1000:.2f}ms fwd={dt_fwd*1000:.2f}ms bwd={dt_bwd*1000:.2f}ms "
+                    f"wall={dt_wall*1000:.2f}ms thr={samples_per_s:.1f} samples/s "
+                    f"H2D~{h2d_gbps:.2f} GB/s mem={mem_alloc_mb:.0f}/{mem_max_mb:.0f} MiB"
+                )
+                # Log to W&B as well
+                if not args.no_wandb:
+                    wandb.log({
+                        'profile/h2d_ms': dt_h2d * 1000.0,
+                        'profile/fwd_ms': dt_fwd * 1000.0,
+                        'profile/bwd_ms': dt_bwd * 1000.0,
+                        'profile/wall_ms': dt_wall * 1000.0,
+                        'profile/samples_per_s': samples_per_s,
+                        'profile/h2d_GBps': h2d_gbps,
+                        'profile/mem_alloc_MiB': mem_alloc_mb,
+                        'profile/mem_max_MiB': mem_max_mb,
+                        'global_step': global_step,
+                        'epoch': epoch,
+                    })
+                step_idx += 1
 
             if args.log_steps:
                 writer.add_scalar('Loss/train_step', l, global_step)

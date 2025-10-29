@@ -75,11 +75,11 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_002"
+MODEL_NAME = "WAE_Cached_004"
 DEFAULT_BATCH_SIZE = 128
-DEFAULT_EPOCHS = 5000
+DEFAULT_EPOCHS = 2500
 DEFAULT_LR = 1e-5
-SAVE_INTERVAL = 10  # save every N epochs
+SAVE_INTERVAL = 2  # save every N epochs
 CHECKPOINTS_TO_KEEP = 5  # keep last K rolling checkpoints
 
 # ----------
@@ -324,6 +324,8 @@ def main():
                         help='Training cached filename (under --root).')
     parser.add_argument('--val_file', type=str, default='validation_auto_encoder.pkl',
                         help='Validation cached filename (under --root).')
+    parser.add_argument('--test_file', type=str, default=None,
+                        help='Optional test cached filename (under --root). If provided, evaluate RMSE after training.')
 
     # Training hyperparameters
     parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE)
@@ -686,6 +688,7 @@ def main():
         val_mmd_sum = 0.0
         val_triplet_sum = 0.0
         val_batches = 0
+        val_l2_sum = 0.0  # Add this
         with torch.no_grad():
             for batch in val_loader:
                 x_cpu = batch[0]
@@ -696,17 +699,22 @@ def main():
                 val_recon_sum += float(recon_loss.item())
                 val_mmd_sum += float(mmd_loss.item())
                 val_triplet_sum += float(triplet_loss.item())
+                # Calculate L2 error (RMSE per value)
+                l2_error = torch.sqrt(torch.mean((recon_x - x) ** 2))
+                val_l2_sum += float(l2_error.item())
                 val_batches += 1
 
         val_loss = val_loss_sum / max(1, val_batches)
         val_recon = val_recon_sum / max(1, val_batches)
         val_mmd = val_mmd_sum / max(1, val_batches)
         val_triplet = val_triplet_sum / max(1, val_batches)
+        val_rmse = val_l2_sum / max(1, val_batches)  # Add this
 
         logger.info(
             f"Epoch {epoch + 1}/{num_epochs} | "
             f"Train: Loss {avg_loss:.6f} | Recon {avg_recon:.6f} | MMD {avg_mmd:.6f} | Triplet {avg_triplet:.6f} | "
             f"Val: Loss {val_loss:.6f} | Recon {val_recon:.6f} | MMD {val_mmd:.6f} | Triplet {val_triplet:.6f} | "
+            f"RMSE {val_rmse:.6f} | "  # Add this
             f"Time {epoch_time:.2f}s"
         )
 
@@ -720,8 +728,8 @@ def main():
         writer.add_scalar('Val/recon_epoch', val_recon, epoch)
         writer.add_scalar('Val/mmd_epoch', val_mmd, epoch)
         writer.add_scalar('Val/triplet_epoch', val_triplet, epoch)
+        writer.add_scalar('Val/rmse_epoch', val_rmse, epoch)
 
-        # W&B (per-epoch)
         if not args.no_wandb:
             wandb.log({
                 'Loss/train_epoch': avg_loss,
@@ -732,72 +740,103 @@ def main():
                 'Val/recon_epoch': val_recon,
                 'Val/mmd_epoch': val_mmd,
                 'Val/triplet_epoch': val_triplet,
+                'Val/rmse_epoch': val_rmse,
                 'epoch': epoch,
             })
 
-        # Save checkpoint
-        if (epoch + 1) % save_every == 0:
-            ckpt_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch + 1}.pt")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-                'val_loss': val_loss,
-            }, ckpt_path)
-            logger.info(f"Saved model checkpoint to {ckpt_path}")
-            # Prune local checkpoints to keep a rolling window
-            prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
-            if not args.no_wandb:
-                try:
-                    wandb.save(ckpt_path)
-                except OSError as e:
-                    logger.warning(f"wandb.save failed (likely symlink issue on Windows): {e}")
-                    try:
-                        import shutil
-                        run_dir = wandb.run.dir if wandb.run else None
-                        if run_dir:
-                            dst_dir = os.path.join(run_dir, 'files', 'saved_models')
-                            os.makedirs(dst_dir, exist_ok=True)
-                            dst_path = os.path.join(dst_dir, os.path.basename(ckpt_path))
-                            shutil.copy2(ckpt_path, dst_path)
-                            logger.info(f"Copied checkpoint to W&B files dir: {dst_path}")
-                    except Exception as e2:
-                        logger.error(f"Failed to copy checkpoint into W&B dir: {e2}")
-                # Also prune any checkpoint copies inside the W&B run directory
-                prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
+        # Checkpoint saving every `save_every` epochs
+        if ((epoch + 1) % save_every) == 0:
+            ckpt_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
+            try:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'args': vars(args),
+                }, ckpt_path)
+                logger.info(f"Saved checkpoint: {ckpt_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save checkpoint to {ckpt_path}: {e}")
 
-    # Final save
-    final_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-    }, final_path)
-    logger.info(f"Saved final model to {final_path}")
+            # Optional: mirror into active W&B run folder on Windows (copy fallback)
+            try:
+                run = getattr(wandb, 'run', None)
+                if (not args.no_wandb) and run and getattr(run, 'dir', None):
+                    dst_dir = os.path.join(run.dir, 'files', 'saved_models')
+                    os.makedirs(dst_dir, exist_ok=True)
+                    import shutil
+                    shutil.copy2(ckpt_path, os.path.join(dst_dir, os.path.basename(ckpt_path)))
+            except Exception as e:
+                logger.warning(f"Failed to mirror checkpoint into W&B run dir: {e}")
+
+            # Prune old checkpoints
+            try:
+                prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
+                prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
+            except Exception as e:
+                logger.warning(f"Checkpoint pruning failed: {e}")
+
+    # Final checkpoint at the end of training
+    try:
+        final_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")
+        torch.save({
+            'epoch': epoch + 1 if 'epoch' in locals() else num_epochs,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'args': vars(args),
+        }, final_path)
+        logger.info(f"Saved final checkpoint: {final_path}")
+        # Mirror into active W&B run directory (Windows copy fallback)
+        run = getattr(wandb, 'run', None)
+        if (not args.no_wandb) and run and getattr(run, 'dir', None):
+            dst_dir = os.path.join(run.dir, 'files', 'saved_models')
+            os.makedirs(dst_dir, exist_ok=True)
+            import shutil
+            shutil.copy2(final_path, os.path.join(dst_dir, os.path.basename(final_path)))
+        # Prune old ones
+        prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
+        prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
+    except Exception as e:
+        logger.warning(f"Failed to save final checkpoint: {e}")
+
+    # After training completes: optional Test RMSE
+    if getattr(args, 'test_file', None):
+        test_path = os.path.join(root_dir, args.test_file)
+        if not os.path.isfile(test_path):
+            logger.warning(f"Test cached file not found: {test_path} — skipping final test evaluation.")
+        else:
+            test_np = _load_cached_array(test_path)
+            test_loader = _make_loader(
+                test_np,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=int(args.num_workers),
+                prefetch_factor=int(args.prefetch_factor),
+                persistent_workers=bool(args.persistent_workers),
+                pin_memory=not args.no_pin_memory,
+            )
+            model.eval()
+            test_rmse = 0.0
+            with torch.no_grad():
+                for batch in test_loader:
+                    x = batch[0].to(device, non_blocking=(device.type == 'cuda'))
+                    recon_x, _ = model(x)
+                    test_rmse += torch.sqrt(torch.mean((recon_x - x) ** 2)).item()
+            test_rmse /= max(1, len(test_loader))
+            logger.info(f"Final Test RMSE: {test_rmse:.6f}")
+            if not args.no_wandb:
+                wandb.log({'Test/RMSE_final': test_rmse})
+
+    # Close writers and finish wandb
+    try:
+        writer.close()
+    except Exception:
+        pass
     if not args.no_wandb:
         try:
-            wandb.save(final_path)
-        except OSError as e:
-            logger.warning(f"wandb.save (final) failed (likely symlink issue on Windows): {e}")
-            try:
-                import shutil
-                run_dir = wandb.run.dir if wandb.run else None
-                if run_dir:
-                    dst_dir = os.path.join(run_dir, 'files', 'saved_models')
-                    os.makedirs(dst_dir, exist_ok=True)
-                    dst_path = os.path.join(dst_dir, os.path.basename(final_path))
-                    shutil.copy2(final_path, dst_path)
-                    logger.info(f"Copied final model to W&B files dir: {dst_path}")
-            except Exception as e2:
-                logger.error(f"Failed to copy final model into W&B dir: {e2}")
+            wandb.finish()
+        except Exception:
+            pass
 
-    total_time = time.time() - train_start
-    logger.info(f"Training completed in {total_time:.2f} seconds")
-
-    writer.close()
-    if not args.no_wandb:
-        wandb.finish()
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -551,13 +551,27 @@ def main():
             model.load_state_dict(checkpoint['model_state_dict'])
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'epoch' in checkpoint:
-                start_epoch = int(checkpoint['epoch'])
-                logger.info(f"Resuming training from epoch {start_epoch}")
+                # Move optimizer state to device
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+            if 'scaler_state_dict' in checkpoint and scaler is not None:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
         except Exception as e:
             logger.error(f"Failed to load checkpoint: {e}")
             logger.error("Training will start from scratch.")
+            
+        # DIAGNOSTIC: Run a quick validation pass
+        model.eval()
+        with torch.no_grad():
+            test_batch = next(iter(val_loader))[0].to(device)
+            test_recon, test_z = model(test_batch)
+            test_rmse = torch.sqrt(torch.mean((test_recon - test_batch) ** 2))
+            logger.info(f"CHECKPOINT LOADED - Immediate validation RMSE: {test_rmse.item():.6f}")
+        model.train()
 
+    model.train()  # Add this explicitly
     logger.info(f"Initialized WAE model with latent dimension {model.fc4.out_features}")
 
     # =================
@@ -735,226 +749,4 @@ def main():
                 # Calculate L2 error (RMSE per value)
                 l2_error = torch.sqrt(torch.mean((recon_x - x) ** 2))
                 val_l2_sum += float(l2_error.item())
-                # SSE/MSE accum
-                try:
-                    sse_batch = torch.sum((recon_x - x) ** 2).item()
-                    val_sse_sum += float(sse_batch)
-                    val_elem_sum += int(x.numel())
-                except Exception:
-                    pass
-                val_batches += 1
-
-        val_loss = val_loss_sum / max(1, val_batches)
-        val_recon = val_recon_sum / max(1, val_batches)
-        val_mmd = val_mmd_sum / max(1, val_batches)
-        val_triplet = val_triplet_sum / max(1, val_batches)
-        val_rmse = val_l2_sum / max(1, val_batches)
-
-        # Compute Train/Val SSE & MSE
-        train_sse = float(train_sse_sum)
-        train_mse = float(train_sse_sum / max(1, train_elem_sum))
-        val_sse = float(val_sse_sum)
-        val_mse = float(val_sse_sum / max(1, val_elem_sum))
-
-        # Multi-line epoch report (<=80 chars per line)
-        e_now = epoch + 1
-        lines = []
-        lines.append(f"Epoch {e_now}/{num_epochs}")
-        # Train block
-        lines.append("Train:")
-        lines.append(
-            f"  Loss: {avg_loss:.6f}" + _fmt_delta(avg_loss, prev_metrics.get('train_loss'))
-        )
-        lines.append(
-            f"  Recon: {avg_recon:.6f}" + _fmt_delta(avg_recon, prev_metrics.get('train_recon'))
-        )
-        lines.append(
-            f"  MMD: {avg_mmd:.6f}" + _fmt_delta(avg_mmd, prev_metrics.get('train_mmd'))
-        )
-        lines.append(
-            f"  Triplet: {avg_triplet:.6f}" + _fmt_delta(avg_triplet, prev_metrics.get('train_triplet'))
-        )
-        lines.append(
-            f"  MSE: {train_mse:.6f}" + _fmt_delta(train_mse, prev_metrics.get('train_mse'))
-        )
-        lines.append(
-            f"  SSE: {train_sse:.6f}" + _fmt_delta(train_sse, prev_metrics.get('train_sse'))
-        )
-        # Val block
-        lines.append("Val:")
-        lines.append(
-            f"  Loss: {val_loss:.6f}" + _fmt_delta(val_loss, prev_metrics.get('val_loss'))
-        )
-        lines.append(
-            f"  Recon: {val_recon:.6f}" + _fmt_delta(val_recon, prev_metrics.get('val_recon'))
-        )
-        lines.append(
-            f"  MMD: {val_mmd:.6f}" + _fmt_delta(val_mmd, prev_metrics.get('val_mmd'))
-        )
-        lines.append(
-            f"  Triplet: {val_triplet:.6f}" + _fmt_delta(val_triplet, prev_metrics.get('val_triplet'))
-        )
-        lines.append(
-            f"  RMSE: {val_rmse:.6f}" + _fmt_delta(val_rmse, prev_metrics.get('val_rmse'))
-        )
-        lines.append(
-            f"  MSE: {val_mse:.6f}" + _fmt_delta(val_mse, prev_metrics.get('val_mse'))
-        )
-        lines.append(
-            f"  SSE: {val_sse:.6f}" + _fmt_delta(val_sse, prev_metrics.get('val_sse'))
-        )
-        # Time
-        lines.append(f"Time: {epoch_time:.2f}s" + _fmt_delta(epoch_time, prev_metrics.get('time'), lower_is_better=True, suffix="s"))
-
-        logger.info("\n".join(lines))
-
-        # Update prev metrics
-        prev_metrics = {
-            'train_loss': avg_loss,
-            'train_recon': avg_recon,
-            'train_mmd': avg_mmd,
-            'train_triplet': avg_triplet,
-            'train_mse': train_mse,
-            'train_sse': train_sse,
-            'val_loss': val_loss,
-            'val_recon': val_recon,
-            'val_mmd': val_mmd,
-            'val_triplet': val_triplet,
-            'val_rmse': val_rmse,
-            'val_mse': val_mse,
-            'val_sse': val_sse,
-            'time': epoch_time,
-        }
-
-        # TensorBoard (per-epoch)
-        writer.add_scalar('Loss/train_epoch', avg_loss, epoch)
-        writer.add_scalar('Loss/recon_epoch', avg_recon, epoch)
-        writer.add_scalar('Loss/mmd_epoch', avg_mmd, epoch)
-        writer.add_scalar('Loss/triplet_epoch', avg_triplet, epoch)
-        # Train MSE/SSE
-        writer.add_scalar('Train/MSE_epoch', train_mse, epoch)
-        writer.add_scalar('Train/SSE_epoch', train_sse, epoch)
-
-        writer.add_scalar('Val/Loss_epoch', val_loss, epoch)
-        writer.add_scalar('Val/recon_epoch', val_recon, epoch)
-        writer.add_scalar('Val/mmd_epoch', val_mmd, epoch)
-        writer.add_scalar('Val/triplet_epoch', val_triplet, epoch)
-        writer.add_scalar('Val/rmse_epoch', val_rmse, epoch)
-        # Val MSE/SSE
-        writer.add_scalar('Val/MSE_epoch', val_mse, epoch)
-        writer.add_scalar('Val/SSE_epoch', val_sse, epoch)
-
-        if not args.no_wandb:
-            wandb.log({
-                'Loss/train_epoch': avg_loss,
-                'Loss/recon_epoch': avg_recon,
-                'Loss/mmd_epoch': avg_mmd,
-                'Loss/triplet_epoch': avg_triplet,
-                'Train/MSE_epoch': train_mse,
-                'Train/SSE_epoch': train_sse,
-                'Val/Loss_epoch': val_loss,
-                'Val/recon_epoch': val_recon,
-                'Val/mmd_epoch': val_mmd,
-                'Val/triplet_epoch': val_triplet,
-                'Val/rmse_epoch': val_rmse,
-                'Val/MSE_epoch': val_mse,
-                'Val/SSE_epoch': val_sse,
-                'epoch': epoch,
-            })
-
-        # Checkpoint saving every `save_every` epochs
-        if ((epoch + 1) % save_every) == 0:
-            ckpt_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
-            try:
-                torch.save({
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'args': vars(args),
-                }, ckpt_path)
-                logger.info(f"Saved checkpoint: {ckpt_path}")
-            except Exception as e:
-                logger.warning(f"Failed to save checkpoint to {ckpt_path}: {e}")
-
-            # Optional: mirror into active W&B run folder on Windows (copy fallback)
-            try:
-                run = getattr(wandb, 'run', None)
-                if (not args.no_wandb) and run and getattr(run, 'dir', None):
-                    dst_dir = os.path.join(run.dir, 'files', 'saved_models')
-                    os.makedirs(dst_dir, exist_ok=True)
-                    import shutil
-                    shutil.copy2(ckpt_path, os.path.join(dst_dir, os.path.basename(ckpt_path)))
-            except Exception as e:
-                logger.warning(f"Failed to mirror checkpoint into W&B run dir: {e}")
-
-            # Prune old checkpoints
-            try:
-                prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
-                prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
-            except Exception as e:
-                logger.warning(f"Checkpoint pruning failed: {e}")
-
-    # Final checkpoint at the end of training
-    try:
-        final_path = os.path.join(save_dir, f"{MODEL_NAME}_final.pt")
-        torch.save({
-            'epoch': epoch + 1 if 'epoch' in locals() else num_epochs,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'args': vars(args),
-        }, final_path)
-        logger.info(f"Saved final checkpoint: {final_path}")
-        # Mirror into active W&B run directory (Windows copy fallback)
-        run = getattr(wandb, 'run', None)
-        if (not args.no_wandb) and run and getattr(run, 'dir', None):
-            dst_dir = os.path.join(run.dir, 'files', 'saved_models')
-            os.makedirs(dst_dir, exist_ok=True)
-            import shutil
-            shutil.copy2(final_path, os.path.join(dst_dir, os.path.basename(final_path)))
-        # Prune old ones
-        prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
-        prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
-    except Exception as e:
-        logger.warning(f"Failed to save final checkpoint: {e}")
-
-    # After training completes: optional Test RMSE
-    if getattr(args, 'test_file', None):
-        test_path = os.path.join(root_dir, args.test_file)
-        if not os.path.isfile(test_path):
-            logger.warning(f"Test cached file not found: {test_path} — skipping final test evaluation.")
-        else:
-            test_np = _load_cached_array(test_path)
-            test_loader = _make_loader(
-                test_np,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=int(args.num_workers),
-                prefetch_factor=int(args.prefetch_factor),
-                persistent_workers=bool(args.persistent_workers),
-                pin_memory=not args.no_pin_memory,
-            )
-            model.eval()
-            test_rmse = 0.0
-            with torch.no_grad():
-                for batch in test_loader:
-                    x = batch[0].to(device, non_blocking=(device.type == 'cuda'))
-                    recon_x, _ = model(x)
-                    test_rmse += torch.sqrt(torch.mean((recon_x - x) ** 2)).item()
-            test_rmse /= max(1, len(test_loader))
-            logger.info(f"Final Test RMSE: {test_rmse:.6f}")
-            if not args.no_wandb:
-                wandb.log({'Test/RMSE_final': test_rmse})
-
-    # Close writers and finish wandb
-    try:
-        writer.close()
-    except Exception:
-        pass
-    if not args.no_wandb:
-        try:
-            wandb.finish()
-        except Exception:
-            pass
-
-if __name__ == '__main__':
-    main()
+                #

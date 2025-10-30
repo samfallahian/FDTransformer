@@ -56,6 +56,7 @@ import argparse
 import pickle
 import re
 import glob
+import shutil
 from typing import Optional, Tuple
 
 import numpy as np
@@ -75,7 +76,7 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_005"
+MODEL_NAME = "WAE_Cached_006_Corrected"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 2500
 DEFAULT_LR = 1e-6
@@ -749,4 +750,145 @@ def main():
                 # Calculate L2 error (RMSE per value)
                 l2_error = torch.sqrt(torch.mean((recon_x - x) ** 2))
                 val_l2_sum += float(l2_error.item())
-                #
+                # SSE/MSE accumulators for exact RMSE over all elements
+                try:
+                    sse_batch = torch.sum((recon_x - x) ** 2).item()
+                    val_sse_sum += float(sse_batch)
+                    val_elem_sum += int(x.numel())
+                except Exception:
+                    pass
+                val_batches += 1
+
+        # ---- Aggregate validation metrics ----
+        val_avg_loss = val_loss_sum / max(1, val_batches)
+        val_avg_recon = val_recon_sum / max(1, val_batches)
+        val_avg_mmd = val_mmd_sum / max(1, val_batches)
+        val_avg_triplet = val_triplet_sum / max(1, val_batches)
+        # Global RMSE over all elements (preferred); fallback to mean of per-batch RMSE
+        train_rmse = (float(np.sqrt(train_sse_sum / train_elem_sum)) if train_elem_sum > 0 else None)
+        val_rmse = (float(np.sqrt(val_sse_sum / val_elem_sum)) if val_elem_sum > 0 else (val_l2_sum / max(1, val_batches)))
+
+        # ---- Epoch summary & logging ----
+        elapsed = epoch_time
+        remaining_epochs = (num_epochs - (epoch + 1))
+        eta_total_sec = elapsed * remaining_epochs
+        eta_min = int(eta_total_sec // 60)
+        eta_sec = int(eta_total_sec % 60)
+
+        # Deltas vs previous
+        msg = (
+            f"Epoch {epoch+1}/{num_epochs}: "
+            f"train_loss={avg_loss:.6f}{_fmt_delta(avg_loss, prev_metrics.get('train_loss'))} "
+            f"recon={avg_recon:.6f}{_fmt_delta(avg_recon, prev_metrics.get('train_recon'))} "
+            f"mmd={avg_mmd:.6f}{_fmt_delta(avg_mmd, prev_metrics.get('train_mmd'))} "
+            f"triplet={avg_triplet:.6f}{_fmt_delta(avg_triplet, prev_metrics.get('train_triplet'))} "
+            f"| val_loss={val_avg_loss:.6f}{_fmt_delta(val_avg_loss, prev_metrics.get('val_loss'))} "
+            f"val_recon={val_avg_recon:.6f}{_fmt_delta(val_avg_recon, prev_metrics.get('val_recon'))} "
+            f"val_mmd={val_avg_mmd:.6f}{_fmt_delta(val_avg_mmd, prev_metrics.get('val_mmd'))} "
+            f"val_triplet={val_avg_triplet:.6f}{_fmt_delta(val_avg_triplet, prev_metrics.get('val_triplet'))} "
+        )
+        if train_rmse is not None:
+            msg += f"| train_RMSE={train_rmse:.6f}{_fmt_delta(train_rmse, prev_metrics.get('train_rmSE'))} "
+        msg += f"val_RMSE={val_rmse:.6f}{_fmt_delta(val_rmse, prev_metrics.get('val_rmSE'))} "
+        msg += f"| epoch_time={elapsed:.2f}s | ETA~{eta_min}m{eta_sec:02d}s"
+
+        print(_rainbow(msg))
+        logger.info(msg)
+
+        # TensorBoard scalars
+        writer.add_scalar('epoch/train_loss', avg_loss, epoch+1)
+        writer.add_scalar('epoch/train_recon', avg_recon, epoch+1)
+        writer.add_scalar('epoch/train_mmd', avg_mmd, epoch+1)
+        writer.add_scalar('epoch/train_triplet', avg_triplet, epoch+1)
+        writer.add_scalar('epoch/val_loss', val_avg_loss, epoch+1)
+        writer.add_scalar('epoch/val_recon', val_avg_recon, epoch+1)
+        writer.add_scalar('epoch/val_mmd', val_avg_mmd, epoch+1)
+        writer.add_scalar('epoch/val_triplet', val_avg_triplet, epoch+1)
+        if train_rmse is not None:
+            writer.add_scalar('epoch/train_RMSE', train_rmse, epoch+1)
+        writer.add_scalar('epoch/val_RMSE', val_rmse, epoch+1)
+
+        # W&B logging
+        if not args.no_wandb:
+            try:
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'epoch/train_loss': avg_loss,
+                    'epoch/train_recon': avg_recon,
+                    'epoch/train_mmd': avg_mmd,
+                    'epoch/train_triplet': avg_triplet,
+                    'epoch/val_loss': val_avg_loss,
+                    'epoch/val_recon': val_avg_recon,
+                    'epoch/val_mmd': val_avg_mmd,
+                    'epoch/val_triplet': val_avg_triplet,
+                    **({'epoch/train_RMSE': train_rmse} if train_rmse is not None else {}),
+                    'epoch/val_RMSE': val_rmse,
+                    'epoch/seconds': elapsed,
+                })
+            except Exception as e:
+                logger.warning(f"wandb.log failed: {e}")
+
+        # Update previous metrics for delta coloring
+        prev_metrics = {
+            'train_loss': avg_loss,
+            'train_recon': avg_recon,
+            'train_mmd': avg_mmd,
+            'train_triplet': avg_triplet,
+            'val_loss': val_avg_loss,
+            'val_recon': val_avg_recon,
+            'val_mmd': val_avg_mmd,
+            'val_triplet': val_avg_triplet,
+            'train_rmSE': train_rmse if train_rmse is not None else prev_metrics.get('train_rmSE'),
+            'val_rmSE': val_rmse,
+        }
+
+        # ---- Checkpointing ----
+        do_save = ((epoch + 1) % save_every == 0)
+        if do_save:
+            ckpt_path = os.path.join(save_dir, f"{MODEL_NAME}_epoch_{epoch+1}.pt")
+            try:
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scaler_state_dict': (scaler.state_dict() if (scaler is not None and use_amp) else None),
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'model_name': MODEL_NAME,
+                    'accelerator': acc_info,
+                }, ckpt_path)
+                logger.info(f"Saved checkpoint: {ckpt_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save checkpoint {ckpt_path}: {e}")
+
+            # Prune older checkpoints in project dir
+            try:
+                prune_checkpoints(save_dir, MODEL_NAME, CHECKPOINTS_TO_KEEP)
+            except Exception as e:
+                logger.warning(f"prune_checkpoints failed: {e}")
+
+            # Also copy into W&B run directory on Windows (symlink disabled)
+            try:
+                if not args.no_wandb and wandb_run is not None:
+                    run_dir = getattr(wandb_run, 'dir', None)
+                    if run_dir:
+                        dst_dir = os.path.join(run_dir, 'files', 'saved_models')
+                        os.makedirs(dst_dir, exist_ok=True)
+                        shutil.copy2(ckpt_path, dst_dir)
+                        logger.info(f"Copied checkpoint into W&B run dir: {dst_dir}")
+                        prune_wandb_checkpoints_if_present(MODEL_NAME, CHECKPOINTS_TO_KEEP)
+            except Exception as e:
+                logger.warning(f"Failed to copy/prune W&B checkpoint: {e}")
+
+    # end for epoch
+
+    # Close writers
+    try:
+        writer.flush()
+        writer.close()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    # Entry point to start training when this script is executed directly
+    main()

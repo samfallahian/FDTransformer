@@ -76,7 +76,7 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_006_Corrected"
+MODEL_NAME = "WAE_Cached_007_DidWeLearn"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 2500
 DEFAULT_LR = 1e-6

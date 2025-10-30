@@ -75,10 +75,10 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_004"
+MODEL_NAME = "WAE_Cached_005"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_EPOCHS = 2500
-DEFAULT_LR = 1e-5
+DEFAULT_LR = 1e-6
 SAVE_INTERVAL = 2  # save every N epochs
 CHECKPOINTS_TO_KEEP = 5  # keep last K rolling checkpoints
 
@@ -97,6 +97,10 @@ logger = logging.getLogger(__name__)
 CSI = "\033["
 RESET = f"{CSI}0m"
 COLORS = [31, 33, 32, 36, 34, 35]  # R, Y, G, C, B, M
+GREEN = f"{CSI}32m"
+RED = f"{CSI}31m"
+GREY = f"{CSI}90m"
+
 
 def _rainbow(msg: str) -> str:
     out = []
@@ -108,6 +112,21 @@ def _rainbow(msg: str) -> str:
         else:
             out.append(ch)
     return ''.join(out)
+
+
+def _fmt_delta(curr: float, prev: float | None, *, lower_is_better: bool = True, suffix: str = "") -> str:
+    """Return a colored delta string like ' (-0.0012)' with green for improvement and red for regression.
+    If prev is None, return empty string.
+    """
+    try:
+        if prev is None:
+            return ""
+        diff = curr - prev
+        sign = "+" if diff > 0 else ("-" if diff < 0 else "±")
+        color = GREEN if ((diff < 0) == lower_is_better) else (RED if diff != 0 else GREY)
+        return f" ({color}{sign}{abs(diff):.6f}{suffix}{RESET})"
+    except Exception:
+        return ""
 
 
 def accelerator_report() -> Tuple[torch.device, dict]:
@@ -546,6 +565,7 @@ def main():
     # =================
     global_step = 0
     train_start = time.time()
+    prev_metrics = {}
 
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -555,6 +575,9 @@ def main():
         epoch_triplet = 0.0
         num_batches = 0
         epoch_t0 = time.time()
+        # Train SSE/MSE accumulators
+        train_sse_sum = 0.0
+        train_elem_sum = 0
 
         # Profiling controls
         profile_n = int(getattr(args, 'profile_steps', 0) or 0)
@@ -615,6 +638,13 @@ def main():
             epoch_recon += r
             epoch_mmd += m
             epoch_triplet += t
+            # Train SSE/MSE accum
+            try:
+                sse_batch = torch.sum((recon_x - x) ** 2).item()
+                train_sse_sum += float(sse_batch)
+                train_elem_sum += int(x.numel())
+            except Exception:
+                pass
             num_batches += 1
             global_step += 1
 
@@ -688,7 +718,10 @@ def main():
         val_mmd_sum = 0.0
         val_triplet_sum = 0.0
         val_batches = 0
-        val_l2_sum = 0.0  # Add this
+        val_l2_sum = 0.0  # RMSE accumulated per-batch
+        # Val SSE/MSE accumulators
+        val_sse_sum = 0.0
+        val_elem_sum = 0
         with torch.no_grad():
             for batch in val_loader:
                 x_cpu = batch[0]
@@ -702,33 +735,114 @@ def main():
                 # Calculate L2 error (RMSE per value)
                 l2_error = torch.sqrt(torch.mean((recon_x - x) ** 2))
                 val_l2_sum += float(l2_error.item())
+                # SSE/MSE accum
+                try:
+                    sse_batch = torch.sum((recon_x - x) ** 2).item()
+                    val_sse_sum += float(sse_batch)
+                    val_elem_sum += int(x.numel())
+                except Exception:
+                    pass
                 val_batches += 1
 
         val_loss = val_loss_sum / max(1, val_batches)
         val_recon = val_recon_sum / max(1, val_batches)
         val_mmd = val_mmd_sum / max(1, val_batches)
         val_triplet = val_triplet_sum / max(1, val_batches)
-        val_rmse = val_l2_sum / max(1, val_batches)  # Add this
+        val_rmse = val_l2_sum / max(1, val_batches)
 
-        logger.info(
-            f"Epoch {epoch + 1}/{num_epochs} | "
-            f"Train: Loss {avg_loss:.6f} | Recon {avg_recon:.6f} | MMD {avg_mmd:.6f} | Triplet {avg_triplet:.6f} | "
-            f"Val: Loss {val_loss:.6f} | Recon {val_recon:.6f} | MMD {val_mmd:.6f} | Triplet {val_triplet:.6f} | "
-            f"RMSE {val_rmse:.6f} | "  # Add this
-            f"Time {epoch_time:.2f}s"
+        # Compute Train/Val SSE & MSE
+        train_sse = float(train_sse_sum)
+        train_mse = float(train_sse_sum / max(1, train_elem_sum))
+        val_sse = float(val_sse_sum)
+        val_mse = float(val_sse_sum / max(1, val_elem_sum))
+
+        # Multi-line epoch report (<=80 chars per line)
+        e_now = epoch + 1
+        lines = []
+        lines.append(f"Epoch {e_now}/{num_epochs}")
+        # Train block
+        lines.append("Train:")
+        lines.append(
+            f"  Loss: {avg_loss:.6f}" + _fmt_delta(avg_loss, prev_metrics.get('train_loss'))
         )
+        lines.append(
+            f"  Recon: {avg_recon:.6f}" + _fmt_delta(avg_recon, prev_metrics.get('train_recon'))
+        )
+        lines.append(
+            f"  MMD: {avg_mmd:.6f}" + _fmt_delta(avg_mmd, prev_metrics.get('train_mmd'))
+        )
+        lines.append(
+            f"  Triplet: {avg_triplet:.6f}" + _fmt_delta(avg_triplet, prev_metrics.get('train_triplet'))
+        )
+        lines.append(
+            f"  MSE: {train_mse:.6f}" + _fmt_delta(train_mse, prev_metrics.get('train_mse'))
+        )
+        lines.append(
+            f"  SSE: {train_sse:.6f}" + _fmt_delta(train_sse, prev_metrics.get('train_sse'))
+        )
+        # Val block
+        lines.append("Val:")
+        lines.append(
+            f"  Loss: {val_loss:.6f}" + _fmt_delta(val_loss, prev_metrics.get('val_loss'))
+        )
+        lines.append(
+            f"  Recon: {val_recon:.6f}" + _fmt_delta(val_recon, prev_metrics.get('val_recon'))
+        )
+        lines.append(
+            f"  MMD: {val_mmd:.6f}" + _fmt_delta(val_mmd, prev_metrics.get('val_mmd'))
+        )
+        lines.append(
+            f"  Triplet: {val_triplet:.6f}" + _fmt_delta(val_triplet, prev_metrics.get('val_triplet'))
+        )
+        lines.append(
+            f"  RMSE: {val_rmse:.6f}" + _fmt_delta(val_rmse, prev_metrics.get('val_rmse'))
+        )
+        lines.append(
+            f"  MSE: {val_mse:.6f}" + _fmt_delta(val_mse, prev_metrics.get('val_mse'))
+        )
+        lines.append(
+            f"  SSE: {val_sse:.6f}" + _fmt_delta(val_sse, prev_metrics.get('val_sse'))
+        )
+        # Time
+        lines.append(f"Time: {epoch_time:.2f}s" + _fmt_delta(epoch_time, prev_metrics.get('time'), lower_is_better=True, suffix="s"))
+
+        logger.info("\n".join(lines))
+
+        # Update prev metrics
+        prev_metrics = {
+            'train_loss': avg_loss,
+            'train_recon': avg_recon,
+            'train_mmd': avg_mmd,
+            'train_triplet': avg_triplet,
+            'train_mse': train_mse,
+            'train_sse': train_sse,
+            'val_loss': val_loss,
+            'val_recon': val_recon,
+            'val_mmd': val_mmd,
+            'val_triplet': val_triplet,
+            'val_rmse': val_rmse,
+            'val_mse': val_mse,
+            'val_sse': val_sse,
+            'time': epoch_time,
+        }
 
         # TensorBoard (per-epoch)
         writer.add_scalar('Loss/train_epoch', avg_loss, epoch)
         writer.add_scalar('Loss/recon_epoch', avg_recon, epoch)
         writer.add_scalar('Loss/mmd_epoch', avg_mmd, epoch)
         writer.add_scalar('Loss/triplet_epoch', avg_triplet, epoch)
+        # Train MSE/SSE
+        writer.add_scalar('Train/MSE_epoch', train_mse, epoch)
+        writer.add_scalar('Train/SSE_epoch', train_sse, epoch)
 
         writer.add_scalar('Val/Loss_epoch', val_loss, epoch)
         writer.add_scalar('Val/recon_epoch', val_recon, epoch)
         writer.add_scalar('Val/mmd_epoch', val_mmd, epoch)
         writer.add_scalar('Val/triplet_epoch', val_triplet, epoch)
         writer.add_scalar('Val/rmse_epoch', val_rmse, epoch)
+        # Val MSE/SSE
+        writer.add_scalar('Val/MSE_epoch', val_mse, epoch)
+        writer.add_scalar('Val/SSE_epoch', val_sse, epoch)
 
         if not args.no_wandb:
             wandb.log({
@@ -736,11 +850,15 @@ def main():
                 'Loss/recon_epoch': avg_recon,
                 'Loss/mmd_epoch': avg_mmd,
                 'Loss/triplet_epoch': avg_triplet,
+                'Train/MSE_epoch': train_mse,
+                'Train/SSE_epoch': train_sse,
                 'Val/Loss_epoch': val_loss,
                 'Val/recon_epoch': val_recon,
                 'Val/mmd_epoch': val_mmd,
                 'Val/triplet_epoch': val_triplet,
                 'Val/rmse_epoch': val_rmse,
+                'Val/MSE_epoch': val_mse,
+                'Val/SSE_epoch': val_sse,
                 'epoch': epoch,
             })
 

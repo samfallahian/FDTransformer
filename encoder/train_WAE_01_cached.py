@@ -144,6 +144,55 @@ def _fmt_val(v: float, decimals: int = 3) -> str:
         return str(v)
 
 
+def _count_params(model: torch.nn.Module) -> dict:
+    """Count trainable parameters, broken down by typical 'weight' and 'bias' naming.
+    Returns a dict with keys: weights, biases, others, total.
+    """
+    try:
+        weights = 0
+        biases = 0
+        total = 0
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            n = int(p.numel())
+            total += n
+            ln = name.lower()
+            if ln.endswith('.weight') or ln.find('.weight') != -1:
+                weights += n
+            elif ln.endswith('.bias') or ln.find('.bias') != -1:
+                biases += n
+        others = max(0, total - weights - biases)
+        return {'weights': weights, 'biases': biases, 'others': others, 'total': total}
+    except Exception:
+        return {'weights': 0, 'biases': 0, 'others': 0, 'total': 0}
+
+
+def _fmt_timestamp_local(ts) -> str:
+    """Format a POSIX timestamp (seconds) as local time string; tolerate None/invalid."""
+    try:
+        import datetime
+        return datetime.datetime.fromtimestamp(float(ts)).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return 'unknown'
+
+
+def _cuda_mem_get_info(device: torch.device) -> tuple | None:
+    """Return (free_bytes, total_bytes) from CUDA driver if available; else None."""
+    try:
+        if device.type != 'cuda' or not torch.cuda.is_available():
+            return None
+        # Prefer explicit device index when available
+        idx = device.index if (device.index is not None) else torch.cuda.current_device()
+        return torch.cuda.mem_get_info(idx)
+    except Exception:
+        try:
+            # Some torch builds accept no args
+            return torch.cuda.mem_get_info()
+        except Exception:
+            return None
+
+
 def accelerator_report() -> Tuple[torch.device, dict]:
     """Detect CUDA/MPS/CPU, print a diagnostic, and return (device, info).
 
@@ -181,11 +230,22 @@ def accelerator_report() -> Tuple[torch.device, dict]:
             idx = torch.cuda.current_device()
             props = torch.cuda.get_device_properties(idx)
             cap = torch.cuda.get_device_capability(idx)
-            lines += [
-                f"CUDA device count: {torch.cuda.device_count()}",
-                f"Current device: {idx} | Name: {props.name}",
-                f"Compute capability: {cap[0]}.{cap[1]} | Total memory: {props.total_memory/1024**3:.2f} GiB",
-            ]
+            mem_info = _cuda_mem_get_info(torch.device('cuda'))
+            if mem_info is not None:
+                free_b, total_b = mem_info
+                free_gib = free_b / 1024**3
+                total_gib = total_b / 1024**3
+                lines += [
+                    f"CUDA device count: {torch.cuda.device_count()}",
+                    f"Current device: {idx} | Name: {props.name}",
+                    f"Compute capability: {cap[0]}.{cap[1]} | Total memory: {props.total_memory/1024**3:.2f} GiB | Free (driver): {free_gib:.2f}/{total_gib:.2f} GiB",
+                ]
+            else:
+                lines += [
+                    f"CUDA device count: {torch.cuda.device_count()}",
+                    f"Current device: {idx} | Name: {props.name}",
+                    f"Compute capability: {cap[0]}.{cap[1]} | Total memory: {props.total_memory/1024**3:.2f} GiB",
+                ]
         except Exception as e:
             lines.append(f"CUDA detail query failed: {e}")
 
@@ -193,7 +253,7 @@ def accelerator_report() -> Tuple[torch.device, dict]:
     for ln in lines:
         logger.info(ln)
 
-    return device, {
+    info = {
         'python': py,
         'torch': pyv,
         'cuda_available': has_cuda,
@@ -202,6 +262,19 @@ def accelerator_report() -> Tuple[torch.device, dict]:
         'mps_available': mps_avail,
         'selected_device': str(device),
     }
+    if has_cuda:
+        try:
+            mem_info = _cuda_mem_get_info(device)
+            if mem_info is not None:
+                free_b, total_b = mem_info
+                info.update({
+                    'cuda_mem_free_bytes': int(free_b),
+                    'cuda_mem_total_bytes': int(total_b),
+                })
+        except Exception:
+            pass
+
+    return device, info
 
 
 def _model_checksum(model: torch.nn.Module) -> Tuple[float, float]:
@@ -218,46 +291,6 @@ def _model_checksum(model: torch.nn.Module) -> Tuple[float, float]:
         pass
     return float(s), float(a)
 
-    has_cuda = torch.cuda.is_available()
-    cuda_version = getattr(torch.version, 'cuda', None)
-    mps_built = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built()
-    mps_avail = mps_built and torch.backends.mps.is_available()
-
-    device = torch.device('cuda') if has_cuda else (torch.device('mps') if mps_avail else torch.device('cpu'))
-
-    lines = [
-        f"Python: {py} | PyTorch: {pyv}",
-        f"CUDA available: {has_cuda} | CUDA toolkit: {cuda_version}",
-        f"MPS built: {mps_built} | MPS available (runtime): {mps_avail}",
-        f"Selected default device: {device}",
-    ]
-
-    if has_cuda:
-        try:
-            idx = torch.cuda.current_device()
-            props = torch.cuda.get_device_properties(idx)
-            cap = torch.cuda.get_device_capability(idx)
-            lines += [
-                f"CUDA device count: {torch.cuda.device_count()}",
-                f"Current device: {idx} | Name: {props.name}",
-                f"Compute capability: {cap[0]}.{cap[1]} | Total memory: {props.total_memory/1024**3:.2f} GiB",
-            ]
-        except Exception as e:
-            lines.append(f"CUDA detail query failed: {e}")
-
-    for ln in lines:
-        print(_rainbow(ln))
-        logger.info(ln)
-
-    return device, {
-        'python': py,
-        'torch': pyv,
-        'cuda_available': has_cuda,
-        'cuda_version': cuda_version,
-        'mps_built': mps_built,
-        'mps_available': mps_avail,
-        'selected_device': str(device),
-    }
 
 
 # ---------
@@ -413,7 +446,7 @@ def _make_loader(
 
 # ---- Provenance & checksum helpers ----
 
-def _count_params(model: torch.nn.Module) -> int:
+def _count_params_total(model: torch.nn.Module) -> int:
     try:
         return sum(p.numel() for p in model.parameters())
     except Exception:
@@ -792,8 +825,38 @@ def main():
     if resume_path and os.path.isfile(resume_path):
         try:
             logger.info(f"Loading checkpoint from {resume_path}")
-            checkpoint = torch.load(resume_path, map_location=device)
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
+            # Rainbow banner summarizing what was loaded
+            try:
+                # Count tensors in state_dict
+                sd = checkpoint.get('model_state_dict', {})
+                w_t = sum(1 for k in sd.keys() if 'weight' in k.lower())
+                b_t = sum(1 for k in sd.keys() if 'bias' in k.lower())
+                o_t = max(0, len(sd) - w_t - b_t)
+                # Count parameters
+                pc = _count_params(model)
+                # Provenance timestamp: prefer checkpoint provenance, else file mtime
+                prov = checkpoint.get('provenance', {}) or {}
+                ts = prov.get('timestamp')
+                if ts is None:
+                    try:
+                        ts = os.path.getmtime(resume_path)
+                    except Exception:
+                        ts = None
+                ts_s = _fmt_timestamp_local(ts)
+                banner = (
+                    f"LOADED MODEL STATE: tensors W={w_t} B={b_t} O={o_t} | "
+                    f"params W={pc.get('weights',0):,} B={pc.get('biases',0):,} "
+                    f"O={pc.get('others',0):,} TOTAL={pc.get('total',0):,} | "
+                    f"provenance={ts_s}"
+                )
+                if not getattr(args, 'no_color', False):
+                    logger.info(_rainbow(banner))
+                else:
+                    logger.info(banner)
+            except Exception:
+                pass
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 # Move optimizer state to device
@@ -1033,17 +1096,26 @@ def main():
                 h2d_gbps = (mb_h2d / dt_h2d) / 1024.0  # GB/s
                 # CUDA memory stats (if CUDA)
                 mem_alloc_mb = mem_max_mb = None
+                mem_free_mb = mem_total_mb = None
                 if device.type == 'cuda':
                     try:
                         mem_alloc_mb = torch.cuda.memory_allocated() / (1024**2)
                         mem_max_mb = torch.cuda.max_memory_allocated() / (1024**2)
                     except Exception:
                         pass
+                    try:
+                        mi = _cuda_mem_get_info(device)
+                        if mi is not None:
+                            free_b, total_b = mi
+                            mem_free_mb = free_b / (1024**2)
+                            mem_total_mb = total_b / (1024**2)
+                    except Exception:
+                        pass
                 logger.info(
                     f"[Profile] epoch={epoch+1} step={step_idx+1} bs={bs} "
                     f"h2d={dt_h2d*1000:.2f}ms fwd={dt_fwd*1000:.2f}ms bwd={dt_bwd*1000:.2f}ms "
                     f"wall={dt_wall*1000:.2f}ms thr={samples_per_s:.1f} samples/s "
-                    f"H2D~{h2d_gbps:.2f} GB/s mem={mem_alloc_mb:.0f}/{mem_max_mb:.0f} MiB"
+                    f"H2D~{h2d_gbps:.2f} GB/s mem={mem_alloc_mb:.0f}/{mem_max_mb:.0f} MiB | free={mem_free_mb:.0f}/{mem_total_mb:.0f} MiB (driver)"
                 )
                 # Log to W&B as well
                 if not args.no_wandb:
@@ -1056,6 +1128,8 @@ def main():
                         'profile/h2d_GBps': h2d_gbps,
                         'profile/mem_alloc_MiB': mem_alloc_mb,
                         'profile/mem_max_MiB': mem_max_mb,
+                        'profile/mem_free_MiB': mem_free_mb,
+                        'profile/mem_total_MiB': mem_total_mb,
                         'global_step': global_step,
                         'epoch': epoch,
                     })
@@ -1312,7 +1386,7 @@ def main():
                 }, tmp_ckpt)
                 # Load back into a fresh model and compare checksums
                 fresh_model = WAE().to(device)
-                loaded = torch.load(tmp_ckpt, map_location=device)
+                loaded = torch.load(tmp_ckpt, map_location=device, weights_only=False)
                 fresh_model.load_state_dict(loaded['model_state_dict'])
                 s_live, a_live = _model_checksum(model)
                 s_load, a_load = _model_checksum(fresh_model)

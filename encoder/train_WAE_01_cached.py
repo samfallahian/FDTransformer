@@ -58,6 +58,8 @@ import re
 import glob
 import shutil
 from typing import Optional, Tuple
+import hashlib
+import random
 
 import numpy as np
 import torch
@@ -218,46 +220,6 @@ def _model_checksum(model: torch.nn.Module) -> Tuple[float, float]:
         pass
     return float(s), float(a)
 
-    has_cuda = torch.cuda.is_available()
-    cuda_version = getattr(torch.version, 'cuda', None)
-    mps_built = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built()
-    mps_avail = mps_built and torch.backends.mps.is_available()
-
-    device = torch.device('cuda') if has_cuda else (torch.device('mps') if mps_avail else torch.device('cpu'))
-
-    lines = [
-        f"Python: {py} | PyTorch: {pyv}",
-        f"CUDA available: {has_cuda} | CUDA toolkit: {cuda_version}",
-        f"MPS built: {mps_built} | MPS available (runtime): {mps_avail}",
-        f"Selected default device: {device}",
-    ]
-
-    if has_cuda:
-        try:
-            idx = torch.cuda.current_device()
-            props = torch.cuda.get_device_properties(idx)
-            cap = torch.cuda.get_device_capability(idx)
-            lines += [
-                f"CUDA device count: {torch.cuda.device_count()}",
-                f"Current device: {idx} | Name: {props.name}",
-                f"Compute capability: {cap[0]}.{cap[1]} | Total memory: {props.total_memory/1024**3:.2f} GiB",
-            ]
-        except Exception as e:
-            lines.append(f"CUDA detail query failed: {e}")
-
-    for ln in lines:
-        print(_rainbow(ln))
-        logger.info(ln)
-
-    return device, {
-        'python': py,
-        'torch': pyv,
-        'cuda_available': has_cuda,
-        'cuda_version': cuda_version,
-        'mps_built': mps_built,
-        'mps_available': mps_avail,
-        'selected_device': str(device),
-    }
 
 
 # ---------
@@ -398,15 +360,19 @@ def _make_loader(
     use_persistent = bool(persistent_workers and num_workers > 0)
 
     # On CPU-only runs, pin_memory has no effect; on CUDA it accelerates H2D
-    loader = DataLoader(
-        dataset,
+    loader_kwargs = dict(
         batch_size=batch_size,
         shuffle=shuffle,
         pin_memory=pin_memory,
         drop_last=False,
         num_workers=max(0, int(num_workers)),
-        prefetch_factor=int(prefetch_factor) if int(num_workers) > 0 else None,
         persistent_workers=use_persistent,
+    )
+    if int(num_workers) > 0:
+        loader_kwargs['prefetch_factor'] = int(prefetch_factor)
+    loader = DataLoader(
+        dataset,
+        **loader_kwargs,
     )
     return loader
 
@@ -449,9 +415,48 @@ def _file_info(path: str) -> dict:
 
 # -------- Evaluation helper --------
 
-def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> dict:
+def _sha256_file(path: str, chunk_size: int = 4 * 1024 * 1024) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            while True:
+                b = f.read(chunk_size)
+                if not b:
+                    break
+                h.update(b)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+def _set_deterministic(seed: int = 12345) -> None:
+    try:
+        np.random.seed(seed)
+    except Exception:
+        pass
+    try:
+        random.seed(seed)
+    except Exception:
+        pass
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.device, *, audit: bool = False) -> dict:
     """Run a full pass over `loader` computing the same aggregates the epoch loop uses.
     Returns a dict with keys: loss, recon, mmd, triplet, rmse, batches.
+    If audit=True, also returns 'audit' sub-dict with alternative deterministic aggregations.
     """
     model_was_training = model.training
     model.eval()
@@ -459,10 +464,20 @@ def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.dev
     batches = 0
     sse_sum = 0.0
     elem_sum = 0
+    sample_count = 0
+
+    # Audit accumulators
+    audit_total_recon_logcosh_sum = 0.0  # sum over all instances of sum(logcosh) -> for mean over instances
+    audit_total_triplet63_sum = 0.0      # mean-of-instances triplet (index 62) sum across instances
+    audit_instances_count = 0
+    audit_max_recon_across_set = None
+
     with torch.no_grad():
         for batch in loader:
             x_cpu = batch[0]
             x = x_cpu.to(device, non_blocking=(device.type == 'cuda'))
+            bs = int(x.size(0))
+            sample_count += bs
             recon_x, z = model(x)
             loss, recon_loss, mmd_loss, triplet_loss = model.loss_function(recon_x, x, z)
             loss_sum += float(loss.item())
@@ -475,6 +490,32 @@ def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.dev
                 elem_sum += int(x.numel())
             except Exception:
                 pass
+
+            if audit:
+                try:
+                    # Recompute per-instance log-cosh with the same scaling (10) used in model.log_cosh_loss
+                    prediction_error = x - recon_x
+                    scaled_error = 10.0 * prediction_error
+                    lc = torch.log(torch.cosh(scaled_error))
+                    # sum over feature dim
+                    lc_inst = torch.sum(lc.view(bs, -1), dim=1)
+                    audit_total_recon_logcosh_sum += float(lc_inst.sum().item())
+                    audit_instances_count += bs
+                    m_inst = float(lc_inst.max().item())
+                    if (audit_max_recon_across_set is None) or (m_inst > audit_max_recon_across_set):
+                        audit_max_recon_across_set = m_inst
+                    # Triplet mean over instances at fixed index 62 (if divisible by 3 as expected)
+                    try:
+                        grouped = recon_x.view(bs, -1, 3)
+                        grouped_x = x.view(bs, -1, 3)
+                        if grouped.size(1) > 62:
+                            trip_inst = torch.mean((grouped[:, 62] - grouped_x[:, 62]) ** 2, dim=1)  # per-instance MSE of index 62
+                            audit_total_triplet63_sum += float(trip_inst.sum().item())
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
             batches += 1
     if model_was_training:
         model.train()
@@ -483,7 +524,8 @@ def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.dev
     avg_mmd = mmd_sum / max(1, batches)
     avg_triplet = triplet_sum / max(1, batches)
     rmse = float(np.sqrt(sse_sum / elem_sum)) if elem_sum > 0 else float('nan')
-    return {
+
+    out = {
         'loss': avg_loss,
         'recon': avg_recon,
         'mmd': avg_mmd,
@@ -491,6 +533,24 @@ def _evaluate_full(model: torch.nn.Module, loader: DataLoader, device: torch.dev
         'rmse': rmse,
         'batches': batches,
     }
+    if audit:
+        mean_recon_logcosh_per_instance = (audit_total_recon_logcosh_sum / audit_instances_count) if audit_instances_count > 0 else float('nan')
+        mean_triplet63_per_instance = (audit_total_triplet63_sum / audit_instances_count) if audit_instances_count > 0 else float('nan')
+        out['audit'] = {
+            'instances': audit_instances_count,
+            'elements': elem_sum,
+            'loss_sum_over_batches': loss_sum,
+            'recon_sum_over_batches': recon_sum,
+            'mmd_sum_over_batches': mmd_sum,
+            'triplet_sum_over_batches': triplet_sum,
+            'mean_recon_logcosh_per_instance': mean_recon_logcosh_per_instance,
+            'max_recon_logcosh_over_set': (float(audit_max_recon_across_set) if audit_max_recon_across_set is not None else None),
+            'mean_triplet63_mse_per_instance': mean_triplet63_per_instance,
+            'rmse': rmse,
+            'mse': (rmse * rmse) if np.isfinite(rmse) else float('nan'),
+            'samples': sample_count,
+        }
+    return out
 
 
 def _build_provenance(model: torch.nn.Module,
@@ -513,7 +573,23 @@ def _build_provenance(model: torch.nn.Module,
     # Checksums
     m_sum, m_abs = _model_checksum(model)
     o_sum, o_abs = _optimizer_checksum(optimizer)
+    # Hashes
+    train_sha = _sha256_file(train_path)
+    val_sha = _sha256_file(val_path)
     # Build dict
+    # Model source file info
+    model_src_path = os.path.join(PARENT_DIR, 'encoder', 'model_WAE_01.py')
+    try:
+        model_src_sha = _sha256_file(model_src_path)
+        model_src_info = {
+            'path': model_src_path,
+            'sha256': model_src_sha,
+            'size': os.path.getsize(model_src_path) if os.path.exists(model_src_path) else None,
+            'mtime': os.path.getmtime(model_src_path) if os.path.exists(model_src_path) else None,
+        }
+    except Exception:
+        model_src_info = {'path': model_src_path, 'sha256': None, 'size': None, 'mtime': None}
+
     prov = {
         'timestamp': time.time(),
         'host': host,
@@ -525,6 +601,7 @@ def _build_provenance(model: torch.nn.Module,
         'param_count': _count_params(model),
         'model_checksum': {'sum': m_sum, 'abs_sum': m_abs},
         'optimizer_checksum': {'sum': o_sum, 'abs_sum': o_abs},
+        'model_source': model_src_info,
         'run_config': {
             'epochs': int(num_epochs),
             'batch_size': int(batch_size),
@@ -547,10 +624,31 @@ def _build_provenance(model: torch.nn.Module,
         'data': {
             'train_path': train_path,
             'val_path': val_path,
-            'train_file': _file_info(train_path),
-            'val_file': _file_info(val_path),
+            'train_file': {**_file_info(train_path), 'sha256': train_sha},
+            'val_file': {**_file_info(val_path), 'sha256': val_sha},
             'train_limit': (int(args.train_limit) if getattr(args, 'train_limit', None) is not None else None),
             'val_limit': (int(args.val_limit) if getattr(args, 'val_limit', None) is not None else None),
+        },
+        'loss_config': {
+            'recon': {
+                'type': 'log_cosh',
+                'scale_factor': 10,
+                'reduction': 'max_over_instances_of_sum_per_instance',
+            },
+            'triplet': {
+                'type': 'mse_single_index',
+                'index': 62,
+                'aggregation': 'random_single_instance_per_batch',
+            },
+            'mmd': {
+                'type': 'kernel_mmd',
+                'kernel': 'exp(-mean((x-y)^2)/dim*2)',
+            },
+            'composite': 'recon + mmd + triplet',
+        },
+        'metrics_definitions': {
+            'rmse': 'global_per_element_over_full_set',
+            'val_loss_epoch': 'mean_of_per_batch_total_loss_items',
         }
     }
     return prov
@@ -581,6 +679,15 @@ def main():
     parser.add_argument('--width', type=int, default=90, help='Target console width for epoch summary lines (wrap if exceeded).')
     parser.add_argument('--no_color', action='store_true', help='Disable ANSI colors in console output.')
     parser.add_argument('--debug', action='store_true', help='After each epoch, save and immediately reload the checkpoint to verify persistence.')
+
+    # Evaluation controls
+    parser.add_argument('--loss_audit', action='store_true',
+                        help='During eval (eval-only or on-start), compute and print a detailed loss/metric audit breakdown.')
+    parser.add_argument('--deterministic_eval', action='store_true',
+                        help='Force deterministic settings during evaluation (set seeds, deterministic algorithms, disable AMP).')
+    parser.add_argument('--seed', type=int, default=12345, help='Random seed to use when --deterministic_eval is set.')
+    parser.add_argument('--enforce_resume_sanity', action='store_true',
+                        help='Shortcut: implies --eval_on_start --fail_if_worse with current tolerances.')
 
     # Evaluation controls
     parser.add_argument('--eval_on_start', action='store_true',
@@ -630,6 +737,11 @@ def main():
 
     args = parser.parse_args()
 
+    # Convenience: enforce resume sanity
+    if getattr(args, 'enforce_resume_sanity', False):
+        setattr(args, 'eval_on_start', True)
+        setattr(args, 'fail_if_worse', True)
+
     # Preferences and roots
     prefs = _load_preferences(args.preferences)
     root_dir = args.root or getattr(prefs, 'root_path', os.getcwd())
@@ -637,11 +749,15 @@ def main():
     # Resolve file paths
     train_path = os.path.join(root_dir, args.train_file)
     val_path = os.path.join(root_dir, args.val_file)
+    test_path = os.path.join(root_dir, args.test_file) if getattr(args, 'test_file', None) else None
 
     if not os.path.isfile(train_path):
         raise FileNotFoundError(f"Training cached file not found: {train_path}")
     if not os.path.isfile(val_path):
         raise FileNotFoundError(f"Validation cached file not found: {val_path}")
+    if test_path is not None and not os.path.isfile(test_path):
+        logger.warning(f"Test cached file specified but not found: {test_path}. Skipping test evaluation.")
+        test_path = None
 
     # Effective settings
     batch_size = int(args.batch_size)
@@ -792,7 +908,11 @@ def main():
     if resume_path and os.path.isfile(resume_path):
         try:
             logger.info(f"Loading checkpoint from {resume_path}")
-            checkpoint = torch.load(resume_path, map_location=device)
+            try:
+                checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            except TypeError:
+                # Older PyTorch versions do not support weights_only; fallback to legacy behavior
+                checkpoint = torch.load(resume_path, map_location=device)
             model.load_state_dict(checkpoint['model_state_dict'])
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -834,7 +954,7 @@ def main():
                     rc = ckpt_prov.get('run_config', {})
                     data = ckpt_prov.get('data', {})
                     logger.info("PROVENANCE: model_name=%s device=%s params=%s",
-                                ckpt_prov.get('model_name'), ckpt_prov.get('device'))
+                                ckpt_prov.get('model_name'), ckpt_prov.get('device'), ckpt_prov.get('param_count'))
                     logger.info("PROVENANCE: python=%s torch=%s cuda=%s host=%s",
                                 ckpt_prov.get('python'), ckpt_prov.get('torch'), ckpt_prov.get('cuda_version'), ckpt_prov.get('host'))
                     logger.info("PROVENANCE: train_path=%s size=%s mtime=%s | val_path=%s size=%s mtime=%s",
@@ -846,6 +966,18 @@ def main():
                                 (data.get('val_file') or {}).get('mtime'))
                     logger.info("PROVENANCE: config batch_size=%s lr=%s amp=%s workers=%s limits(train=%s,val=%s)",
                                 rc.get('batch_size'), rc.get('learning_rate'), rc.get('amp'), rc.get('num_workers'), rc.get('train_limit'), rc.get('val_limit'))
+                    # New: dataset and model source hashes
+                    try:
+                        tf = (data.get('train_file') or {})
+                        vf = (data.get('val_file') or {})
+                        ms = ckpt_prov.get('model_source') or {}
+                        logger.info("PROVENANCE: train_sha256=%s | val_sha256=%s | model_src_sha256=%s",
+                                    tf.get('sha256'), vf.get('sha256'), (ms.get('sha256') if isinstance(ms, dict) else None))
+                        if ms:
+                            logger.info("PROVENANCE: model_source path=%s size=%s mtime=%s",
+                                        ms.get('path'), ms.get('size'), ms.get('mtime'))
+                    except Exception:
+                        pass
                     logger.info("PROVENANCE: model_checksum(sum=%.6e,abs=%.6e) match=%s | now(sum=%.6e,abs=%.6e)",
                                 float(cs.get('sum', float('nan'))), float(cs.get('abs_sum', float('nan'))),
                                 (abs(float(cs.get('sum', 0.0)) - s_now) < 1e-6 and abs(float(cs.get('abs_sum', 0.0)) - a_now) < 1e-6),
@@ -866,7 +998,10 @@ def main():
         except Exception:
             eval_on_start_flag = bool(resume_path)
         if eval_on_start_flag:
-            eval_res = _evaluate_full(model, val_loader, device)
+            # Deterministic evaluation if requested
+            if getattr(args, 'deterministic_eval', False):
+                _set_deterministic(int(getattr(args, 'seed', 12345)))
+            eval_res = _evaluate_full(model, val_loader, device, audit=bool(getattr(args, 'loss_audit', False)))
             ckpt_metrics = checkpoint.get('metrics') if 'checkpoint' in locals() else None
             msg = (
                 f"EVAL-ON-START: val_loss={_fmt_val(eval_res['loss'])} val_recon={_fmt_val(eval_res['recon'])} "
@@ -874,6 +1009,16 @@ def main():
                 f"val_RMSE={_fmt_val(eval_res['rmse'])} batches={eval_res['batches']}"
             )
             logger.info(msg)
+            if getattr(args, 'loss_audit', False) and isinstance(eval_res.get('audit'), dict):
+                a = eval_res['audit']
+                logger.info(
+                    "LOSS-AUDIT: instances=%s elements=%s mean_recon_logcosh_per_instance=%s max_recon_logcosh_over_set=%s "
+                    "mean_triplet63_mse_per_instance=%s rmse=%s mse=%s",
+                    a.get('instances'), a.get('elements'), _fmt_val(a.get('mean_recon_logcosh_per_instance')),
+                    _fmt_val(a.get('max_recon_logcosh_over_set') if a.get('max_recon_logcosh_over_set') is not None else float('nan')),
+                    _fmt_val(a.get('mean_triplet63_mse_per_instance')),
+                    _fmt_val(a.get('rmse')), _fmt_val(a.get('mse'))
+                )
             # If checkpoint has embedded metrics, print diffs and optionally enforce tolerances
             if isinstance(ckpt_metrics, dict):
                 def rel_diff(curr, ref):
@@ -928,7 +1073,6 @@ def main():
         # back to train mode
         model.train()
 
-    model.train()  # Add this explicitly
     logger.info(f"Initialized WAE model with latent dimension {model.fc4.out_features}")
 
     # =================
@@ -1150,8 +1294,8 @@ def main():
         ]
         parts_rmse = []
         if train_rmse is not None:
-            parts_rmse.append(f"train_RMSE={_fmt_val(train_rmse)}{_fmt_delta(train_rmse, prev_metrics.get('train_rmSE'), decimals=3, color_enabled=color_enabled)}")
-        parts_rmse.append(f"val_RMSE={_fmt_val(val_rmse)}{_fmt_delta(val_rmse, prev_metrics.get('val_rmSE'), decimals=3, color_enabled=color_enabled)}")
+            parts_rmse.append(f"train_RMSE={_fmt_val(train_rmse)}{_fmt_delta(train_rmse, prev_metrics.get('train_RMSE'), decimals=3, color_enabled=color_enabled)}")
+        parts_rmse.append(f"val_RMSE={_fmt_val(val_rmse)}{_fmt_delta(val_rmse, prev_metrics.get('val_RMSE'), decimals=3, color_enabled=color_enabled)}")
         tail = f"epoch_time={elapsed:.1f}s | ETA~{eta_min}m{eta_sec:02d}s"
 
         # Assemble with wrapping at separators ' | '
@@ -1233,8 +1377,8 @@ def main():
             'val_recon': val_avg_recon,
             'val_mmd': val_avg_mmd,
             'val_triplet': val_avg_triplet,
-            'train_rmSE': train_rmse if train_rmse is not None else prev_metrics.get('train_rmSE'),
-            'val_rmSE': val_rmse,
+            'train_RMSE': train_rmse if train_rmse is not None else prev_metrics.get('train_RMSE'),
+            'val_RMSE': val_rmse,
         }
 
         # ---- Checkpointing ----
@@ -1312,7 +1456,10 @@ def main():
                 }, tmp_ckpt)
                 # Load back into a fresh model and compare checksums
                 fresh_model = WAE().to(device)
-                loaded = torch.load(tmp_ckpt, map_location=device)
+                try:
+                    loaded = torch.load(tmp_ckpt, map_location=device, weights_only=False)
+                except TypeError:
+                    loaded = torch.load(tmp_ckpt, map_location=device)
                 fresh_model.load_state_dict(loaded['model_state_dict'])
                 s_live, a_live = _model_checksum(model)
                 s_load, a_load = _model_checksum(fresh_model)
@@ -1331,10 +1478,61 @@ def main():
 
         # end for epoch
 
+    # Optional: evaluate on test set if provided
+    if 'test_path' in locals() and test_path is not None:
+        try:
+            test_np = _load_cached_array(test_path, limit=None)
+            test_loader = _make_loader(
+                test_np,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=int(args.num_workers),
+                prefetch_factor=int(args.prefetch_factor),
+                persistent_workers=bool(args.persistent_workers),
+                pin_memory=not args.no_pin_memory,
+            )
+            del test_np
+            test_res = _evaluate_full(model, test_loader, device)
+            logger.info(
+                "TEST EVAL: loss=%s recon=%s mmd=%s triplet=%s RMSE=%s batches=%s",
+                _fmt_val(test_res['loss']), _fmt_val(test_res['recon']), _fmt_val(test_res['mmd']),
+                _fmt_val(test_res['triplet']), _fmt_val(test_res['rmse']), test_res['batches']
+            )
+            # TensorBoard
+            writer.add_scalar('test/loss', test_res['loss'], num_epochs)
+            writer.add_scalar('test/recon', test_res['recon'], num_epochs)
+            writer.add_scalar('test/mmd', test_res['mmd'], num_epochs)
+            writer.add_scalar('test/triplet', test_res['triplet'], num_epochs)
+            writer.add_scalar('test/RMSE', test_res['rmse'], num_epochs)
+            # W&B
+            if not args.no_wandb:
+                try:
+                    wandb.log({
+                        'test/loss': test_res['loss'],
+                        'test/recon': test_res['recon'],
+                        'test/mmd': test_res['mmd'],
+                        'test/triplet': test_res['triplet'],
+                        'test/RMSE': test_res['rmse'],
+                        'test/batches': test_res['batches'],
+                        'epoch': num_epochs,
+                        'global_step': global_step,
+                    })
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Test evaluation failed: {e}")
+
     # Close writers
     try:
         writer.flush()
         writer.close()
+    except Exception:
+        pass
+
+    # Finish W&B run if active
+    try:
+        if not args.no_wandb and wandb_run is not None:
+            wandb.finish()
     except Exception:
         pass
 

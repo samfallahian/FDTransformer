@@ -1,6 +1,6 @@
 {
     "skirt": {
-        "root_path": "/Users/kkreth/PycharmProjects/data/all_data_cleaned_dtype_correct/",
+        "root_path": "/Users/kkreth/PycharmProjects/data/",
         "training_data_path": "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training",
         "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/Users/kkreth/PycharmProjects/data/logs_for_jobs/",
@@ -26,8 +26,8 @@
         "output_directory": "/home/kkreth_umassd_edu/DL-PTV/all_data_broken_down_1200_each_directory/",
         "logging_level": "DEBUG"
     },
-        "b13d3886216b": {
-        "root_path": "/workspace/cgan",
+        "e9725e55faec": {
+        "root_path": "/workspace/",
         "training_data_path": "/workspace",
         "metadata_location": "/home/kkreth_umassd_edu/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/home/kkreth_umassd_edu/logs/",

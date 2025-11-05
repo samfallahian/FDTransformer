@@ -78,9 +78,9 @@ from Ordered_001_Initialize import HostPreferences  # noqa: E402
 # ----------------------
 # Default training config
 # ----------------------
-MODEL_NAME = "WAE_Cached_011_Overhaul"
+MODEL_NAME = "WAE_Cached_012_H200"
 DEFAULT_BATCH_SIZE = 128
-DEFAULT_EPOCHS = 2500
+DEFAULT_EPOCHS = 5500
 DEFAULT_LR = 1e-6
 SAVE_INTERVAL = 2  # save every N epochs
 CHECKPOINTS_TO_KEEP = 5  # keep last K rolling checkpoints

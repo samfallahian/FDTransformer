@@ -1,12 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="root@213.181.108.221:33408 agent (2)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="unity.rc.umass.edu">
+      <paths name="root@213.181.108.221:33408 agent">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/workspace/cgan" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@213.181.108.221:33408 agent (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/workspace/cgan" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

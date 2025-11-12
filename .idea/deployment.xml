@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="root@213.181.108.221:33408 agent (2)" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="kkreth_umassd_edu@unity.rc.umass.edu:22 key" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
+      <paths name="kkreth_umassd_edu@unity.rc.umass.edu:22 key">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/kkreth_umassd_edu/cgan" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="root@213.181.108.221:33408 agent">
         <serverdata>
           <mappings>

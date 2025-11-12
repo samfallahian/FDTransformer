@@ -133,8 +133,44 @@ def load_wae_model(model_path):
     # Initialize the model
     model = WAE().to(device)
     
-    # Load the model weights
-    checkpoint = torch.load(model_path, map_location=device)
+    # Load the model weights with compatibility for PyTorch 2.6+ "weights_only" changes
+    # Prefer explicit weights_only=False first (only if you trust the checkpoint source)
+    # If that fails due to new safe-unpickling rules, allowlist required globals and retry safely.
+    checkpoint = None
+    torch_version = getattr(torch, "__version__", "unknown")
+    logger.info(f"PyTorch version detected: {torch_version}")
+    try:
+        # In PyTorch 2.6+ default weights_only=True can break legacy checkpoints; override explicitly
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    except Exception as e:
+        logger.warning(
+            "torch.load with weights_only=False failed on first attempt. Will try safe allowlist path. "
+            f"Error: {e}"
+        )
+        try:
+            # Attempt to allowlist TorchVersion which is commonly needed by older checkpoints
+            from torch.serialization import add_safe_globals
+            try:
+                # TorchVersion class location
+                from torch.torch_version import TorchVersion
+            except Exception:
+                TorchVersion = None
+            if 'add_safe_globals' in dir(__import__('torch').serialization) and TorchVersion is not None:
+                add_safe_globals([TorchVersion])
+            # Retry load; if available, keep weights_only=True for extra safety; otherwise omit
+            try:
+                checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+            except TypeError:
+                # Older torch without weights_only argument
+                checkpoint = torch.load(model_path, map_location=device)
+        except Exception as e2:
+            logger.error(
+                "Failed to load checkpoint even after adding safe globals. "
+                "If you trust the checkpoint source, ensure this process has permissions and the file is not corrupted. "
+                f"Original error: {e}; Fallback error: {e2}"
+            )
+            raise
+    
     
     # Extract the model state dict
     if "model_state_dict" in checkpoint:
@@ -286,7 +322,8 @@ def main(picklefile):
             raise TypeError(f"Expected DataFrame, got {type(df)}")
         
         # 4. Load the WAE model
-        model_path = os.path.join(current_dir, "encoder/saved_models/WAE_01_epoch_2870.pt")
+        # NOTE: `os.path` is a module, not a callable. Use a plain string path (or join/resolve if needed).
+        model_path = "/home/kkreth_umassd_edu/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt"
         wae_model, device = load_wae_model(model_path)
         
         # 5. Process the dataframe

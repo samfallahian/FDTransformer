@@ -11,8 +11,8 @@
 source /home/kkreth_umassd_edu/_virtual_python_3/bin/activate
 
 # Set the directory path
-export PYTHONPATH="${PYTHONPATH}:/home/kkreth_umassd_edu/cgan/2025/:/home/kkreth_umassd_edu/cgan/:/home/kkreth_umassd_edu/cgan/configs/"
-cd /home/kkreth_umassd_edu/cgan/2025/
+export PYTHONPATH="${PYTHONPATH}:/home/kkreth_umassd_edu/cgan/:/home/kkreth_umassd_edu/cgan/configs/"
+cd /home/kkreth_umassd_edu/cgan/
 
 # Set the directory path using job name
 directory_path="/home/kkreth_umassd_edu/DL-PTV/all_data_broken_down_1200_each_directory/${SLURM_JOB_NAME}"
@@ -25,6 +25,6 @@ file_1="${directory_path}/${file_number}.pkl"
 
 
 # Pass the input file as an argument to the Python script
-/home/kkreth_umassd_edu/_virtual_python_3/bin/python /home/kkreth_umassd_edu/cgan/2025/Ordered_100_iterateThrough.py \
+/home/kkreth_umassd_edu/_virtual_python_3/bin/python /home/kkreth_umassd_edu/cgan/Ordered_100_iterateThrough.py \
     "$file_1"
 

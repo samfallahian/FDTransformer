@@ -25,7 +25,8 @@ from encoder.train_WAE_01_cached import _load_cached_array, _load_preferences  #
 # CONFIG (as requested: CAPS var)
 # ------------------------------
 MODEL_CHECKPOINT_PATH = \
-    "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt"
+    "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_01_epoch_2870.pt"
+    #"/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt"
 
 # Random sample size from the validation set
 RANDOM_SAMPLE_SIZE = 100_000

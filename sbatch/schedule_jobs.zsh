@@ -4,8 +4,8 @@
 
 #echo "Waiting 2 hours for first submission..."
 #sleep 7200
-#echo "Submitting populate_all_cubes_6p6.sbatch"
-#sbatch /home/kkreth_umassd_edu/cgan/2025/sbatch/populate_all_cubes_6p6.sbatch
+echo "Submitting populate_all_cubes_6p6.sbatch"
+sbatch /home/kkreth_umassd_edu/cgan/2025/sbatch/populate_all_cubes_6p6.sbatch
 
 echo "Waiting 2 hours for next submission..."
 sleep 9200

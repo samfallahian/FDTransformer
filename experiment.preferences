@@ -1,6 +1,6 @@
 {
     "skirt": {
-        "root_path": "/Users/kkreth/PycharmProjects/data/all_data_empty_columns_added",
+        "root_path": "/Users/kkreth/PycharmProjects/data/",
         "training_data_path": "/Users/kkreth/PycharmProjects/data/",
         "metadata_location": "/Users/kkreth/PycharmProjects/cgan/configs/Experiment_MetaData.json",
         "logging_path": "/Users/kkreth/PycharmProjects/data/logs_for_jobs/",

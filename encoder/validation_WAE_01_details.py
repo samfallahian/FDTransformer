@@ -1,3 +1,8 @@
+'''
+Decent view on errors, by vx, vy, and vz breakdowns as well. Will use this as a rough template
+for creating a view that looks at time as an element related to error.
+'''
+
 import os
 import sys
 import math
@@ -122,7 +127,12 @@ def compute_percentiles(residuals: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
 
 def plot_boxplot_all_positions(residuals: np.ndarray, title: Optional[str], output_path: str,
                                  q25: Optional[np.ndarray] = None, q50: Optional[np.ndarray] = None,
-                                 q75: Optional[np.ndarray] = None) -> None:
+                                 q75: Optional[np.ndarray] = None,
+                                 q15: Optional[np.ndarray] = None, q85: Optional[np.ndarray] = None,
+                                 show_percentile_means: bool = False,
+                                 y_lim: Optional[tuple[float, float]] = None,
+                                 x_label: Optional[str] = None,
+                                 y_label: Optional[str] = None) -> None:
     # residuals: [N, D]
     D = residuals.shape[1]
     data = [residuals[:, j] for j in range(D)]
@@ -143,11 +153,35 @@ def plot_boxplot_all_positions(residuals: np.ndarray, title: Optional[str], outp
         ax.plot(xs, q50, color='tab:red', linestyle='none', marker='.', markersize=2.5, alpha=0.7, label='Median (p50)')
         ax.plot(xs, q25, color='tab:blue', linestyle='none', marker='.', markersize=2.0, alpha=0.5, label='Q1 (p25)')
         ax.plot(xs, q75, color='tab:green', linestyle='none', marker='.', markersize=2.0, alpha=0.5, label='Q3 (p75)')
-        ax.legend(loc='upper right', fontsize=8, framealpha=0.3)
+        leg = ax.legend(loc='upper right', fontsize=8, framealpha=0.3)
+        # Optionally show mean of percentiles near legend
+        if show_percentile_means:
+            # Compute means of available percentiles
+            items = []
+            if q15 is not None:
+                items.append(("p15", float(np.nanmean(q15))))
+            items.append(("p25", float(np.nanmean(q25))))
+            items.append(("p50", float(np.nanmean(q50))))
+            items.append(("p75", float(np.nanmean(q75))))
+            if q85 is not None:
+                items.append(("p85", float(np.nanmean(q85))))
+            txt = "\n".join([f"mean {k}: {v:.3e}" for k, v in items])
+            # Place text box in bottom right; white text on black background for contrast
+            ax.text(0.985, 0.05, txt, transform=ax.transAxes,
+                    ha='right', va='bottom', fontsize=8, color='white',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', edgecolor='none', alpha=0.85))
 
     # Axis labels/title
-    ax.set_xlabel('Position index (0-based)')
-    ax.set_ylabel('Residual' + (' (absolute)' if ABSOLUTE_RESIDUALS else ''))
+    # Allow overrides via parameters; otherwise keep previous defaults
+    ax.set_xlabel(x_label if x_label is not None else 'Position index (0-based)')
+    ax.set_ylabel(y_label if y_label is not None else 'Residual' + (' (absolute)' if ABSOLUTE_RESIDUALS else ''))
+    # Optional fixed y-limits (e.g., to standardize across plots)
+    if y_lim is not None:
+        try:
+            ax.set_ylim(*y_lim)
+        except Exception:
+            # Fallback: ignore invalid limits
+            pass
     if title:
         ax.set_title(title)
 
@@ -480,7 +514,7 @@ def main():
         f"residual_boxplot_{base}{abs_suffix}_whis15_85_{timestamp}.png"
     )
     title = f"Residuals per position (N={residuals.shape[0]}) | {base}{' | abs' if ABSOLUTE_RESIDUALS else ''}"
-    plot_boxplot_all_positions(residuals, title, out_png, q25=p25, q50=p50, q75=p75)
+    plot_boxplot_all_positions(residuals, title, out_png, q25=p25, q50=p50, q75=p75, q15=p15, q85=p85, show_percentile_means=False)
     logger.info(f"Saved residual boxplot to: {out_png}")
 
     # Violin plots (symlog): standard and split by sign
@@ -514,6 +548,48 @@ def main():
     )
     plot_ecdf_subset(residuals, title, out_ecdf, step=SUBSET_STEP, max_positions=SUBSET_MAX_POSITIONS, highlight=5)
     logger.info(f"Saved residual ECDF subset to: {out_ecdf}")
+
+    # Additional requirement: create three separate boxplots for vx, vy, vz
+    def _component_indices(D: int, comp: str) -> np.ndarray:
+        comp = comp.lower()
+        start_map = {"vx": 0, "vy": 1, "vz": 2}
+        if comp not in start_map:
+            raise ValueError(f"Unknown component: {comp}")
+        start = start_map[comp]
+        return np.arange(start, D, 3, dtype=int)
+
+    D = residuals.shape[1]
+    for comp in ["vx", "vy", "vz"]:
+        idxs = _component_indices(D, comp)
+        if idxs.size == 0:
+            logger.warning(f"No indices found for component {comp}; skipping.")
+            continue
+        res_c = residuals[:, idxs]
+        p15_c = p15[idxs]
+        p25_c = p25[idxs]
+        p50_c = p50[idxs]
+        p75_c = p75[idxs]
+        p85_c = p85[idxs]
+        out_comp = os.path.join(
+            OUTPUT_DIR,
+            f"residual_boxplot_{base}{abs_suffix}_whis15_85_{comp}_{timestamp}.png"
+        )
+        title_c = f"Residuals per position [{comp}] (N={residuals.shape[0]}) | {base}{' | abs' if ABSOLUTE_RESIDUALS else ''}"
+        plot_boxplot_all_positions(
+            res_c,
+            title_c,
+            out_comp,
+            q25=p25_c,
+            q50=p50_c,
+            q75=p75_c,
+            q15=p15_c,
+            q85=p85_c,
+            show_percentile_means=True,
+            y_lim=(-0.020, 0.015),
+            x_label="Position Index",
+            y_label="Scaled RMSE Residual",
+        )
+        logger.info(f"Saved {comp} residual boxplot to: {out_comp}")
 
 
 if __name__ == "__main__":

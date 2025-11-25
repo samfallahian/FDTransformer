@@ -72,7 +72,7 @@ MODEL_V2_PATH = "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cac
 # Larger samples give more robust metrics but take longer to compute
 # NOTE: Computational complexity is O(N^2) for distance calculations
 # 1000 samples: ~10 seconds, 2000 samples: ~40 seconds, 5000 samples: ~4 minutes
-RANDOM_SAMPLE_SIZE = 10_000
+RANDOM_SAMPLE_SIZE = 2_000
 
 # Inference batch size (tune if you hit memory limits)
 BATCH_SIZE = 2048

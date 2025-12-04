@@ -1,0 +1,36 @@
+RMSE Statistics for 7p2 at time 1000
+============================================================
+
+Total unique positions: 41664
+Positions with overlaps: 41656
+
+
+VX RMSE Statistics:
+----------------------------------------
+  mean_rmse      : 0.00680942
+  median_rmse    : 0.00570948
+  std_rmse       : 0.00466421
+  min_rmse       : 0.00012010
+  max_rmse       : 0.04221640
+  q25_rmse       : 0.00328645
+  q75_rmse       : 0.00922347
+
+VY RMSE Statistics:
+----------------------------------------
+  mean_rmse      : 0.00694698
+  median_rmse    : 0.00582161
+  std_rmse       : 0.00447053
+  min_rmse       : 0.00005133
+  max_rmse       : 0.03087713
+  q25_rmse       : 0.00348522
+  q75_rmse       : 0.00941521
+
+VZ RMSE Statistics:
+----------------------------------------
+  mean_rmse      : 0.00724211
+  median_rmse    : 0.00598209
+  std_rmse       : 0.00439828
+  min_rmse       : 0.00001232
+  max_rmse       : 0.02944582
+  q25_rmse       : 0.00399351
+  q75_rmse       : 0.00956010

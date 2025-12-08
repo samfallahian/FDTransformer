@@ -36,14 +36,34 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import plotly.io as pio
 
-# Configuration
-OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/overlap_analysis"
-FIGURE_OUTPUT_DIR = "/Users/kkreth/PycharmProjects/cgan/encoder/velocity_overlap_analysis"
+# Add parent directory to path for imports
+PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PARENT_DIR not in sys.path:
+    sys.path.append(PARENT_DIR)
+
+from Ordered_001_Initialize import HostPreferences  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Initialize host preferences to get correct paths
+try:
+    host_prefs = HostPreferences()
+    metadata_path = Path(host_prefs.metadata_location)
+    PROJECT_ROOT = metadata_path.parent.parent
+
+    OUTPUT_DIR = Path(host_prefs.training_data_path) / "overlap_analysis"
+    FIGURE_OUTPUT_DIR = PROJECT_ROOT / "encoder" / "velocity_overlap_analysis"
+
+    logger.info(f"Initialized paths from HostPreferences:")
+    logger.info(f"  Output dir: {OUTPUT_DIR}")
+    logger.info(f"  Figure output dir: {FIGURE_OUTPUT_DIR}")
+except Exception as e:
+    logger.warning(f"Could not load HostPreferences, using default paths: {e}")
+    OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/overlap_analysis"
+    FIGURE_OUTPUT_DIR = "/Users/kkreth/PycharmProjects/cgan/encoder/velocity_overlap_analysis"
 
 
 def load_data(dataset_name, time, output_dir):

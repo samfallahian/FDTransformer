@@ -73,15 +73,35 @@ from encoder.model_WAE_01 import WAE  # noqa: E402
 from Ordered_001_Initialize import HostPreferences  # noqa: E402
 from CoordinateSpace import givenXYZreplyVelocityCube  # noqa: E402
 
-# Configuration
-MODEL_PATH = "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt"
-DATA_BASE_DIR = "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training"
-OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/overlap_analysis"
-
 # Configure logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Initialize host preferences to get correct paths
+try:
+    host_prefs = HostPreferences()
+    # Derive project root from metadata_location
+    # metadata_location is like: /home/kkreth_umassd_edu/cgan/configs/Experiment_MetaData.json
+    # So project root is two levels up
+    metadata_path = Path(host_prefs.metadata_location)
+    PROJECT_ROOT = metadata_path.parent.parent
+
+    MODEL_PATH = PROJECT_ROOT / "encoder" / "saved_models" / "WAE_Cached_012_H200_FINAL.pt"
+    DATA_BASE_DIR = Path(host_prefs.training_data_path) / "all_data_ready_for_training"
+    OUTPUT_DIR = Path(host_prefs.training_data_path) / "overlap_analysis"
+
+    logger.info(f"Initialized paths from HostPreferences:")
+    logger.info(f"  Project root: {PROJECT_ROOT}")
+    logger.info(f"  Model path: {MODEL_PATH}")
+    logger.info(f"  Data base dir: {DATA_BASE_DIR}")
+    logger.info(f"  Output dir: {OUTPUT_DIR}")
+except Exception as e:
+    logger.warning(f"Could not load HostPreferences, using default paths: {e}")
+    # Fallback to hardcoded paths
+    MODEL_PATH = "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt"
+    DATA_BASE_DIR = "/Users/kkreth/PycharmProjects/data/all_data_ready_for_training"
+    OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/overlap_analysis"
 
 
 def load_model(model_path, device):
@@ -235,6 +255,10 @@ def process_dataset(dataset_name, time, model, device, data_base_dir, output_dir
     Returns:
         Tuple of (velocity_df, position_df)
     """
+    # Convert paths to Path objects for consistency
+    data_base_dir = Path(data_base_dir)
+    output_dir = Path(output_dir)
+
     logger.info(f"Processing dataset: {dataset_name}, time: {time}")
 
     # Construct path to pickle file

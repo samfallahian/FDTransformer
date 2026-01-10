@@ -330,8 +330,9 @@ def create_animated_html(dataset, time_steps, output_dir):
     <div id="container">
         <h1>Velocity RMSE Animation - Dataset {dataset}</h1>
         <div class="info">
-            <strong>Note:</strong> Data is loaded on-demand. Each time step is a separate file,
+            <strong>Note:</strong> Data is loaded on-demand with smart prefetching. Each time step is a separate file,
             allowing smooth navigation through {len(available_times)} time steps without memory issues.
+            The viewer automatically caches up to 20 frames and prefetches nearby frames for smooth playback.
             <br><br>
             <strong>Important:</strong> If you see "Failed to load data", you need to serve this HTML with a local web server:
             <ul style="margin: 10px 0; padding-left: 30px;">
@@ -358,6 +359,9 @@ def create_animated_html(dataset, time_steps, output_dir):
                 <input type="number" id="speedInput" value="500" min="100" max="5000" step="100" style="width: 80px;">
                 <span> ms/frame</span>
             </div>
+            <div class="control-group">
+                <span id="cacheStatus" style="color: #666; font-size: 12px;">Cache: 0/20 frames</span>
+            </div>
         </div>
 
         <div id="plot"></div>
@@ -377,6 +381,16 @@ def create_animated_html(dataset, time_steps, output_dir):
         let isPlaying = false;
         let playInterval = null;
         let currentData = null;
+
+        // Cache management - Adjust these values based on your needs:
+        // - MAX_CACHE_SIZE: How many frames to keep in memory (higher = more RAM, smoother playback)
+        // - PREFETCH_AHEAD: How many upcoming frames to load in background (5-10 recommended)
+        // - PREFETCH_BEHIND: How many previous frames to cache (2-5 recommended)
+        const dataCache = new Map(); // LRU cache for loaded frames
+        const MAX_CACHE_SIZE = 20; // Keep up to 20 frames in memory (~40-100 MB depending on data size)
+        const PREFETCH_AHEAD = 5; // Prefetch next 5 frames (important for smooth playback)
+        const PREFETCH_BEHIND = 2; // Prefetch previous 2 frames (for going backwards)
+        let prefetchQueue = [];
 
         // Create the initial plot structure
         const layout = {{
@@ -410,6 +424,96 @@ def create_animated_html(dataset, time_steps, output_dir):
         // Initialize empty plot
         Plotly.newPlot('plot', [], layout, {{ responsive: true }});
 
+        // Cache management functions
+        function addToCache(time, data) {{
+            // Add to cache
+            dataCache.set(time, data);
+
+            // Implement LRU: if cache is too large, remove oldest entries
+            if (dataCache.size > MAX_CACHE_SIZE) {{
+                const firstKey = dataCache.keys().next().value;
+                dataCache.delete(firstKey);
+            }}
+
+            // Update cache status UI
+            updateCacheStatus();
+        }}
+
+        function updateCacheStatus() {{
+            const statusEl = document.getElementById('cacheStatus');
+            if (statusEl) {{
+                statusEl.textContent = `Cache: ${{dataCache.size}}/${{MAX_CACHE_SIZE}} frames`;
+            }}
+        }}
+
+        function getFromCache(time) {{
+            return dataCache.get(time);
+        }}
+
+        // Fetch data from server (with caching)
+        async function fetchTimeData(time) {{
+            // Check cache first
+            const cached = getFromCache(time);
+            if (cached) {{
+                console.log(`Cache hit for time ${{time}}`);
+                return cached;
+            }}
+
+            // Fetch from server
+            const jsonPath = `./${{dataDir}}/time_${{String(time).padStart(4, '0')}}.json`;
+            console.log('Fetching:', jsonPath);
+            const response = await fetch(jsonPath);
+            if (!response.ok) throw new Error(`HTTP error! status: ${{response.status}}`);
+
+            const data = await response.json();
+            addToCache(time, data);
+            return data;
+        }}
+
+        // Prefetch frames in the background
+        async function prefetchFrames(centerIndex) {{
+            // Cancel any pending prefetches
+            prefetchQueue = [];
+
+            // Determine which frames to prefetch
+            const framesToPrefetch = [];
+
+            // Prefetch ahead (higher priority)
+            for (let i = 1; i <= PREFETCH_AHEAD; i++) {{
+                const idx = centerIndex + i;
+                if (idx < availableTimes.length) {{
+                    const time = availableTimes[idx];
+                    if (!getFromCache(time)) {{
+                        framesToPrefetch.push({{ time, priority: 1 }});
+                    }}
+                }}
+            }}
+
+            // Prefetch behind (lower priority)
+            for (let i = 1; i <= PREFETCH_BEHIND; i++) {{
+                const idx = centerIndex - i;
+                if (idx >= 0) {{
+                    const time = availableTimes[idx];
+                    if (!getFromCache(time)) {{
+                        framesToPrefetch.push({{ time, priority: 2 }});
+                    }}
+                }}
+            }}
+
+            // Sort by priority and fetch
+            framesToPrefetch.sort((a, b) => a.priority - b.priority);
+            prefetchQueue = framesToPrefetch;
+
+            // Prefetch in background (don't await)
+            for (const item of framesToPrefetch) {{
+                try {{
+                    await fetchTimeData(item.time);
+                }} catch (error) {{
+                    console.warn(`Prefetch failed for time ${{item.time}}:`, error);
+                }}
+            }}
+        }}
+
         // Load and display data for a specific time step
         async function loadTime(index) {{
             if (index < 0 || index >= availableTimes.length) return;
@@ -418,12 +522,8 @@ def create_animated_html(dataset, time_steps, output_dir):
             document.getElementById('loading').style.display = 'inline';
 
             try {{
-                const jsonPath = `./${{dataDir}}/time_${{String(time).padStart(4, '0')}}.json`;
-                console.log('Attempting to load:', jsonPath);
-                const response = await fetch(jsonPath);
-                if (!response.ok) throw new Error(`HTTP error! status: ${{response.status}}`);
-
-                const data = await response.json();
+                // Fetch data (from cache or server)
+                const data = await fetchTimeData(time);
                 currentData = data;
 
                 // Create hover text
@@ -539,6 +639,9 @@ def create_animated_html(dataset, time_steps, output_dir):
                 document.getElementById('timeSlider').value = index;
                 document.getElementById('timeDisplay').textContent = `Time: ${{time}}`;
 
+                // Trigger prefetching of nearby frames (in background)
+                prefetchFrames(index);
+
             }} catch (error) {{
                 console.error('Error loading data:', error);
                 const msg = `Failed to load data for time ${{time}}: ${{error.message}}\\n\\n` +
@@ -614,6 +717,8 @@ def create_animated_html(dataset, time_steps, output_dir):
     logger.info(f"Animated HTML viewer saved successfully: {output_file}")
     logger.info(f"Data files location: {data_dir}")
     logger.info(f"Total files created: 1 HTML + {len(available_times)} JSON files + 1 metadata file")
+    logger.info(f"Features: Smart prefetching (5 ahead, 2 behind), LRU cache (20 frames max)")
+    logger.info(f"Usage: Start web server with 'python3 -m http.server 8000' in {output_dir}")
 
 
 def main():

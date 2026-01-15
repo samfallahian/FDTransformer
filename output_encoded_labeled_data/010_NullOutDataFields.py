@@ -1,8 +1,8 @@
 """
-Null Out Data Fields - Remove velocity columns and repackage with proper compression
+Null Out Data Fields - Remove latent columns and repackage with proper compression
 
 This script walks through all pickle files in the data directory and:
-1. Removes all data in columns vx_1, vy_1, vz_1 ... vx_125, vy_125, vz_125
+1. Removes all data in columns latent_1 through latent_47
 2. Validates that all requested columns are set to 0
 3. Re-packages the file with gzip compression and new naming convention (N.pkl.gz)
 """
@@ -19,7 +19,7 @@ from threading import Lock
 
 
 class NullOutDataFields:
-    """Process pickle files to null out velocity data fields"""
+    """Process pickle files to null out latent data fields"""
 
     def __init__(self, data_root: str, n_threads: int = 10):
         """
@@ -30,16 +30,13 @@ class NullOutDataFields:
             n_threads: Number of threads for parallel processing (default: 10)
         """
         self.data_root = Path(data_root)
-        self.velocity_columns = self._generate_velocity_columns()
+        self.latent_columns = self._generate_latent_columns()
         self.n_threads = n_threads
         self.print_lock = Lock()
 
-    def _generate_velocity_columns(self) -> List[str]:
-        """Generate list of velocity column names (vx_1 through vz_125)"""
-        columns = []
-        for i in range(1, 126):  # 1 to 125 inclusive
-            columns.extend([f'vx_{i}', f'vy_{i}', f'vz_{i}'])
-        return columns
+    def _generate_latent_columns(self) -> List[str]:
+        """Generate list of latent column names (latent_1 through latent_47)"""
+        return [f'latent_{i}' for i in range(1, 48)]  # 1 to 47 inclusive
 
     def load_pickle(self, file_path: Path) -> pd.DataFrame:
         """Load a pickle file (handles gzip compression)"""
@@ -51,29 +48,29 @@ class NullOutDataFields:
             with open(file_path, 'rb') as f:
                 return pickle.load(f)
 
-    def null_velocity_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+    def null_latent_columns(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Set all velocity columns to 0
+        Set all latent columns to 0
 
         Args:
             df: Input DataFrame
 
         Returns:
-            DataFrame with velocity columns set to 0
+            DataFrame with latent columns set to 0
         """
         df_copy = df.copy()
 
-        # Find which velocity columns exist in the dataframe
-        existing_vel_cols = [col for col in self.velocity_columns if col in df_copy.columns]
+        # Find which latent columns exist in the dataframe
+        existing_latent_cols = [col for col in self.latent_columns if col in df_copy.columns]
 
-        if existing_vel_cols:
-            df_copy[existing_vel_cols] = 0
+        if existing_latent_cols:
+            df_copy[existing_latent_cols] = 0
 
         return df_copy
 
     def validate_nulled_columns(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
         """
-        Validate that all velocity columns are set to 0
+        Validate that all latent columns are set to 0
 
         Args:
             df: DataFrame to validate
@@ -81,10 +78,10 @@ class NullOutDataFields:
         Returns:
             Tuple of (is_valid, list_of_non_zero_columns)
         """
-        existing_vel_cols = [col for col in self.velocity_columns if col in df.columns]
+        existing_latent_cols = [col for col in self.latent_columns if col in df.columns]
         non_zero_cols = []
 
-        for col in existing_vel_cols:
+        for col in existing_latent_cols:
             if not (df[col] == 0).all():
                 non_zero_cols.append(col)
 
@@ -98,7 +95,7 @@ class NullOutDataFields:
 
     def process_file(self, input_path: Path, output_path: Path) -> bool:
         """
-        Process a single file: load, null velocities, validate, save
+        Process a single file: load, null latents, validate, save
 
         Args:
             input_path: Path to input pickle file
@@ -111,8 +108,8 @@ class NullOutDataFields:
             # Load the file
             df = self.load_pickle(input_path)
 
-            # Null out velocity columns
-            df = self.null_velocity_columns(df)
+            # Null out latent columns
+            df = self.null_latent_columns(df)
 
             # Validate
             is_valid, non_zero_cols = self.validate_nulled_columns(df)
@@ -259,7 +256,7 @@ def main():
     """Main execution function"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Null out velocity data fields and repackage')
+    parser = argparse.ArgumentParser(description='Null out latent data fields and repackage')
     parser.add_argument('--data-root', type=str,
                        default='/Users/kkreth/PycharmProjects/data/all_data_ready_to_populate',
                        help='Root directory containing subdirectories with pkl files')

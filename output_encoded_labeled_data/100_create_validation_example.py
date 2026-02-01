@@ -59,6 +59,7 @@ class RoundtripValidator:
     def _load_wae_model(self):
         """
         Load the WAE model from the specified path.
+        Supports both new format (with embedded model) and legacy format (state dict only).
 
         Returns:
             Tuple of (model, device)
@@ -71,10 +72,7 @@ class RoundtripValidator:
                              "cpu")
         logger.info(f"Using device: {device}")
 
-        # Initialize the model
-        model = WAE().to(device)
-
-        # Load the model weights with compatibility for PyTorch 2.6+ "weights_only" changes
+        # Load checkpoint with compatibility for PyTorch 2.6+ "weights_only" changes
         checkpoint = None
         torch_version = getattr(torch, "__version__", "unknown")
         logger.info(f"PyTorch version detected: {torch_version}")
@@ -98,11 +96,30 @@ class RoundtripValidator:
                 logger.error(f"Failed to load checkpoint. Original: {e}; Fallback: {e2}")
                 raise
 
-        # Extract the model state dict
-        if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
+        # Check if checkpoint contains model metadata (new format with embedded model info)
+        if isinstance(checkpoint, dict) and all(k in checkpoint for k in ["model_class", "model_module", "model_config"]):
+            logger.info("Loading from new checkpoint format (embedded model metadata)")
+            logger.info(f"  Model class: {checkpoint['model_class']}")
+            logger.info(f"  Model module: {checkpoint['model_module']}")
+
+            # Dynamically import and instantiate the model
+            import importlib
+            module = importlib.import_module(checkpoint['model_module'])
+            model_class = getattr(module, checkpoint['model_class'])
+            model = model_class(**checkpoint['model_config']).to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+        elif isinstance(checkpoint, dict) and "model" in checkpoint:
+            logger.info("Loading from new checkpoint format (full embedded model)")
+            model = checkpoint["model"].to(device)
         else:
-            model.load_state_dict(checkpoint)
+            # Legacy format: instantiate model and load state dict
+            logger.info("Loading from legacy checkpoint format (state dict)")
+            model = WAE().to(device)
+
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["model_state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
 
         model.eval()
         return model, device
@@ -118,14 +135,41 @@ class RoundtripValidator:
 
         try:
             with gzip.open(file_path, 'rb') as f:
-                df = pickle.load(f)
-                logger.info(f"  Successfully loaded: {len(df)} rows, {len(df.columns)} columns")
-                return df
+                data = pickle.load(f)
         except (OSError, gzip.BadGzipFile):
             with open(file_path, 'rb') as f:
-                df = pickle.load(f)
-                logger.info(f"  Successfully loaded: {len(df)} rows, {len(df.columns)} columns")
-                return df
+                data = pickle.load(f)
+
+        # Convert to DataFrame if it's a dict
+        if isinstance(data, dict):
+            logger.info(f"  Loaded dict with keys: {list(data.keys())}")
+            # Check if it's a dict with 'dataframe' key (common format)
+            if 'dataframe' in data:
+                logger.info(f"  Extracting 'dataframe' key from dict")
+                df = data['dataframe']
+            else:
+                # Check if values are 2D arrays that need special handling
+                first_val = next(iter(data.values()))
+                if isinstance(first_val, np.ndarray) and first_val.ndim == 2:
+                    logger.info(f"  Dict contains 2D array with shape {first_val.shape}")
+                    # Create empty dict to hold 1D columns
+                    df_data = {}
+                    for key, arr in data.items():
+                        if arr.ndim == 2:
+                            # Split 2D array into separate columns
+                            for i in range(arr.shape[1]):
+                                df_data[f"{key}_{i}"] = arr[:, i]
+                        else:
+                            df_data[key] = arr
+                    df = pd.DataFrame(df_data)
+                else:
+                    logger.info(f"  Converting dict to DataFrame")
+                    df = pd.DataFrame(data)
+        else:
+            df = data
+
+        logger.info(f"  Successfully loaded: {len(df)} rows, {len(df.columns)} columns")
+        return df
 
     def create_roundtrip_velocities(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -251,7 +295,7 @@ def main():
                        default='/Users/kkreth/PycharmProjects/data/all_data_ready_to_populate/8p4/160.roundtrip.pkl.gz',
                        help='Path to output .roundtrip.pkl.gz file')
     parser.add_argument('--model-path', type=str,
-                       default='/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt',
+                       default='/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/Model_09_Residual_AE_epoch_500.pt',
                        help='Path to the WAE model file')
 
     args = parser.parse_args()

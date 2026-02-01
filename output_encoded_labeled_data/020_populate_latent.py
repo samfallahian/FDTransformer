@@ -30,8 +30,12 @@ parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
-# Import the WAE model
-from encoder.model_WAE_01 import WAE
+# Model imports - we'll dynamically load the correct one from checkpoint
+# Keep legacy import for backwards compatibility with old checkpoints
+try:
+    from encoder.model_WAE_01 import WAE
+except ImportError:
+    WAE = None
 
 # Configure logging
 logging.basicConfig(
@@ -59,6 +63,7 @@ class LatentPopulator:
         """
         self.data_root = Path(data_root)
         self.model_path = model_path
+        self.model_filename = Path(model_path).name
         self.n_threads = n_threads
         self.print_lock = Lock()
 
@@ -68,12 +73,16 @@ class LatentPopulator:
 
     def _load_wae_model(self):
         """
-        Load the WAE model from the specified path.
+        Load the model from the specified path with dynamic architecture detection.
+
+        Supports both:
+        1. New checkpoints with embedded model architecture info
+        2. Legacy checkpoints (assumes WAE architecture)
 
         Returns:
             Tuple of (model, device)
         """
-        logger.info(f"Loading WAE model from: {self.model_path}")
+        logger.info(f"Loading model from: {self.model_path}")
 
         # Determine device
         device = torch.device("cuda" if torch.cuda.is_available() else
@@ -81,10 +90,7 @@ class LatentPopulator:
                              "cpu")
         logger.info(f"Using device: {device}")
 
-        # Initialize the model
-        model = WAE().to(device)
-
-        # Load the model weights with compatibility for PyTorch 2.6+ "weights_only" changes
+        # Load checkpoint with compatibility for PyTorch 2.6+ "weights_only" changes
         checkpoint = None
         torch_version = getattr(torch, "__version__", "unknown")
         logger.info(f"PyTorch version detected: {torch_version}")
@@ -120,7 +126,55 @@ class LatentPopulator:
                 )
                 raise
 
-        # Extract the model state dict
+        # Dynamically instantiate the correct model architecture
+        if isinstance(checkpoint, dict) and 'model_class' in checkpoint and 'model_module' in checkpoint:
+            # NEW FORMAT: checkpoint contains architecture info
+            model_class_name = checkpoint['model_class']
+            model_module_name = checkpoint['model_module']
+            model_config = checkpoint.get('model_config', {})
+
+            logger.info(f"✓ Found model architecture info in checkpoint:")
+            logger.info(f"  Class: {model_class_name}")
+            logger.info(f"  Module: {model_module_name}")
+            logger.info(f"  Config: {model_config}")
+
+            # Dynamically import the model class
+            try:
+                # Import the module
+                import importlib
+                module = importlib.import_module(model_module_name)
+                model_class = getattr(module, model_class_name)
+
+                # Instantiate with config
+                model = model_class(**model_config)
+                logger.info(f"✓ Successfully instantiated {model_class_name}")
+
+            except Exception as e:
+                logger.error(f"Failed to dynamically load model class {model_class_name} from {model_module_name}: {e}")
+                raise RuntimeError(
+                    f"Could not load model architecture. The checkpoint specifies {model_class_name} "
+                    f"from module {model_module_name}, but it could not be imported. "
+                    f"Error: {e}"
+                )
+        else:
+            # LEGACY FORMAT: checkpoint doesn't have architecture info, assume WAE
+            logger.warning("⚠ Checkpoint does not contain model architecture info (legacy format)")
+            logger.warning("  Falling back to hardcoded WAE architecture")
+            logger.warning("  Future checkpoints should include 'model_class' and 'model_module' fields")
+
+            if WAE is None:
+                raise RuntimeError(
+                    "Legacy checkpoint detected but WAE class could not be imported. "
+                    "Please ensure encoder.model_WAE_01 is available or use a checkpoint "
+                    "that includes model architecture info."
+                )
+
+            model = WAE()
+            logger.info("✓ Using legacy WAE architecture")
+
+        model = model.to(device)
+
+        # Extract and load the model state dict
         if "model_state_dict" in checkpoint:
             model.load_state_dict(checkpoint["model_state_dict"])
         else:
@@ -129,17 +183,24 @@ class LatentPopulator:
         # Set to evaluation mode
         model.eval()
 
+        logger.info("✓ Model loaded successfully")
         return model, device
 
     def load_pickle(self, file_path: Path) -> pd.DataFrame:
-        """Load a pickle file (handles gzip compression)"""
+        """Load a pickle file (handles gzip compression and metadata)"""
         try:
             with gzip.open(file_path, 'rb') as f:
-                return pickle.load(f)
+                data = pickle.load(f)
         except (OSError, gzip.BadGzipFile):
             # Try without gzip if not compressed
             with open(file_path, 'rb') as f:
-                return pickle.load(f)
+                data = pickle.load(f)
+
+        # Handle both raw DataFrames and dict with metadata
+        if isinstance(data, dict) and 'dataframe' in data:
+            return data['dataframe']
+        else:
+            return data
 
     def extract_velocity_data(self, row: pd.Series) -> np.ndarray:
         """
@@ -287,9 +348,21 @@ class LatentPopulator:
         return is_valid, still_zero_cols
 
     def save_pickle_compressed(self, df: pd.DataFrame, output_path: Path):
-        """Save DataFrame as gzip-compressed pickle"""
+        """Save DataFrame as gzip-compressed pickle with metadata"""
+        from datetime import datetime
+
+        # Create data structure with metadata
+        data_with_metadata = {
+            'dataframe': df,
+            'metadata': {
+                'model_file': f"Created by running the model file {self.model_filename}",
+                'processing_date': datetime.now().isoformat(),
+                'latent_dimensions': 47
+            }
+        }
+
         with gzip.open(output_path, 'wb', compresslevel=9) as f:
-            pickle.dump(df, f)
+            pickle.dump(data_with_metadata, f)
 
     def process_file(self, input_path: Path, output_path: Path) -> bool:
         """
@@ -483,16 +556,16 @@ def main():
     """Main execution function"""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Populate latent data fields using WAE model')
+    parser = argparse.ArgumentParser(description='Populate latent data fields using an arbitrary model')
     parser.add_argument('--data-root', type=str,
                        default='/Users/kkreth/PycharmProjects/data/all_data_ready_to_populate',
                        help='Root directory containing subdirectories with pkl files')
     parser.add_argument('--model-path', type=str,
-                       default='/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/WAE_Cached_012_H200_FINAL.pt',
+                       default='/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/Model_09_Residual_AE_epoch_500.pt',
                        help='Path to the WAE model file')
     parser.add_argument('--subdir', type=str, default=None,
                        help='Process only this subdirectory (e.g., "3p6")')
-    parser.add_argument('--threads', type=int, default=2,
+    parser.add_argument('--threads', type=int, default=4,
                        help='Number of threads for parallel processing (default: 2)')
     parser.add_argument('--dry-run', action='store_true',
                        help='Report what would be done without actually processing')

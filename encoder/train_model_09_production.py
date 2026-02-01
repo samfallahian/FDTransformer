@@ -35,7 +35,7 @@ import wandb
 MODEL_NAME = "Model_09_Residual_AE"
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_LR = 1e-4
-DEFAULT_EPOCHS = 500
+DEFAULT_EPOCHS = 510
 
 # Logging
 logging.basicConfig(
@@ -247,6 +247,12 @@ def train_model(model, train_loader, val_loader, device, optimizer,
                     'train_rmse_history': train_rmse_history,
                     'val_rmse_history': val_rmse_history,
                     'best_val_rmse': best_val_rmse,
+                    # Save model architecture info for generic loading
+                    'model_class': type(model).__name__,
+                    'model_module': type(model).__module__,
+                    'model_config': {
+                        'dropout_rate': getattr(model, 'dropout_rate', 0.2) if hasattr(model, 'dropout_rate') else 0.2
+                    }
                 }, checkpoint_path)
 
                 # Only log saves every 5 epochs to reduce clutter
@@ -275,6 +281,12 @@ def train_model(model, train_loader, val_loader, device, optimizer,
                         'train_rmse_history': train_rmse_history,
                         'val_rmse_history': val_rmse_history,
                         'best_val_rmse': best_val_rmse,
+                        # Save model architecture info for generic loading
+                        'model_class': type(model).__name__,
+                        'model_module': type(model).__module__,
+                        'model_config': {
+                            'dropout_rate': getattr(model, 'dropout_rate', 0.2) if hasattr(model, 'dropout_rate') else 0.2
+                        }
                     }, best_path)
                     logger.info(f"  → New best model! Val RMSE: {val_rmse:.6f}")
                     if use_wandb:

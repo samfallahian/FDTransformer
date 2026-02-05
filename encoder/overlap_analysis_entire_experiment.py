@@ -48,10 +48,32 @@ GENERATE_SCRIPT = SCRIPT_DIR / "generate_decoded_velocity_analysis.py"
 ANALYSIS_SCRIPT = SCRIPT_DIR / "analysis_overlapping_velocities.py"
 MI_SCRIPT = SCRIPT_DIR / "analysis_overlapping_velocities_mutual_information.py"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO,
+# Configure logging - DEBUG mode for detailed progress
+logging.basicConfig(level=logging.DEBUG,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+# ANSI color codes for colorful device logging
+class Colors:
+    RED = '\033[91m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+    @staticmethod
+    def rainbow(text):
+        """Create rainbow effect for text"""
+        colors = [Colors.RED, Colors.YELLOW, Colors.GREEN, Colors.CYAN, Colors.BLUE, Colors.MAGENTA]
+        result = []
+        for i, char in enumerate(text):
+            result.append(f"{colors[i % len(colors)]}{char}")
+        return ''.join(result) + Colors.RESET
 
 # Initialize host preferences to get correct paths
 from Ordered_001_Initialize import HostPreferences  # noqa: E402
@@ -89,23 +111,56 @@ def run_step(script_path, dataset, time, step_name):
     try:
         cmd = [sys.executable, str(script_path), '--dataset', dataset, '--time', str(time)]
 
+        logger.debug(f"[Time {time}] Starting {step_name}: {script_path.name}")
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=900  # 10 minute timeout per step
+            timeout=900  # 15 minute timeout per step
         )
 
         if result.returncode != 0:
-            error_msg = f"Step failed with return code {result.returncode}\nSTDERR:\n{result.stderr}"
+            error_msg = f"Step failed with return code {result.returncode}\nSTDOUT:\n{result.stdout[-500:]}\nSTDERR:\n{result.stderr[-500:]}"
+            logger.error(f"[Time {time}] {step_name} FAILED: return code {result.returncode}")
             return (False, time, step_name, error_msg)
 
+        logger.debug(f"[Time {time}] Completed {step_name} successfully")
         return (True, time, step_name, None)
 
     except subprocess.TimeoutExpired:
-        return (False, time, step_name, "Timeout after 10 minutes")
+        logger.error(f"[Time {time}] {step_name} TIMEOUT after 15 minutes")
+        return (False, time, step_name, "Timeout after 15 minutes")
     except Exception as e:
+        logger.error(f"[Time {time}] {step_name} EXCEPTION: {e}")
         return (False, time, step_name, str(e))
+
+
+def check_output_file_exists(dataset, time, min_size_mb=2):
+    """
+    Check if output file already exists and is larger than min_size_mb.
+
+    Args:
+        dataset: Dataset name
+        time: Time step
+        min_size_mb: Minimum file size in MB (default: 2)
+
+    Returns:
+        bool: True if file exists and is large enough, False otherwise
+    """
+    # Check for the final output CSV file (this is created last in the pipeline)
+    output_file = FIGURE_OUTPUT_DIR / f"rmse_per_position_{dataset}_{time:04d}.csv"
+
+    if output_file.exists():
+        file_size_mb = output_file.stat().st_size / (1024 * 1024)
+        if file_size_mb >= min_size_mb:
+            logger.debug(f"[Time {time}] Output file already exists ({file_size_mb:.1f} MB >= {min_size_mb} MB): {output_file}")
+            return True
+        else:
+            logger.debug(f"[Time {time}] Output file exists but too small ({file_size_mb:.1f} MB < {min_size_mb} MB): {output_file}")
+            return False
+
+    return False
 
 
 def process_single_time(dataset, time):
@@ -120,6 +175,11 @@ def process_single_time(dataset, time):
         Tuple of (success: bool, time: int, errors: list)
     """
     errors = []
+
+    # Check if output already exists
+    if check_output_file_exists(dataset, time):
+        logger.info(f"[Time {time}] Skipping - output already exists and is complete")
+        return (True, time, errors)
 
     # Step 1: Generate decoded velocity data
     success, t, step, error = run_step(GENERATE_SCRIPT, dataset, time, "generate")
@@ -741,6 +801,49 @@ def main():
     args = parser.parse_args()
 
     time_steps = list(range(args.start, args.end + 1))
+
+    # Detect and display device with RAINBOW COLORS
+    try:
+        import torch
+        device_name = "CPU"
+        device_color = Colors.WHITE
+
+        if torch.backends.mps.is_available():
+            try:
+                device = torch.device("mps")
+                test_tensor = torch.randn(10).to(device)
+                device_name = "MPS (Apple Silicon GPU)"
+                device_color = Colors.MAGENTA
+                logger.debug("MPS device test passed")
+            except Exception as e:
+                logger.warning(f"MPS available but failed test: {e}, falling back to CUDA/CPU")
+                device = None
+        else:
+            device = None
+            logger.debug("MPS not available")
+
+        if device is None and torch.cuda.is_available():
+            device = torch.device("cuda")
+            device_name = f"CUDA (GPU {torch.cuda.get_device_name(0)})"
+            device_color = Colors.GREEN
+            logger.debug(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+        elif device is None:
+            device = torch.device("cpu")
+            device_name = "CPU (No GPU acceleration)"
+            device_color = Colors.RED
+            logger.debug("Falling back to CPU")
+
+        # Print device in RAINBOW COLORS
+        separator = Colors.rainbow("=" * 80)
+        device_line = f"{device_color}{Colors.BOLD}🚀 USING DEVICE: {device_name} 🚀{Colors.RESET}"
+
+        banner = f"\n{separator}\n{device_line}\n{separator}\n"
+        sys.stderr.write(banner)
+        sys.stderr.flush()
+
+        logger.info(f"Device: {device_name}")
+    except ImportError:
+        logger.warning("PyTorch not available, cannot detect device")
 
     logger.info(f"Starting overlap analysis for dataset '{args.dataset}'")
     logger.info(f"Time steps: {args.start} to {args.end} ({len(time_steps)} total)")

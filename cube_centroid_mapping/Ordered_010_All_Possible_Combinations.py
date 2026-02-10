@@ -64,7 +64,7 @@ def ensure_int_sorted(values: List[Any]) -> List[int]:
     return sorted(int(v) for v in values)
 
 
-def trim_edges(values: List[int], trim_each_side: int = 2) -> List[int]:
+def trim_edges(values: List[int], trim_each_side: int = 3) -> List[int]:
     """
     Drop first `trim_each_side` and last `trim_each_side` values from a sorted list.
     If the list is too short, return an empty list.
@@ -122,9 +122,9 @@ def build_dataframe(meta: Dict[str, Any]) -> pd.DataFrame:
     source, x_enum_raw, y_enum_raw, z_enum_raw = all_enums[0]
     logger.info(f"Processing single representative source: '{source}'")
 
-    x_enum = trim_edges(x_enum_raw, 2)
-    y_enum = trim_edges(y_enum_raw, 2)
-    z_enum = trim_edges(z_enum_raw, 2)
+    x_enum = trim_edges(x_enum_raw, 3)
+    y_enum = trim_edges(y_enum_raw, 3)
+    z_enum = trim_edges(z_enum_raw, 3)
 
     if not x_enum or not y_enum or not z_enum:
         logger.info(f"Skipping '{source}' due to insufficient interior points.")

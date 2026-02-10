@@ -1,6 +1,8 @@
 import socket
 import ast
 import logging
+import os
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -10,6 +12,13 @@ logger = logging.getLogger(__name__)
 
 class HostPreferences:
     def __init__(self, filename="experiment.preferences"):
+        # Resolve path relative to this file if it's not absolute and not in CWD
+        if not os.path.isabs(filename) and not os.path.exists(filename):
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            potential_path = os.path.join(base_dir, filename)
+            if os.path.exists(potential_path):
+                filename = potential_path
+
         self.filename = filename
         self.hostname = self.get_hostname()
         self.root_path = None
@@ -54,7 +63,6 @@ class HostPreferences:
             config = {k.lower(): v for k, v in config.items()}
 
             # Find matching configuration using regex
-            import re
             matched_key = None
             for host_pattern in config.keys():
                 if re.search(host_pattern, self.hostname):

@@ -1,0 +1,193 @@
+import os
+import pandas as pd
+import numpy as np
+import h5py
+import random
+import argparse
+from tqdm import tqdm
+import sys
+
+# Constants from issue description
+X_COORDS = [-50, -46, -42, -38, -34, -30, -26, -22, -18, -14, -10, -6, -2, 2, 6, 10, 14, 18, 22, 25, 29, 33, 37, 41, 45, 49]
+Z_COORDS = [-33, -29, -25, -21, -17, -13, -9, -5, -1, 3, 7, 11, 14, 18, 22, 26, 30, 34]
+Y_COORDS = [-83, -80, -76, -72, -68, -64, -60, -56, -52, -48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 0, 4, 8, 12, 16, 20, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87]
+LATENT_COLS = [f"latent_{i}" for i in range(1, 48)]
+NUM_X = len(X_COORDS)
+NUM_TIME = 8
+# Features: 47 (latent) + 3 (x,y,z) + 1 (rel_time) + 1 (param_val) = 52
+NUM_FEATURES = 47 + 3 + 1 + 1 
+
+INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/simplified_cubes_wLatent"
+OUTPUT_DIR = "/Users/kkreth/PycharmProjects/cgan/transformer"
+
+def parse_param(p_str):
+    """Convert directory name like '7p8' to float 7.8."""
+    return float(p_str.replace('p', '.'))
+
+def get_available_yz(param_set):
+    """Identify which (y, z) pairs from the allowed lists are present in the data."""
+    p_dir = os.path.join(INPUT_ROOT, param_set)
+    files = sorted([f for f in os.listdir(p_dir) if f.endswith('.pkl.gz')])
+    if not files:
+        return []
+    # Check a file in the middle to ensure good coverage
+    sample_file = os.path.join(p_dir, files[len(files)//2])
+    try:
+        df = pd.read_pickle(sample_file, compression='gzip')
+        yz = df[['y', 'z']].drop_duplicates()
+        valid = yz[yz['y'].isin(Y_COORDS) & yz['z'].isin(Z_COORDS)]
+        return valid.values.tolist()
+    except Exception as e:
+        print(f"Error reading {sample_file}: {e}")
+        return []
+
+def generate_sample_definitions(param_sets, n_total):
+    """Generate random (param_set, y, z, start_t) combinations."""
+    print(f"Gathering available coordinates for {len(param_sets)} parameter sets...")
+    ps_yz_map = {}
+    total_combinations = 0
+    for ps in param_sets:
+        valid_yz = get_available_yz(ps)
+        if valid_yz:
+            ps_yz_map[ps] = valid_yz
+            total_combinations += len(valid_yz) * 1192 # 1 to 1192
+    
+    if not ps_yz_map:
+        raise ValueError("No valid coordinates found in any parameter set.")
+
+    print(f"Found {len(ps_yz_map)} parameter sets with valid data.")
+    samples = []
+    # Sample proportionally or just uniformly across all possible? 
+    # Let's do uniform across all valid (ps, y, z, t) triples.
+    param_list = list(ps_yz_map.keys())
+    
+    for _ in range(n_total):
+        ps = random.choice(param_list)
+        y, z = random.choice(ps_yz_map[ps])
+        start_t = random.randint(1, 1192)
+        samples.append({'param_set': ps, 'y': y, 'z': z, 'start_t': start_t})
+    
+    return samples
+
+def process_and_save(samples, output_path):
+    """Extract data for samples and save to HDF5."""
+    n = len(samples)
+    samples_by_ps = {}
+    for i, s in enumerate(samples):
+        ps = s['param_set']
+        if ps not in samples_by_ps:
+            samples_by_ps[ps] = []
+        samples_by_ps[ps].append((i, s))
+    
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    with h5py.File(output_path, 'w') as f:
+        # Create dataset: (N, 8, 26, 52)
+        ds = f.create_dataset('data', (n, NUM_TIME, NUM_X, NUM_FEATURES), dtype='float32', chunks=(1, NUM_TIME, NUM_X, NUM_FEATURES))
+        
+        # Also store some metadata attributes
+        f.attrs['x_coords'] = X_COORDS
+        f.attrs['feature_description'] = "0-46: latent, 47: x, 48: y, 49: z, 50: relative_time, 51: parameter_value"
+
+        for ps in samples_by_ps:
+            ps_val = parse_param(ps)
+            ps_samples = samples_by_ps[ps]
+            # Sort by start_t to optimize file loading
+            ps_samples.sort(key=lambda x: x[1]['start_t'])
+            
+            print(f"\nProcessing parameter set {ps} ({len(ps_samples)} samples)...")
+            
+            current_window = {} # t -> dataframe
+            
+            for idx, s in tqdm(ps_samples):
+                start_t = s['start_t']
+                y_val = s['y']
+                z_val = s['z']
+                
+                needed_times = range(start_t, start_t + 8)
+                
+                # Cleanup window
+                for t in list(current_window.keys()):
+                    if t < start_t:
+                        del current_window[t]
+                
+                # Load new files
+                for t in needed_times:
+                    if t not in current_window:
+                        file_path = os.path.join(INPUT_ROOT, ps, f"{t:04d}.pkl.gz")
+                        if os.path.exists(file_path):
+                            try:
+                                df = pd.read_pickle(file_path, compression='gzip')
+                                # Pre-filter for X_COORDS to save memory and speed up grouping
+                                df = df[df['x'].isin(X_COORDS)]
+                                current_window[t] = df
+                            except:
+                                current_window[t] = None
+                        else:
+                            current_window[t] = None
+                
+                # Extract tensor for this sample
+                sample_tensor = np.zeros((NUM_TIME, NUM_X, NUM_FEATURES), dtype='float32')
+                for t_idx, t in enumerate(needed_times):
+                    df = current_window.get(t)
+                    if df is not None:
+                        # Filter rows
+                        mask = (df['y'] == y_val) & (df['z'] == z_val) & (df['x'].isin(X_COORDS))
+                        rows = df[mask]
+                        
+                        if not rows.empty:
+                            # Reindex to ensure order and presence of all X
+                            rows = rows.set_index('x').reindex(X_COORDS).reset_index()
+                            
+                            latents = rows[LATENT_COLS].values
+                            # Handle potential NaNs from reindex
+                            latents = np.nan_to_num(latents)
+                            
+                            xs = rows['x'].values.astype('float32')
+                            ys = np.full(NUM_X, y_val, dtype='float32')
+                            zs = np.full(NUM_X, z_val, dtype='float32')
+                            ts = np.full(NUM_X, t_idx, dtype='float32') # Relative time
+                            pv = np.full(NUM_X, ps_val, dtype='float32')
+                            
+                            combined = np.column_stack([latents, xs, ys, zs, ts, pv])
+                            sample_tensor[t_idx] = combined
+                
+                ds[idx] = sample_tensor
+
+def main():
+    parser = argparse.ArgumentParser(description="Prepare Transformer dataset from latent space cubes.")
+    parser.add_argument("--num_samples", type=int, default=1000000, help="Number of samples per file.")
+    parser.add_argument("--test_run", action="store_true", help="Run with very few samples for testing.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    args = parser.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    num_samples = 1000 if args.test_run else args.num_samples
+    
+    param_sets = sorted([d for d in os.listdir(INPUT_ROOT) if os.path.isdir(os.path.join(INPUT_ROOT, d))])
+    if not param_sets:
+        print(f"No parameter directories found in {INPUT_ROOT}")
+        return
+
+    print(f"Total samples requested per file: {num_samples}")
+    
+    # Generate definitions for Training and Validation
+    print("Generating training sample definitions...")
+    train_samples = generate_sample_definitions(param_sets, num_samples)
+    print("Generating validation sample definitions...")
+    val_samples = generate_sample_definitions(param_sets, num_samples)
+    
+    # Process Training
+    print("\n=== Processing Training Data ===")
+    process_and_save(train_samples, os.path.join(OUTPUT_DIR, "training_data.h5"))
+    
+    # Process Validation
+    print("\n=== Processing Validation Data ===")
+    process_and_save(val_samples, os.path.join(OUTPUT_DIR, "validation_data.h5"))
+
+    print("\nDone! Files created in", OUTPUT_DIR)
+
+if __name__ == "__main__":
+    main()

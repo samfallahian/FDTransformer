@@ -1,7 +1,7 @@
 import unittest
 import os
 import pandas as pd
-from Ordered_020_NetNewCleanFiles import CleanFilesProcessor
+from cube_centroid_mapping.Ordered_020_NetNewCleanFiles import CleanFilesProcessor
 
 
 class TestCleanFilesProcessor(unittest.TestCase):

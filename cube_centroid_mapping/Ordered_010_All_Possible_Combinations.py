@@ -1,5 +1,5 @@
 '''
-This script generates a comprehensive mapping of all interior centroids to their surrounding 5x5x5 
+This script generates a comprehensive mapping of all interior centroids to their surrounding 5x5x5
 coordinate neighborhoods. The output is a CSV file used for unit testing and spatial mapping.
 
 ### DECODING INSTRUCTIONS (LLM-READABLE)

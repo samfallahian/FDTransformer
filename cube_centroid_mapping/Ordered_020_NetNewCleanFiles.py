@@ -6,20 +6,15 @@ dtype...which we must maintain in order to have as clean/fast of a pipeline as p
 '''
 
 
-from Ordered_001_Initialize import HostPreferences
 import os
 import pandas as pd
 import TransformLatent
 from concurrent.futures import ThreadPoolExecutor
 
-class CleanFilesProcessor(HostPreferences):
-    def __init__(self, filename="experiment.preferences"):
-        super().__init__(filename)
-        if not hasattr(self, 'metadata_location'):
-            raise AttributeError(
-                "'metadata_location' is required but not set in the parent class (HostPreferences). Check your configuration.")
-        if self.metadata_location is None:
-            raise ValueError("'metadata_location' is set but contains None value. A valid path must be provided.")
+class CleanFilesProcessor:
+    def __init__(self):
+        self.raw_input = "/Users/kkreth/PycharmProjects/data/DL-PTV.backup"
+        self.output_directory = "/Users/kkreth/PycharmProjects/data/simplified_output"
         self.converter = TransformLatent.FloatConverter()
 
     def read_pickle_file(self, file_path):
@@ -75,7 +70,9 @@ class CleanFilesProcessor(HostPreferences):
             processed_df = self.process_dataframe(df)
             if processed_df is not None:
                 # Save the processed dataframe with compression
-                output_file = os.path.join(self.output_directory, os.path.basename(file_path))
+                base_name = os.path.basename(file_path)
+                experiment_name = os.path.splitext(base_name)[0]
+                output_file = os.path.join(self.output_directory, f"{experiment_name}.pkl.gz")
                 processed_df.to_pickle(output_file, compression='gzip')
                 return True
         return False
@@ -84,13 +81,6 @@ class CleanFilesProcessor(HostPreferences):
         print(f"\nPath Configuration:")
         print(f"Input: {self.raw_input}")
         print(f"Output: {self.output_directory}")
-        print(f"Metadata Location: {self.metadata_location}")
-
-        # Verify metadata location exists and is readable
-        if not os.path.exists(self.metadata_location):
-            raise FileNotFoundError(f"Metadata file not found: {self.metadata_location}")
-        if not os.access(self.metadata_location, os.R_OK):
-            raise PermissionError(f"Metadata file is not readable: {self.metadata_location}")
 
         # Ensure output directory exists and is writable
         try:

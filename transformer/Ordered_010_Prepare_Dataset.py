@@ -6,6 +6,7 @@ import random
 import argparse
 from tqdm import tqdm
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 # Constants from issue description
 X_COORDS = [-50, -46, -42, -38, -34, -30, -26, -22, -18, -14, -10, -6, -2, 2, 6, 10, 14, 18, 22, 25, 29, 33, 37, 41, 45, 49]
@@ -43,11 +44,18 @@ def get_available_yz(param_set):
 
 def generate_sample_definitions(param_sets, n_total):
     """Generate random (param_set, y, z, start_t) combinations."""
-    print(f"Gathering available coordinates for {len(param_sets)} parameter sets...")
     ps_yz_map = {}
+    
+    def get_yz(ps):
+        return ps, get_available_yz(ps)
+
+    with ThreadPoolExecutor() as executor:
+        results = list(tqdm(executor.map(get_yz, param_sets), 
+                            total=len(param_sets), 
+                            desc=f"Gathering coordinates for {len(param_sets)} parameter sets"))
+    
     total_combinations = 0
-    for ps in param_sets:
-        valid_yz = get_available_yz(ps)
+    for ps, valid_yz in results:
         if valid_yz:
             ps_yz_map[ps] = valid_yz
             total_combinations += len(valid_yz) * 1192 # 1 to 1192
@@ -89,70 +97,73 @@ def process_and_save(samples, output_path):
         f.attrs['x_coords'] = X_COORDS
         f.attrs['feature_description'] = "0-46: latent, 47: x, 48: y, 49: z, 50: relative_time, 51: parameter_value"
 
-        for ps in samples_by_ps:
-            ps_val = parse_param(ps)
-            ps_samples = samples_by_ps[ps]
-            # Sort by start_t to optimize file loading
-            ps_samples.sort(key=lambda x: x[1]['start_t'])
-            
-            print(f"\nProcessing parameter set {ps} ({len(ps_samples)} samples)...")
-            
-            current_window = {} # t -> dataframe
-            
-            for idx, s in tqdm(ps_samples):
-                start_t = s['start_t']
-                y_val = s['y']
-                z_val = s['z']
+        with tqdm(total=n, desc=f"Processing {os.path.basename(output_path)}") as pbar:
+            def process_ps(ps):
+                ps_val = parse_param(ps)
+                ps_samples = samples_by_ps[ps]
+                # Sort by start_t to optimize file loading
+                ps_samples.sort(key=lambda x: x[1]['start_t'])
                 
-                needed_times = range(start_t, start_t + 8)
+                current_window = {} # t -> dataframe
                 
-                # Cleanup window
-                for t in list(current_window.keys()):
-                    if t < start_t:
-                        del current_window[t]
-                
-                # Load new files
-                for t in needed_times:
-                    if t not in current_window:
-                        file_path = os.path.join(INPUT_ROOT, ps, f"{t:04d}.pkl.gz")
-                        if os.path.exists(file_path):
-                            try:
-                                df = pd.read_pickle(file_path, compression='gzip')
-                                # Pre-filter for X_COORDS to save memory and speed up grouping
-                                df = df[df['x'].isin(X_COORDS)]
-                                current_window[t] = df
-                            except:
+                for idx, s in ps_samples:
+                    start_t = s['start_t']
+                    y_val = s['y']
+                    z_val = s['z']
+                    
+                    needed_times = range(start_t, start_t + 8)
+                    
+                    # Cleanup window
+                    for t in list(current_window.keys()):
+                        if t < start_t:
+                            del current_window[t]
+                    
+                    # Load new files
+                    for t in needed_times:
+                        if t not in current_window:
+                            file_path = os.path.join(INPUT_ROOT, ps, f"{t:04d}.pkl.gz")
+                            if os.path.exists(file_path):
+                                try:
+                                    df = pd.read_pickle(file_path, compression='gzip')
+                                    # Pre-filter for X_COORDS to save memory and speed up grouping
+                                    df = df[df['x'].isin(X_COORDS)]
+                                    current_window[t] = df
+                                except:
+                                    current_window[t] = None
+                            else:
                                 current_window[t] = None
-                        else:
-                            current_window[t] = None
-                
-                # Extract tensor for this sample
-                sample_tensor = np.zeros((NUM_TIME, NUM_X, NUM_FEATURES), dtype='float32')
-                for t_idx, t in enumerate(needed_times):
-                    df = current_window.get(t)
-                    if df is not None:
-                        # Filter rows
-                        mask = (df['y'] == y_val) & (df['z'] == z_val) & (df['x'].isin(X_COORDS))
-                        rows = df[mask]
-                        
-                        if not rows.empty:
-                            # Reindex to ensure order and presence of all X
-                            rows = rows.set_index('x').reindex(X_COORDS).reset_index()
+                    
+                    # Extract tensor for this sample
+                    sample_tensor = np.zeros((NUM_TIME, NUM_X, NUM_FEATURES), dtype='float32')
+                    for t_idx, t in enumerate(needed_times):
+                        df = current_window.get(t)
+                        if df is not None:
+                            # Filter rows
+                            mask = (df['y'] == y_val) & (df['z'] == z_val)
+                            rows = df[mask]
                             
-                            latents = rows[LATENT_COLS].values
-                            # Handle potential NaNs from reindex
-                            latents = np.nan_to_num(latents)
-                            
-                            xs = rows['x'].values.astype('float32')
-                            ys = np.full(NUM_X, y_val, dtype='float32')
-                            zs = np.full(NUM_X, z_val, dtype='float32')
-                            ts = np.full(NUM_X, t_idx, dtype='float32') # Relative time
-                            pv = np.full(NUM_X, ps_val, dtype='float32')
-                            
-                            combined = np.column_stack([latents, xs, ys, zs, ts, pv])
-                            sample_tensor[t_idx] = combined
-                
-                ds[idx] = sample_tensor
+                            if not rows.empty:
+                                # Reindex to ensure order and presence of all X
+                                rows = rows.set_index('x').reindex(X_COORDS).reset_index()
+                                
+                                latents = rows[LATENT_COLS].values
+                                # Handle potential NaNs from reindex
+                                latents = np.nan_to_num(latents)
+                                
+                                xs = rows['x'].values.astype('float32')
+                                ys = np.full(NUM_X, y_val, dtype='float32')
+                                zs = np.full(NUM_X, z_val, dtype='float32')
+                                ts = np.full(NUM_X, t_idx, dtype='float32') # Relative time
+                                pv = np.full(NUM_X, ps_val, dtype='float32')
+                                
+                                combined = np.column_stack([latents, xs, ys, zs, ts, pv])
+                                sample_tensor[t_idx] = combined
+                    
+                    ds[idx] = sample_tensor
+                    pbar.update(1)
+
+            with ThreadPoolExecutor() as executor:
+                list(executor.map(process_ps, samples_by_ps.keys()))
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare Transformer dataset from latent space cubes.")

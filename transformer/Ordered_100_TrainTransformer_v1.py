@@ -32,13 +32,13 @@ class Config:
     BIAS = True
     
     # Training
-    BATCH_SIZE = 64
+    BATCH_SIZE = 256
     LEARNING_RATE = 3e-4
     EPOCHS = 100
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     
     # Fast experimentation
-    LIMIT_SAMPLES = None # Set to an integer (e.g. 10000) to shrink the dataset
+    LIMIT_SAMPLES = 100000 # Set to an integer (e.g. 10000) to shrink the dataset
     
     # Target positions for focused evaluation (Last 4, 8, 16 positions in the last time period)
     TARGET_POSITIONS = list(range(SEQ_LEN - 4, SEQ_LEN)) 
@@ -83,7 +83,7 @@ def train():
     2. Predict the first spatial point of the next time step (when at the end of a time row).
     
     We track:
-    - overall_loss: MSE across all 207 prediction steps.
+    - overall_loss: MSE averaged across all 207 prediction steps and all 47 latent features.
     - target_pos_loss: MSE specifically for the last 4 positions of the last time step.
     - time_step_losses: MSE broken down by which time step the target belongs to.
     """
@@ -127,14 +127,66 @@ def train():
     val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=0)
     
     model = OrderedTransformerV1(Config).to(Config.DEVICE)
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
     criterion = nn.MSELoss()
     
     best_val_loss = float('inf')
+    start_epoch = 0
     
-    for epoch in range(Config.EPOCHS):
+    # --- Load Checkpoint ---
+    model_save_dir = os.path.dirname(os.path.abspath(__file__))
+    model_save_path = os.path.join(model_save_dir, "best_ordered_transformer_v1.pt")
+    if os.path.exists(model_save_path):
+        print(f"Loading existing checkpoint from: {model_save_path}")
+        try:
+            # Use weights_only=False to allow loading the full dictionary and embedded model object
+            checkpoint = torch.load(model_save_path, map_location=Config.DEVICE, weights_only=False)
+            
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+                start_epoch = checkpoint.get('epoch', 0)
+                print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch} (Best Val Loss: {best_val_loss:.6f})")
+            else:
+                # Fallback for legacy state_dict only files
+                model.load_state_dict(checkpoint)
+                print("Legacy state_dict loaded successfully.")
+        except Exception as e:
+            print(f"Warning: Could not load checkpoint: {e}")
+    else:
+        print("No existing checkpoint found. Starting from scratch.")
+    
+    # Track previous losses for coloring (Epoch level trend)
+    prev_val_loss = None
+    prev_target_loss = None
+    prev_target2_loss = None
+    prev_target3_loss = None
+    
+    # Helper for coloring based on trend
+    def get_colored_str(val, prev_val, fmt=".6f"):
+        val_str = f"{val:{fmt}}"
+        if prev_val is None:
+            return val_str
+        # Green if improved (lower), Red if worse or same
+        color = "\033[32m" if val < prev_val else "\033[31m"
+        return f"{color}{val_str}\033[0m"
+
+    # Pre-calculate indices for batch-level target loss calculation
+    eval_indices_1 = [p - 1 for p in Config.TARGET_POSITIONS]
+    eval_indices_2 = [p - 1 for p in Config.TARGET_POSITIONS_2]
+    eval_indices_3 = [p - 1 for p in Config.TARGET_POSITIONS_3]
+
+    for epoch in range(start_epoch, Config.EPOCHS):
         model.train()
         total_loss = 0
+        
+        # Track previous losses for batch-level trend coloring
+        last_batch_l4 = None
+        last_batch_l8 = None
+        last_batch_l16 = None
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.EPOCHS}")
         for batch in pbar:
@@ -153,7 +205,21 @@ def train():
             optimizer.step()
             
             total_loss += loss.item()
-            pbar.set_postfix(loss=loss.item())
+            
+            # Calculate target losses for the current batch to show in progress bar
+            with torch.no_grad():
+                l4 = criterion(outputs[:, eval_indices_1, :], targets[:, eval_indices_1, :]).item()
+                l8 = criterion(outputs[:, eval_indices_2, :], targets[:, eval_indices_2, :]).item()
+                l16 = criterion(outputs[:, eval_indices_3, :], targets[:, eval_indices_3, :]).item()
+            
+            pbar.set_postfix({
+                'AvgAll': f"{loss.item():.5f}",
+                'L4': get_colored_str(l4, last_batch_l4, ".5f"),
+                'L8': get_colored_str(l8, last_batch_l8, ".5f"),
+                'L16': get_colored_str(l16, last_batch_l16, ".5f")
+            })
+            
+            last_batch_l4, last_batch_l8, last_batch_l16 = l4, l8, l16
             
         avg_train_loss = total_loss / len(train_loader)
         
@@ -239,16 +305,35 @@ def train():
             
         wandb.log(log_dict)
         
-        print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-        print(f"  Target Losses -> Last4: {avg_target_loss:.6f}, Last8: {avg_target2_loss:.6f}, Last16: {avg_target3_loss:.6f}")
+        print(f"Epoch {epoch+1}: Avg Train (All): {avg_train_loss:.6f}, Avg Val (All): {get_colored_str(avg_val_loss, prev_val_loss)}")
+        print(f"  Target Losses -> Last4: {get_colored_str(avg_target_loss, prev_target_loss)}, "
+              f"Last8: {get_colored_str(avg_target2_loss, prev_target2_loss)}, "
+              f"Last16: {get_colored_str(avg_target3_loss, prev_target3_loss)}")
         
+        # Update previous values for next epoch trend comparison
+        prev_val_loss = avg_val_loss
+        prev_target_loss = avg_target_loss
+        prev_target2_loss = avg_target2_loss
+        prev_target3_loss = avg_target3_loss
+
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             model_save_dir = os.path.dirname(os.path.abspath(__file__))
             model_save_path = os.path.join(model_save_dir, "best_ordered_transformer_v1.pt")
-            torch.save(model.state_dict(), model_save_path)
+            
+            # Create a comprehensive checkpoint (The "Standard" format)
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+                'config': {k: v for k, v in Config.__dict__.items() if not k.startswith("__") and not callable(v)},
+                'model': model # Embedding the model object itself for maximum compatibility
+            }
+            
+            torch.save(checkpoint, model_save_path)
             wandb.save(model_save_path) # Also save model weights to wandb
-            print(f"Saved best model to {model_save_path}")
+            print(f"Saved best model checkpoint to {model_save_path}")
 
     wandb.finish()
 

@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D # Required for 3d projection
 
 # Add project root to sys.path to allow imports from other modules
 PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
@@ -233,7 +234,9 @@ def main():
                     stats_data.append({
                         'param': params[i],
                         'pos_idx': j,
-                        'sq_error': sq_errors[i, j]
+                        'sq_error': sq_errors[i, j],
+                        'y': coords_t8[i, j, 1].item(),
+                        'z': coords_t8[i, j, 2].item()
                     })
             
             # Detailed reporting for first few samples
@@ -327,6 +330,54 @@ def main():
     plt.tight_layout()
     plt.savefig('rmse_per_experiment.png')
     print(f"Saved: {Colors.CYAN}rmse_per_experiment.png{Colors.RESET}")
+
+    # 4. RMSE vs Y/Z Coordinate space (Heatmap-style Scatter)
+    plt.figure(figsize=(10, 8))
+    # Aggregate by Y, Z
+    yz_stats = df.groupby(['y', 'z'])['sq_error'].mean().apply(np.sqrt).reset_index()
+    yz_stats.columns = ['y', 'z', 'rmse']
+    
+    sc = plt.scatter(yz_stats['y'], yz_stats['z'], c=yz_stats['rmse'], cmap='viridis', s=50, alpha=0.8)
+    plt.colorbar(sc, label='RMSE')
+    plt.title('RMSE Distribution in Y-Z Coordinate Space')
+    plt.xlabel('Y Coordinate')
+    plt.ylabel('Z Coordinate')
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.savefig('rmse_yz_space.png')
+    print(f"Saved: {Colors.CYAN}rmse_yz_space.png{Colors.RESET}")
+
+    # 5. 3D Error Density/Surface Plot
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # Using the aggregated Y, Z stats
+    # We'll use a scatter3D but could also try to interpolate for a surface
+    img = ax.scatter3D(yz_stats['y'], yz_stats['z'], yz_stats['rmse'], 
+                       c=yz_stats['rmse'], cmap='magma', s=60)
+    
+    ax.set_title('3D Error Magnitude across Y-Z Space')
+    ax.set_xlabel('Y Coordinate')
+    ax.set_ylabel('Z Coordinate')
+    ax.set_zlabel('RMSE')
+    fig.colorbar(img, ax=ax, label='RMSE', shrink=0.5, aspect=10)
+    
+    # Add a "shadow" on the floor for better depth perception
+    ax.scatter3D(yz_stats['y'], yz_stats['z'], np.zeros_like(yz_stats['rmse']), 
+                 c='gray', alpha=0.1, s=10)
+    
+    plt.savefig('rmse_3d_density.png')
+    print(f"Saved: {Colors.CYAN}rmse_3d_density.png{Colors.RESET}")
+
+    # 6. Creative Plot: Hexbin Error Density
+    plt.figure(figsize=(10, 8))
+    # We use all raw points for hexbin to show "density" of error samples if they overlap
+    hb = plt.hexbin(df['y'], df['z'], C=df['sq_error'].apply(np.sqrt), gridsize=25, cmap='magma', reduce_C_function=np.mean)
+    cb = plt.colorbar(hb, label='Mean RMSE')
+    plt.title('Hexbin RMSE Density Map (Y-Z Plane)')
+    plt.xlabel('Y Coordinate')
+    plt.ylabel('Z Coordinate')
+    plt.savefig('rmse_yz_hexbin.png')
+    print(f"Saved: {Colors.CYAN}rmse_yz_hexbin.png{Colors.RESET}")
 
     # --- Final Report ---
     print(f"\n{Colors.BOLD}SUMMARY STATISTICS{Colors.RESET}")

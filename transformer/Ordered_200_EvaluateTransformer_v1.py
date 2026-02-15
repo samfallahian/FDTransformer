@@ -5,6 +5,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
 # Add project root to sys.path to allow imports from other modules
 PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
@@ -177,12 +178,9 @@ def main():
     
     # Evaluation Loop
     total_samples_processed = 0
-    all_gt_velocities = []
-    all_pred_velocities = []
-    
-    # For detailed reporting, we'll pick the first few samples
     detailed_reports = []
     NUM_DETAILED = 3
+    stats_data = []
 
     with torch.no_grad():
         for batch_idx, (batch, originals_batch) in enumerate(tqdm(loader, desc="Evaluating Transformer")):
@@ -190,20 +188,11 @@ def main():
             originals_batch = originals_batch.to(Config.DEVICE) # (B, 26, 3)
             B = batch.shape[0]
             
-            # 1. Transformer Prediction (One-step ahead for all positions)
-            # Input: tokens 0 to 206
-            # Output: predicts latents for tokens 1 to 207
+            # 1. Transformer Prediction
             inputs = batch[:, :-1, :]
-            targets = batch[:, 1:, :Config.LATENT_DIM]
-            
             outputs = transformer(inputs) # (B, 207, Config.LATENT_DIM)
             
             # 2. Extract 8th time step predictions
-            # 8th time step in original batch: indices 182 to 207 (26 points)
-            # In 'outputs' tensor (indices 0 to 206), these correspond to:
-            # Target 182 is output index 181
-            # ...
-            # Target 207 is output index 206
             t8_target_indices = range(182, 208)
             t8_output_indices = [i-1 for i in t8_target_indices]
             
@@ -212,34 +201,47 @@ def main():
             
             # Metadata for 8th time step
             coords_t8 = batch[:, t8_target_indices, 47:50] # (B, 26, 3)
-            rel_time_t8 = batch[:, t8_target_indices, 50] # (B, 26)
             param_t8 = batch[:, t8_target_indices, 51] # (B, 26)
             
             # 3. Decode Latents to Velocities
-            # Flatten to (B*26, 47) for AE
             pred_latents_flat = pred_latents_t8.reshape(-1, Config.LATENT_DIM)
             gt_latents_flat = gt_latents_t8.reshape(-1, Config.LATENT_DIM)
             
             pred_velocities_full = ae.decode(pred_latents_flat) # (B*26, 375)
             gt_velocities_full = ae.decode(gt_latents_flat) # (B*26, 375)
             
-            # Reshape to (B, 26, 125, 3)
-            pred_v_triplets = pred_velocities_full.reshape(B, 26, 125, 3)
-            gt_v_triplets = gt_velocities_full.reshape(B, 26, 125, 3)
+            # Reshape and extract 63rd triplet (Central Velocity)
+            pred_v_63 = pred_velocities_full.reshape(B, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
+            gt_v_63 = gt_velocities_full.reshape(B, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
             
-            # 4. Extract 63rd triplet (Central Velocity)
-            pred_v_63 = pred_v_triplets[:, :, Config.TRIPLET_IDX, :] # (B, 26, 3)
-            gt_v_63 = gt_v_triplets[:, :, Config.TRIPLET_IDX, :] # (B, 26, 3)
+            # 4. Denormalize for statistics
+            pred_v_63_np = pred_v_63.cpu().numpy()
+            pred_denorm_v = converter.unconvert(pred_v_63_np.reshape(-1, 3)).reshape(B, 26, 3)
             
-            # Accumulate for overall metrics
-            # (In a real script you might want to save to CSV or calculate MSE here)
+            if dataset.has_originals:
+                gt_denorm_v = originals_batch.cpu().numpy()
+            else:
+                gt_v_63_np = gt_v_63.cpu().numpy()
+                gt_denorm_v = converter.unconvert(gt_v_63_np.reshape(-1, 3)).reshape(B, 26, 3)
+                
+            # Calculate squared errors
+            sq_errors = np.sum((gt_denorm_v - pred_denorm_v)**2, axis=2) # (B, 26)
+            params = param_t8[:, 0].cpu().numpy() # (B,)
+            
+            for i in range(B):
+                for j in range(26):
+                    stats_data.append({
+                        'param': params[i],
+                        'pos_idx': j,
+                        'sq_error': sq_errors[i, j]
+                    })
             
             # Detailed reporting for first few samples
             if batch_idx == 0:
                 for i in range(min(B, NUM_DETAILED)):
                     sample_report = {
                         'sample_idx': i,
-                        'param': param_t8[i, 0].item(),
+                        'param': params[i],
                         'y': coords_t8[i, 0, 1].item(),
                         'z': coords_t8[i, 0, 2].item(),
                         'positions': []
@@ -256,55 +258,106 @@ def main():
                             'idx': original_pos_idx,
                             'x': coords_t8[i, j, 0].item(),
                             'label': target_label,
-                            'orig_v': originals_batch[i, j].cpu().numpy() if dataset.has_originals else None,
+                            'orig_v': gt_denorm_v[i, j],
                             'gt_v': gt_v_63[i, j].cpu().numpy(),
-                            'pred_v': pred_v_63[i, j].cpu().numpy()
+                            'pred_v': pred_v_63[i, j].cpu().numpy(),
+                            'pred_denorm': pred_denorm_v[i, j]
                         })
                     detailed_reports.append(sample_report)
 
             total_samples_processed += B
 
-    # --- Final Report ---
-    print(f"\n{Colors.BOLD}REPORTING ON DE-ENCODED VELOCITIES (8th Time Step, 63rd Triplet){Colors.RESET}")
-    print("-" * 180)
+    # --- Statistics Calculation ---
+    print(f"\n{Colors.BOLD}CALCULATING SUMMARY STATISTICS...{Colors.RESET}")
+    df = pd.DataFrame(stats_data)
     
-    # Answer the user's question about time
-    print(f"{Colors.YELLOW}Note on Actual Time:{Colors.RESET}")
-    print("The validation HDF5 dataset only contains RELATIVE time (0-7).")
-    print("Actual (absolute) timestamps were not preserved in the training/validation cubes.\n")
+    # RMSE per experiment
+    rmse_per_param = df.groupby('param')['sq_error'].mean().apply(np.sqrt)
+    
+    # RMSE per position
+    rmse_per_pos = df.groupby('pos_idx')['sq_error'].mean().apply(np.sqrt)
+    
+    # RMSE for prediction windows
+    # j ranges from 0 (idx 182) to 25 (idx 207)
+    # L4: indices 204-207 -> j: 22-25
+    # L8: indices 200-207 -> j: 18-25
+    # L16: indices 192-207 -> j: 10-25
+    rmse_l4 = np.sqrt(df[df['pos_idx'] >= 22]['sq_error'].mean())
+    rmse_l8 = np.sqrt(df[df['pos_idx'] >= 18]['sq_error'].mean())
+    rmse_l16 = np.sqrt(df[df['pos_idx'] >= 10]['sq_error'].mean())
+    rmse_overall = np.sqrt(df['sq_error'].mean())
 
+    # --- Figures ---
+    print(f"{Colors.BOLD}GENERATING FIGURES...{Colors.RESET}")
+    
+    # 1. RMSE vs Position
+    plt.figure(figsize=(10, 6))
+    plt.plot(rmse_per_pos.index, rmse_per_pos.values, marker='o', linestyle='-', color='b')
+    plt.axvspan(22, 25, alpha=0.2, color='red', label='L4 Window')
+    plt.axvspan(18, 25, alpha=0.1, color='orange', label='L8 Window')
+    plt.axvspan(10, 25, alpha=0.05, color='yellow', label='L16 Window')
+    plt.title('RMSE per Position in T8')
+    plt.xlabel('Position Index (0-25)')
+    plt.ylabel('RMSE (Velocity Units)')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    plt.legend()
+    plt.savefig('rmse_per_position.png')
+    print(f"Saved: {Colors.CYAN}rmse_per_position.png{Colors.RESET}")
+    
+    # 2. RMSE per Window
+    plt.figure(figsize=(8, 6))
+    windows = ['L4 (Last 4)', 'L8 (Last 8)', 'L16 (Last 16)', 'Overall T8']
+    vals = [rmse_l4, rmse_l8, rmse_l16, rmse_overall]
+    colors = ['red', 'orange', 'gold', 'green']
+    plt.bar(windows, vals, color=colors)
+    plt.title('RMSE per Prediction Window')
+    plt.ylabel('RMSE (Velocity Units)')
+    for i, v in enumerate(vals):
+        plt.text(i, v + (max(vals)*0.01), f"{v:.4f}", ha='center', fontweight='bold')
+    plt.savefig('rmse_per_window.png')
+    print(f"Saved: {Colors.CYAN}rmse_per_window.png{Colors.RESET}")
+    
+    # 3. RMSE per Experiment
+    plt.figure(figsize=(12, 6))
+    rmse_per_param.plot(kind='bar', color='skyblue')
+    plt.title('RMSE per Experiment (Param)')
+    plt.ylabel('RMSE (Velocity Units)')
+    plt.xlabel('Experiment Param')
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.savefig('rmse_per_experiment.png')
+    print(f"Saved: {Colors.CYAN}rmse_per_experiment.png{Colors.RESET}")
+
+    # --- Final Report ---
+    print(f"\n{Colors.BOLD}SUMMARY STATISTICS{Colors.RESET}")
+    print("-" * 50)
+    print(f"Overall RMSE:       {Colors.GREEN}{rmse_overall:.6f}{Colors.RESET}")
+    print(f"RMSE (Last 4):      {Colors.YELLOW}{rmse_l4:.6f}{Colors.RESET}")
+    print(f"RMSE (Last 8):      {Colors.YELLOW}{rmse_l8:.6f}{Colors.RESET}")
+    print(f"RMSE (Last 16):     {Colors.YELLOW}{rmse_l16:.6f}{Colors.RESET}")
+    print("-" * 50)
+    print(f"RMSE per Experiment (First 10 Params):\n{rmse_per_param.head(10)}")
+    print("-" * 50)
+
+    print(f"\n{Colors.BOLD}DETAILED SAMPLES (First {NUM_DETAILED}){Colors.RESET}")
     for report in detailed_reports:
-        print(f"{Colors.MAGENTA}Sample {report['sample_idx']} | Param: {report['param']:.2f} | Y: {report['y']} | Z: {report['z']}{Colors.RESET}")
-        header = f"{'Pos':<4} | {'X':<6} | {'Label':<6} | {'Originals (vx, vy, vz)':<30} | {'Auto-encoder Truth (vx, vy, vz)':<32} | {'Predicted (vx, vy, vz)':<30} | {'Predicted de-Normalized (vx, vy, vz)':<38} | {'Error'}"
+        print(f"{Colors.MAGENTA}Sample {report['sample_idx']} | Param: {report['param']:.2f} | Y: {report['y']:.4f} | Z: {report['z']:.4f}{Colors.RESET}")
+        header = f"{'Pos':<4} | {'X':<6} | {'Label':<6} | {'Truth (vx, vy, vz)':<30} | {'Predicted (vx, vy, vz)':<30} | {'Error'}"
         print(header)
         print("-" * len(header))
         
         for pos in report['positions']:
-            gt = pos['gt_v']
-            pred = pos['pred_v']
-            orig = pos['orig_v']
-            pred_denorm = converter.unconvert(pred)
-            if orig is not None:
-                # Calculate absolute error between Predicted de-Normalized and Originals
-                err = np.linalg.norm(orig - pred_denorm)
-                err_str = f"{err:.6f}"
-            else:
-                err_str = "N/A"
+            gt = pos['orig_v']
+            pred_denorm = pos['pred_denorm']
+            err = np.linalg.norm(gt - pred_denorm)
             
-            orig_str = f"({orig[0]:.4f}, {orig[1]:.4f}, {orig[2]:.4f})" if orig is not None else "N/A"
             gt_str = f"({gt[0]:.4f}, {gt[1]:.4f}, {gt[2]:.4f})"
-            pred_str = f"({pred[0]:.4f}, {pred[1]:.4f}, {pred[2]:.4f})"
             pred_denorm_str = f"({pred_denorm[0]:.4f}, {pred_denorm[1]:.4f}, {pred_denorm[2]:.4f})"
             
-            # Highlight target rows (L4) in Bold, non-CYAN columns will inherit this
-            row_style = Colors.BOLD if "L4" in pos['label'] else ""
+            row_style = Colors.BOLD if "L" in pos['label'] else ""
+            err_col = f"{Colors.CYAN}{err:.6f}{Colors.RESET}"
             
-            # Specifically color the requested columns CYAN
-            orig_col = f"{Colors.CYAN}{orig_str:<30}{Colors.RESET}{row_style}"
-            pred_denorm_col = f"{Colors.CYAN}{pred_denorm_str:<38}{Colors.RESET}{row_style}"
-            err_col = f"{Colors.CYAN}{err_str}{Colors.RESET}"
-            
-            print(f"{row_style}{pos['idx']:<4} | {pos['x']:<6.1f} | {pos['label']:<6} | {orig_col} | {gt_str:<32} | {pred_str:<30} | {pred_denorm_col} | {err_col}{Colors.RESET}")
+            print(f"{row_style}{pos['idx']-182:<4} | {pos['x']:<6.1f} | {pos['label']:<6} | {gt_str:<30} | {pred_denorm_str:<30} | {err_col}{Colors.RESET}")
         print()
 
     print(f"{Colors.GREEN}Evaluation complete!{Colors.RESET}")

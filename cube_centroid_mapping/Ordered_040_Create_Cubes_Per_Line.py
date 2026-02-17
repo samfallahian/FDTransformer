@@ -1,3 +1,36 @@
+"""
+Ordered_040_Create_Cubes_Per_Line.py
+
+This script constructs "velocity cubes" for each centroid row in the filtered simulation data.
+It maps each centroid to its 124 neighbors (pre-computed in a mapping CSV) and retrieves
+their corresponding velocity components (vx, vy, vz) from the same time step.
+
+Flow:
+    [ Filtered Time-Step Data (.pkl.gz) ]      [ Neighbor Mapping (CSV) ]
+                   |                                     |
+                   |                                     v
+                   |                         1. Load centroid-to-neighbor 
+                   |                            coordinate mapping.
+                   |                                     |
+                   v                                     |
+    2. Parallel Process Files <--------------------------+
+       For each file (one time-step):
+         a. Build fast lookup dictionaries for vx, vy, vz.
+         b. For each centroid row:
+            - Identify its 124 neighbors' (x,y,z).
+            - Retrieve their velocities (default 0.0 if missing).
+         c. Flatten these into 375 velocity columns (125 points * 3 components).
+         d. Concatenate with original metadata.
+                   |
+                   v
+    [ Output: simplified_cubes/{input_file_path}.pkl.gz ]
+
+Main Components:
+- init_worker(): Loads the large mapping file once per worker process.
+- process_file_task(): Performs the coordinate-to-velocity lookup and cube formation.
+- main(): Manages the parallel execution using ProcessPoolExecutor.
+"""
+
 import os
 import pandas as pd
 import numpy as np

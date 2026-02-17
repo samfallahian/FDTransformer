@@ -1,3 +1,36 @@
+"""
+Ordered_030_RowFilter_TimeSeperate.py
+
+This script filters large simulation data files based on a set of specific 
+coordinate triplets (centroids and their neighbors) and then reorganizes 
+the filtered data into time-separated files.
+
+Flow:
+    [ Input Data (.pkl.gz) ]          [ Filter Coordinates (CSV) ]
+               |                                 |
+               |                                 v
+               |                    1. Load unique (x,y,z) triplets
+               |                       into a fast-lookup set.
+               |                                 |
+               v                                 |
+    2. Parallel Process Files <------------------+
+       For each file:
+         a. Read DataFrame
+         b. Filter rows matching any (x,y,z) triplet found in the 
+            filter CSV (includes both centroids and all neighbors).
+         c. Group by 'time' (1-1200)
+         d. Save each time-step to its own .pkl.gz
+               |
+               v
+    [ Output: output_parent_dir/{input_file_name}/{time_0000}.pkl.gz ]
+
+Main Components:
+- load_filter(): Extracts all unique (x,y,z) triplets from the filter CSV,
+  spanning both centroid and neighbor columns, to create a comprehensive lookup set.
+- process_file(): Handles the reading, filtering, and time-splitting for a single file.
+- run(): Orchestrates the parallel execution across all files in the input directory.
+"""
+
 import os
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +44,10 @@ class RowFilterTimeSeperate:
         self.centroids = None
 
     def load_filter(self):
-        """Load all unique x,y,z coordinate combinations from CSV into a set for fast lookup."""
+        """
+        Load all unique x,y,z coordinate combinations from the filter CSV into a set.
+        This includes the primary centroid columns AND all neighbor coordinate columns.
+        """
         print(f"Loading filter from {self.filter_csv_path}...")
         try:
             df_filter = pd.read_csv(self.filter_csv_path)

@@ -1,3 +1,34 @@
+"""
+Ordered_050_Add_Latent_Space.py
+
+This script enhances the velocity cubes by adding a latent space representation.
+It passes the 375-dimensional velocity vectors through a pre-trained Residual 
+Autoencoder to generate 47 latent dimensions for each row.
+
+Flow:
+    [ Velocity Cubes (.pkl.gz) ]           [ Pre-trained ResidualAE (.pt) ]
+                |                                        |
+                |                                        v
+                |                          1. Load model architecture
+                |                             and weights.
+                |                                        |
+                v                                        |
+    2. Process Files (Sequential) <----------------------+
+       For each file:
+         a. Extract 375 velocity columns.
+         b. Batch process through Model Encoder (using GPU/MPS if avail).
+         c. Generate 47 latent features.
+         d. Append latent columns to original DataFrame.
+                |
+                v
+    [ Output: simplified_cubes_wLatent/{input_file_path}.pkl.gz ]
+
+Main Components:
+- accelerator_report(): Detects and reports available hardware (CUDA/MPS).
+- process_file(): Handles batch encoding and concatenation for a single file.
+- main(): Orchestrates model loading and file iteration.
+"""
+
 import os
 import sys
 import pandas as pd

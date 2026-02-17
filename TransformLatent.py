@@ -10,8 +10,8 @@ import pandas as pd
 
 class FloatConverter:
     def __init__(self):
-        self.min_value = -1.9800
-        self.max_value = 2.6400
+        self.min_value = -0.197745 #-1.9800
+        self.max_value = 0.263599 #2.6400
         self.scale = 1.0 / (self.max_value - self.min_value)
         self.shift = -self.min_value * self.scale
 
@@ -22,8 +22,8 @@ class FloatConverter:
         elif isinstance(value, np.ndarray):
             # Array of float values
             return value * self.scale + self.shift
-        elif isinstance(value, pd.DataFrame):
-            # DataFrame of float values
+        elif isinstance(value, (pd.DataFrame, pd.Series)):
+            # DataFrame or Series of float values
             return value * self.scale + self.shift
         else:
             raise TypeError(f"Unsupported input type: {type(value)}, value: {value}")
@@ -35,8 +35,8 @@ class FloatConverter:
         elif isinstance(value, np.ndarray):
             # Array of float values
             return (value - self.shift) / self.scale
-        elif isinstance(value, pd.DataFrame):
-            # DataFrame of float values
+        elif isinstance(value, (pd.DataFrame, pd.Series)):
+            # DataFrame or Series of float values
             return (value - self.shift) / self.scale
         else:
             raise TypeError(f"Unsupported input type: {type(value)}, value: {value}")

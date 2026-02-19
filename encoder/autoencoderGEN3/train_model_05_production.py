@@ -47,7 +47,7 @@ from Ordered_001_Initialize import HostPreferences
 
 # Configuration
 MODEL_IDX = 4  # Model 5 (AttentionSE)
-DEFAULT_BATCH_SIZE = 128
+DEFAULT_BATCH_SIZE = 4096
 DEFAULT_LR = 1e-4
 DEFAULT_EPOCHS = 1000
 DATA_PERCENTAGE = 100

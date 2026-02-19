@@ -21,10 +21,9 @@ import time
 import pickle
 import numpy as np
 
-# Resolve project root to import local modules
-# The script is in cgan/, so parent is the project root containing cgan/
+# The script is in og_data_prep/, so parent is the project root
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = SCRIPT_DIR  # This script is already in the cgan directory
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
@@ -43,19 +42,24 @@ class AutoEncoderDatasetBuilder:
     """
     def __init__(self,
                  preferences_path: str = None,
-                 train_rows: int = 1_000_000,
-                 val_rows: int = 1_000_000,
+                 train_rows: int = 2_000_000,
+                 val_rows: int = 2_000_000,
+                 source_root: str = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data",
+                 dest_root: str = "/Users/kkreth/PycharmProjects/data",
                  seed: int | None = 42,
                  num_workers: int = 10,
                  cache_size: int = 50,
                  row_floor: int = 20,
                  enable_manifest_cache: bool = True,
-                 enable_profiling: bool = False):
+                 enable_profiling: bool = False,
+                 show_progress: bool = True,
+                 min_file_age_seconds: int = 900,
+                 allowed_extensions: list[str] = ('.pkl.gz',)):
         self.project_root = PROJECT_ROOT
         
         # Resolve preferences path: use provided path, or look in script's directory
         if preferences_path is None:
-            self.preferences_path = os.path.join(SCRIPT_DIR, "experiment.preferences")
+            self.preferences_path = os.path.join(SCRIPT_DIR, "../experiment.preferences")
         else:
             self.preferences_path = preferences_path
             
@@ -67,12 +71,15 @@ class AutoEncoderDatasetBuilder:
         self.row_floor = row_floor
         self.enable_manifest_cache = enable_manifest_cache
         self.enable_profiling = enable_profiling
+        self.show_progress = show_progress
+        self.min_file_age_seconds = min_file_age_seconds
+        self.allowed_extensions = list(allowed_extensions)
 
         self.preferences = HostPreferences(filename=self.preferences_path)
         # Source directory for sampling
-        self.source_root = getattr(self.preferences, 'training_data_path', None) or self.preferences.root_path
+        self.source_root = source_root
         # Destination directory for the new datasets
-        self.dest_root = self.preferences.root_path
+        self.dest_root = dest_root
 
         # Adopt logging level from preferences when available
         lvl = getattr(logging, str(self.preferences.logging_level).upper(), None) if hasattr(self.preferences, 'logging_level') else None
@@ -91,7 +98,10 @@ class AutoEncoderDatasetBuilder:
             shuffle=True,
             seed=self.seed,
             enable_manifest_cache=self.enable_manifest_cache,
-            enable_profiling=self.enable_profiling
+            enable_profiling=self.enable_profiling,
+            show_progress=self.show_progress,
+            min_file_age_seconds=self.min_file_age_seconds,
+            allowed_extensions=self.allowed_extensions
         )
         t1 = time.perf_counter()
         logger.info(f"EfficientDataLoader ready in {t1 - t0:.2f}s (workers={self.num_workers}, cache_size={self.cache_size})")
@@ -147,10 +157,16 @@ def main(argv=None):
         description="Create non-IO-bound train/validation datasets for AE training.")
     parser.add_argument('--preferences', type=str, default=None,
                         help='Path to experiment.preferences (defaults to script directory).')
-    parser.add_argument('--train_rows', type=int, default=1_000_000,
+    parser.add_argument('--train_rows', type=int, default=2_000_000,
                         help='Number of rows for training split.')
-    parser.add_argument('--val_rows', type=int, default=1_000_000,
+    parser.add_argument('--val_rows', type=int, default=2_000_000,
                         help='Number of rows for validation split.')
+    parser.add_argument('--source_root', type=str,
+                        default="/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data",
+                        help='Source directory for sampling (overrides preferences).')
+    parser.add_argument('--dest_root', type=str,
+                        default="/Users/kkreth/PycharmProjects/data",
+                        help='Destination directory for datasets (overrides preferences).')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility (pass to EfficientDataLoader).')
     parser.add_argument('--workers', type=int, default=10,
@@ -161,19 +177,34 @@ def main(argv=None):
                         help='Minimum rows to draw from any single file during sampling.')
     parser.add_argument('--no_manifest_cache', action='store_true',
                         help='Disable manifest on-disk cache for loader.')
+    parser.add_argument('--no_progress', action='store_true',
+                        help='Disable tqdm progress bars.')
+    parser.add_argument('--min_age_min', type=int, default=15,
+                        help='Only use files at least this many minutes old (default: 15).')
+    parser.add_argument('--include_pkl', action='store_true',
+                        help='Also include .pkl files (default is only .pkl.gz).')
 
     args = parser.parse_args(argv)
+
+    extensions = ['.pkl.gz']
+    if args.include_pkl:
+        extensions.append('.pkl')
 
     builder = AutoEncoderDatasetBuilder(
         preferences_path=args.preferences,
         train_rows=args.train_rows,
         val_rows=args.val_rows,
+        source_root=args.source_root,
+        dest_root=args.dest_root,
         seed=args.seed,
         num_workers=args.workers,
         cache_size=args.cache_size,
         row_floor=args.row_floor,
         enable_manifest_cache=not args.no_manifest_cache,
         enable_profiling=False,
+        show_progress=not args.no_progress,
+        min_file_age_seconds=args.min_age_min * 60,
+        allowed_extensions=extensions,
     )
     builder.build()
 

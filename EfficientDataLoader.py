@@ -4,7 +4,7 @@ import random
 import numpy as np
 from typing import List, Iterator, Dict, Any, Union, Tuple
 import glob
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import gzip
 import re
@@ -12,6 +12,7 @@ import time
 from collections import Counter
 import hashlib
 from threading import RLock
+from tqdm import tqdm
 
 
 # ANSI color codes
@@ -23,9 +24,10 @@ class Colors:
 class EfficientDataLoader:
     """
     A memory-efficient dataloader for sampling rows from multiple pickle files.
-    Optimized for handling velocity data with columns named in the pattern:
-    vx_1, vy_1, vz_1, ..., vx_125, vy_125, vz_125 (total 375 columns).
-    Supports both regular and compressed (gzipped) pickle files.
+    Optimized for handling velocity data with columns named in the patterns:
+    1. vx_1, vy_1, vz_1, ..., vx_125, vy_125, vz_125 (total 375 columns)
+    2. velocity_PREFIX_x, velocity_PREFIX_y, velocity_PREFIX_z (total 375 columns)
+    Supports both regular and compressed (gzipped) pickle files (.pkl or .pkl.gz).
     """
     
     def __init__(
@@ -39,19 +41,24 @@ class EfficientDataLoader:
         pin_memory: bool = False,
         enable_manifest_cache: bool = True,
         cache_filename: str = ".efficient_dataloader_cache.pkl",
-        enable_profiling: bool = True
-
+        enable_profiling: bool = True,
+        show_progress: bool = True,
+        min_file_age_seconds: int = 0,
+        allowed_extensions: List[str] = ['.pkl', '.pkl.gz']
     ):
         """
         Initialize the dataloader.
         
         Args:
-            root_directory: Root directory to recursively search for .pkl files
+            root_directory: Root directory to recursively search for .pkl and .pkl.gz files
             batch_size: Number of rows to sample in each batch
             num_workers: Number of parallel workers for file operations
             cache_size: Maximum number of files to keep in memory cache
             shuffle: Whether to shuffle the batches
             seed: Random seed for reproducibility
+            show_progress: Whether to show tqdm progress bars
+            min_file_age_seconds: Minimum age of files in seconds to be included
+            allowed_extensions: List of file extensions to search for
         """
         self.root_directory = root_directory
         self.batch_size = batch_size
@@ -62,6 +69,9 @@ class EfficientDataLoader:
         self.enable_manifest_cache = enable_manifest_cache
         self.cache_path = os.path.join(self.root_directory, cache_filename)
         self.enable_profiling = enable_profiling
+        self.show_progress = show_progress
+        self.min_file_age_seconds = min_file_age_seconds
+        self.allowed_extensions = allowed_extensions
         self.profiling: Dict[str, Any] = {"timings": {}, "notes": {}, "counters": {}}
         # Thread-safety for in-memory cache
         self.cache_lock = RLock()
@@ -111,7 +121,10 @@ class EfficientDataLoader:
             self.all_files = [item["path"] for item in manifest]
             t_end_list = time.perf_counter()
             if not self.all_files:
-                raise ValueError(f"No .pkl files found in {root_directory} or its subdirectories")
+                msg = f"No files with extensions {self.allowed_extensions} found in {root_directory} or its subdirectories"
+                if self.min_file_age_seconds > 0:
+                    msg += f" that are at least {self.min_file_age_seconds} seconds old"
+                raise ValueError(msg)
             if self.enable_profiling:
                 self.profiling["timings"]["list_files_seconds"] = t_end_list - t_start_list
             
@@ -146,16 +159,27 @@ class EfficientDataLoader:
                 raise ValueError("Cache loaded but missing required entries 'file_metadata' or 'all_files'.")
     
     def _find_all_pkl_files(self) -> List[str]:
-        """Find all .pkl files in the root directory and subdirectories."""
-        return glob.glob(os.path.join(self.root_directory, "**/*.pkl"), recursive=True)
+        """Find all files with allowed extensions in the root directory and subdirectories."""
+        all_found = []
+        for ext in self.allowed_extensions:
+            pattern = os.path.join(self.root_directory, f"**/*{ext}")
+            all_found.extend(glob.glob(pattern, recursive=True))
+        
+        # Use set to ensure uniqueness if any overlap occurs (e.g. .pkl and .pkl.gz)
+        return list(set(all_found))
 
     def _build_directory_manifest(self) -> List[Dict[str, Any]]:
-        """Build a manifest of .pkl files with lightweight attributes for change detection."""
+        """Build a manifest of .pkl and .pkl.gz files with lightweight attributes for change detection."""
         files = self._find_all_pkl_files()
         manifest: List[Dict[str, Any]] = []
+        now = time.time()
         for p in files:
             try:
                 st = os.stat(p)
+                # Filter by age if specified
+                if self.min_file_age_seconds > 0:
+                    if now - st.st_mtime < self.min_file_age_seconds:
+                        continue
                 manifest.append({
                     "path": p,
                     "size": st.st_size,
@@ -231,29 +255,60 @@ class EfficientDataLoader:
     
     def _get_ordered_velocity_columns(self, df) -> List[str]:
         """
-        Get velocity columns in the correct order: vx_1, vy_1, vz_1, ..., vx_125, vy_125, vz_125
+        Get velocity columns in the correct order.
+        Supports two naming conventions:
+        1. New: velocity_PREFIX_x, velocity_PREFIX_y, velocity_PREFIX_z
+        2. Old: vx_N, vy_N, vz_N
         Returns an empty list if the required columns are not present.
         """
-        # Check if we have velocity columns
-        velocity_pattern = re.compile(r'v[xyz]_\d+')
-        velocity_cols = [col for col in df.columns if velocity_pattern.match(col)]
+        # 1. Try New pattern first: velocity_..._x/y/z
+        new_pattern = re.compile(r'^velocity_(.*)_([xyz])$')
+        new_cols_dict = {}  # {prefix: {component: col_name}}
+        ordered_prefixes = []
         
-        if not velocity_cols:
+        for col in df.columns:
+            match = new_pattern.match(col)
+            if match:
+                prefix, component = match.group(1), match.group(2)
+                if prefix not in new_cols_dict:
+                    new_cols_dict[prefix] = {}
+                    ordered_prefixes.append(prefix)
+                new_cols_dict[prefix][component] = col
+        
+        if len(ordered_prefixes) == 125:
+            ordered_columns = []
+            valid = True
+            for prefix in ordered_prefixes:
+                cols = new_cols_dict[prefix]
+                if 'x' in cols and 'y' in cols and 'z' in cols:
+                    # Add in x, y, z order
+                    ordered_columns.extend([cols['x'], cols['y'], cols['z']])
+                else:
+                    valid = False
+                    break
+            
+            if valid and len(ordered_columns) == self.total_velocity_values:
+                return ordered_columns
+
+        # 2. Fallback to Old pattern: vx_N, vy_N, vz_N
+        old_pattern = re.compile(r'^v([xyz])_(\d+)$')
+        old_cols = [col for col in df.columns if old_pattern.match(col)]
+        
+        if not old_cols:
             return []
         
         # Extract unique indices from column names
         indices = set()
-        for col in velocity_cols:
+        for col in old_cols:
             match = re.search(r'_(\d+)$', col)
             if match:
                 indices.add(int(match.group(1)))
         
-        # Check if we have the expected number of points (125)
         if len(indices) != 125:
             print(f"Warning: Found {len(indices)} unique points instead of expected 125")
         
         # Sort indices numerically
-        sorted_indices = sorted(indices)
+        sorted_indices = sorted(list(indices))
         
         # Create the properly ordered column list
         ordered_columns = []
@@ -264,17 +319,14 @@ class EfficientDataLoader:
                 if col_name in df.columns:
                     ordered_columns.append(col_name)
                 else:
-                    # This column is missing, which is unexpected
-                    print(f"Warning: Expected column {col_name} not found in dataframe")
-                    # Use placeholder or return empty to indicate issue
+                    # Missing column
                     return []
         
         # Ensure we have exactly 375 velocity values
-        if len(ordered_columns) != self.total_velocity_values:
-            print(f"Warning: Found {len(ordered_columns)} velocity columns instead of expected {self.total_velocity_values}")
-            return []
+        if len(ordered_columns) == self.total_velocity_values:
+            return ordered_columns
             
-        return ordered_columns
+        return []
     
     def _compute_file_metadata(self) -> List[Dict[str, Any]]:
         """Pre-compute metadata about each file (row count, etc.) for efficient sampling."""
@@ -305,7 +357,15 @@ class EfficientDataLoader:
         
         # Process metadata in parallel
         with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
-            results = list(executor.map(process_file, self.all_files))
+            if self.show_progress:
+                results = list(tqdm(
+                    executor.map(process_file, self.all_files),
+                    total=len(self.all_files),
+                    desc="Computing file metadata",
+                    unit="file"
+                ))
+            else:
+                results = list(executor.map(process_file, self.all_files))
         
         # Filter out any failures
         metadata = [m for m in results if m is not None]
@@ -460,7 +520,12 @@ class EfficientDataLoader:
                         self.file_metadata[file_idx],
                         num_rows
                     ))
-                for fut in futures:
+                
+                iterator = as_completed(futures)
+                if self.show_progress:
+                    iterator = tqdm(iterator, total=len(futures), desc="Sampling from files", unit="file", leave=False)
+                
+                for fut in iterator:
                     velocity_data, file_path = fut.result()
                     all_velocity_data.append(velocity_data)
                     source_files.extend([file_path] * len(velocity_data))
@@ -521,7 +586,7 @@ def format_file_path(file_path):
 
 # Example usage:
 if __name__ == "__main__":
-    # Define the root directory containing .pkl files
+    # Define the root directory containing .pkl and .pkl.gz files
     root_dir = "/Users/kkreth/PycharmProjects/data/all_data_broken_down_1200_each_directory_PARTIAL"
     
     # Create the dataloader
@@ -536,7 +601,7 @@ if __name__ == "__main__":
     initialization_time = time.time() - start_time
     
     print(f"Dataloader initialization took {initialization_time:.3f} seconds")
-    print(f"Found {len(dataloader.all_files)} .pkl files in the directory")
+    print(f"Found {len(dataloader.all_files)} .pkl or .pkl.gz files in the directory")
     print(f"Found {len(dataloader.file_metadata)} valid files with complete velocity data")
     
     # Print compression statistics

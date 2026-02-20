@@ -34,6 +34,8 @@ import torch
 import time
 import argparse
 from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 
 # Add the root directory to the path for import resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -85,9 +87,62 @@ def accelerator_report():
 
     return device
 
-def process_file(input_path, output_path, model, device, batch_size=4096):
-    """Process a single file, computing latent space for each row in batches."""
+# Global model and device for workers
+_worker_model = None
+_worker_device = None
+
+def worker_init(model_index, model_path):
+    """Initialize the model in the worker process once."""
+    global _worker_model, _worker_device
+    
+    # Detect device
+    has_cuda = torch.cuda.is_available()
+    mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
+
+    if has_cuda:
+        _worker_device = torch.device('cuda')
+    elif mps_avail:
+        _worker_device = torch.device('mps')
+    else:
+        _worker_device = torch.device('cpu')
+
+    # Load the Model GEN3 05 (AttentionSE)
+    _worker_model = get_model_by_index(model_index)
+    
+    # Load weights
     try:
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            _worker_model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            _worker_model.load_state_dict(checkpoint)
+    except Exception as e:
+        # We'll handle this in the process_file if needed, but it's better to fail early
+        print(f"Failed to load model weights in worker: {e}")
+        _worker_model = None
+        return
+
+    _worker_model.to(_worker_device)
+    _worker_model.eval()
+
+def process_file(input_path, output_path, batch_size=4096):
+    """Process a single file, computing latent space for each row in batches."""
+    global _worker_model, _worker_device
+    
+    if _worker_model is None:
+        return f"Error in {os.path.basename(input_path)}: Model not initialized in worker."
+
+    try:
+        # 1. Restart logic: Check if output already exists and has a reasonable size.
+        # Original files are ~35MB, processed are ~40MB.
+        # If output exists and is > 10MB, let's assume it's good (unless we want to be stricter).
+        if os.path.exists(output_path):
+            out_size = os.path.getsize(output_path)
+            in_size = os.path.getsize(input_path)
+            # If output is at least 90% of input size, skip it.
+            if out_size > (in_size * 0.9) and out_size > 1024 * 1024:
+                return True
+
         df = pd.read_pickle(input_path, compression='gzip')
         if df.empty:
             return True
@@ -113,10 +168,10 @@ def process_file(input_path, output_path, model, device, batch_size=4096):
         with torch.no_grad():
             for i in range(0, len(data_np), batch_size):
                 batch = data_np[i : i + batch_size]
-                batch_tensor = torch.from_numpy(batch).to(device)
+                batch_tensor = torch.from_numpy(batch).to(_worker_device)
                 
                 # Model's encode method returns the latent representation
-                latent_batch = model.encode(batch_tensor)
+                latent_batch = _worker_model.encode(batch_tensor)
                 latent_outputs.append(latent_batch.cpu().numpy())
         
         latent_all = np.concatenate(latent_outputs, axis=0)
@@ -145,11 +200,12 @@ def process_file(input_path, output_path, model, device, batch_size=4096):
 def main():
     parser = argparse.ArgumentParser(description="Precompute latent space for cubed OG data.")
     parser.add_argument("--first_only", action="store_true", help="Only process the first file and exit.")
-    parser.add_argument("--batch_size", type=int, default=4096, help="Number of rows to process at once in the model.")
+    parser.add_argument("--batch_size", type=int, default=409600, help="Number of rows to process at once in the model.")
     parser.add_argument("--input_file", type=str, help="Process a specific input file.")
+    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers.")
     args = parser.parse_args()
 
-    # Hardware acceleration check with colorful banner
+    # Hardware acceleration check with colorful banner (Main process only)
     device = accelerator_report()
 
     # Paths
@@ -167,25 +223,7 @@ def main():
             print(f"Model still not found at {model_path}")
             return
 
-    # Load the Model GEN3 05 (AttentionSE)
-    print(f"Loading model architecture (Model GEN3 05)...")
-    model = get_model_by_index(4) # 4 is Model_GEN3_05_AttentionSE
-    
-    # Load weights
-    print(f"Loading weights from {model_path}...")
-    try:
-        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
-        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
-    except Exception as e:
-        print(f"Failed to load model weights: {e}")
-        return
-
-    model.to(device)
-    model.eval()
-
+    # Prepare list of files
     if args.input_file:
         if not os.path.exists(args.input_file):
             print(f"Input file not found: {args.input_file}")
@@ -209,18 +247,10 @@ def main():
         files_to_process = files_to_process[:1]
         print("Flag --first_only is set. Processing 1 file.")
 
-    print(f"Starting processing of {len(files_to_process)} file(s)...")
-    
-    start_time = time.time()
-    results_count = 0
-    errors = []
-    
-    # Process files
-    for input_file in tqdm(files_to_process, desc="Progress"):
+    # Prepare job list
+    jobs = []
+    for input_file in files_to_process:
         if args.input_file:
-            # If a specific file is given, we might need to figure out its relative path to input_root
-            # to determine output location, or just put it in output_root.
-            # Let's try to be smart if it's within input_root.
             if input_file.startswith(input_root):
                 rel_path = os.path.relpath(input_file, input_root)
             else:
@@ -229,12 +259,30 @@ def main():
             rel_path = os.path.relpath(input_file, input_root)
             
         output_file = os.path.join(output_root, rel_path)
+        jobs.append((input_file, output_file, args.batch_size))
+
+    print(f"Starting processing of {len(files_to_process)} file(s) with {args.workers} workers...")
+    
+    start_time = time.time()
+    results_count = 0
+    errors = []
+    
+    # Process files in parallel
+    with ProcessPoolExecutor(
+        max_workers=args.workers, 
+        mp_context=mp.get_context('spawn'),
+        initializer=worker_init,
+        initargs=(4, model_path) # 4 is Model_GEN3_05_AttentionSE
+    ) as executor:
         
-        res = process_file(input_file, output_file, model, device, args.batch_size)
-        if res is True:
-            results_count += 1
-        else:
-            errors.append(res)
+        futures = {executor.submit(process_file, *job): job for job in jobs}
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Progress"):
+            res = future.result()
+            if res is True:
+                results_count += 1
+            else:
+                errors.append(res)
             
     elapsed = time.time() - start_time
     print(f"\nCompleted {results_count} files in {elapsed:.2f} seconds.")

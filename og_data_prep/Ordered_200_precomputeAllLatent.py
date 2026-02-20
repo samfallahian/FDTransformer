@@ -189,9 +189,9 @@ def process_file(input_path, output_path, batch_size=4096):
         df = df.drop(columns=[c for c in df.columns if c.startswith('latent_')], errors='ignore')
         final_df = pd.concat([df, latent_df], axis=1)
         
-        # Save to net-new file with pkl.gz compression
+        # Save to net-new file with pkl.gz compression (Level 1 for speed)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        final_df.to_pickle(output_path, compression='gzip')
+        final_df.to_pickle(output_path, compression={'method': 'gzip', 'compresslevel': 1})
         
         return True
     except Exception as e:
@@ -200,7 +200,7 @@ def process_file(input_path, output_path, batch_size=4096):
 def main():
     parser = argparse.ArgumentParser(description="Precompute latent space for cubed OG data.")
     parser.add_argument("--first_only", action="store_true", help="Only process the first file and exit.")
-    parser.add_argument("--batch_size", type=int, default=409600, help="Number of rows to process at once in the model.")
+    parser.add_argument("--batch_size", type=int, default=40000, help="Number of rows to process at once in the model.")
     parser.add_argument("--input_file", type=str, help="Process a specific input file.")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers.")
     args = parser.parse_args()

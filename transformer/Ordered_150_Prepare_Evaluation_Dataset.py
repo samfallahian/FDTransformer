@@ -1,3 +1,18 @@
+"""
+This script prepares an evaluation dataset for the Transformer model by creating an HDF5 file 
+containing random samples of 8-timestep windows. Each sample consists of a (y, z) coordinate line 
+across all 26 X coordinates.
+
+For each point in the window, it stores 52 features:
+- 47 latent variables
+- x, y, z coordinates
+- Relative time (0-7)
+- Parameter value
+
+Additionally, it saves the original velocities (vx, vy, vz) for the 8th timestep (t_idx=7) 
+as ground truth for evaluation. The sampling process is designed to align with the 
+validation data from Ordered_010_Prepare_Dataset.py.
+"""
 import os
 import pandas as pd
 import numpy as np
@@ -6,21 +21,21 @@ import random
 import argparse
 from tqdm import tqdm
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # Constants - same as Ordered_010_Prepare_Dataset.py
-X_COORDS = [-50, -46, -42, -38, -34, -30, -26, -22, -18, -14, -10, -6, -2, 2, 6, 10, 14, 18, 22, 25, 29, 33, 37, 41, 45, 49]
-Y_COORDS = [-83, -80, -76, -72, -68, -64, -60, -56, -52, -48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 0, 4, 8, 12, 16, 20, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87]
-Z_COORDS = [-33, -29, -25, -21, -17, -13, -9, -5, -1, 3, 7, 11, 14, 18, 22, 26, 30, 34]
+X_COORDS = [ -49, -45, -41, -37, -33, -29, -26, -22, -18, -14, -10, -6, -2, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49]
+Z_COORDS = [-21, -17, -13, -9, -5, -1, 2, 6, 10, 14, 18, 22]
+Y_COORDS = [-71, -67, -63, -59, -55, -51, -47, -43, -39, -35, -31, -28, -24, -20, -16, -12, -8, -4, 0, 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75]
+
 LATENT_COLS = [f"latent_{i}" for i in range(1, 48)]
 NUM_X = len(X_COORDS)
 NUM_TIME = 8
 # Features: 47 (latent) + 3 (x,y,z) + 1 (rel_time) + 1 (param_val) = 52
 NUM_FEATURES = 47 + 3 + 1 + 1 
 
-INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/simplified_cubes_wLatent"
-OUTPUT_H5 = "/Users/kkreth/PycharmProjects/data/evaluation_data.h5"
+INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
+OUTPUT_H5 = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
 
 def parse_param(p_str):
     """Convert directory name like '7p8' to float 7.8."""
@@ -29,8 +44,6 @@ def parse_param(p_str):
 def get_available_yz(param_set):
     """Identify which (y, z) pairs from the allowed lists are present in the data."""
     p_dir = os.path.join(INPUT_ROOT, param_set)
-    if not os.path.exists(p_dir):
-        return []
     files = sorted([f for f in os.listdir(p_dir) if f.endswith('.pkl.gz')])
     if not files:
         return []
@@ -100,8 +113,6 @@ def process_and_save(samples, output_path):
         f.attrs['feature_description'] = "0-46: latent, 47: x, 48: y, 49: z, 50: relative_time, 51: parameter_value"
         f.attrs['originals_description'] = "Original vx, vy, vz for the 8th timestep (t_idx=7)"
 
-        write_lock = threading.Lock()
-
         with tqdm(total=n, desc=f"Processing {os.path.basename(output_path)}") as pbar:
             def process_ps(ps):
                 ps_val = parse_param(ps)
@@ -168,13 +179,12 @@ def process_and_save(samples, output_path):
 
                                 # Capture original velocities for the 8th timestep
                                 if t_idx == 7:
-                                    orig_v = rows[['vx_original', 'vy_original', 'vz_original']].values.astype('float32')
+                                    orig_v = rows[['original_vx', 'original_vy', 'original_vz']].values.astype('float32')
                                     original_velocities = np.nan_to_num(orig_v)
                     
-                    with write_lock:
-                        ds[idx] = sample_tensor
-                        ds_orig[idx] = original_velocities
-                        pbar.update(1)
+                    ds[idx] = sample_tensor
+                    ds_orig[idx] = original_velocities
+                    pbar.update(1)
 
             with ThreadPoolExecutor() as executor:
                 list(executor.map(process_ps, samples_by_ps.keys()))

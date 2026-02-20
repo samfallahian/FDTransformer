@@ -13,6 +13,20 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from transformer_model_v1 import OrderedTransformerV1
 
 # --- Configuration ---
+def print_rainbow(text):
+    """Prints text in rainbow colors to the console."""
+    colors = [
+        '\033[91m', # Red
+        '\033[93m', # Yellow
+        '\033[92m', # Green
+        '\033[96m', # Cyan
+        '\033[94m', # Blue
+        '\033[95m'  # Magenta
+    ]
+    reset = '\033[0m'
+    colored_text = "".join(colors[i % len(colors)] + char for i, char in enumerate(text))
+    print(colored_text + reset)
+
 class Config:
     # Data paths
     TRAIN_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5"
@@ -32,13 +46,13 @@ class Config:
     BIAS = True
     
     # Training
-    BATCH_SIZE = 1024
+    BATCH_SIZE = 512
     LEARNING_RATE = 1e-4
     EPOCHS = 100
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     
     # Fast experimentation
-    LIMIT_SAMPLES = 100000 # Set to an integer (e.g. 10000) to shrink the dataset
+    LIMIT_SAMPLES = 10000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
     
     # Target positions for focused evaluation (Last 4, 8, 16 positions in the last time period)
     TARGET_POSITIONS = list(range(SEQ_LEN - 4, SEQ_LEN)) 
@@ -56,8 +70,16 @@ class TransformerDataset(Dataset):
             total_available = f['data'].shape[0]
             if max_samples is not None:
                 self.length = min(max_samples, total_available)
+                # Randomly pick indices from the available data if we are limiting samples
+                # This ensures we get different samples on different runs, but keep them 
+                # consistent across epochs in a single run.
+                if self.length < total_available:
+                    self.indices = np.random.choice(total_available, self.length, replace=False)
+                else:
+                    self.indices = None
             else:
                 self.length = total_available
+                self.indices = None
 
     def __len__(self):
         return self.length
@@ -65,7 +87,10 @@ class TransformerDataset(Dataset):
     def __getitem__(self, idx):
         if self._file is None:
             self._file = h5py.File(self.h5_path, 'r')
-        data = self._file['data'][idx] # (8, 26, 52)
+        
+        # If we have a subset of random indices, pick the actual index from that list
+        fetch_idx = self.indices[idx] if self.indices is not None else idx
+        data = self._file['data'][fetch_idx] # (8, 26, 52)
         # Flatten time and space: (208, 52)
         data = data.reshape(Config.SEQ_LEN, Config.INPUT_DIM)
         return torch.from_numpy(data).float()
@@ -149,7 +174,7 @@ def train():
                     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 best_val_loss = checkpoint.get('best_val_loss', float('inf'))
                 start_epoch = checkpoint.get('epoch', 0)
-                print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch} (Best Val Loss: {best_val_loss:.6f})")
+                print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch} (Best Val Loss: {best_val_loss:.4e})")
             else:
                 # Fallback for legacy state_dict only files
                 model.load_state_dict(checkpoint)
@@ -166,7 +191,7 @@ def train():
     prev_target3_loss = None
     
     # Helper for coloring based on trend
-    def get_colored_str(val, prev_val, fmt=".6f"):
+    def get_colored_str(val, prev_val, fmt=".4e"):
         val_str = f"{val:{fmt}}"
         if prev_val is None:
             return val_str
@@ -213,10 +238,10 @@ def train():
                 l16 = criterion(outputs[:, eval_indices_3, :], targets[:, eval_indices_3, :]).item()
             
             pbar.set_postfix({
-                'AvgAll': f"{loss.item():.5f}",
-                'L4': get_colored_str(l4, last_batch_l4, ".5f"),
-                'L8': get_colored_str(l8, last_batch_l8, ".5f"),
-                'L16': get_colored_str(l16, last_batch_l16, ".5f")
+                'AvgAll': f"{loss.item():.2e}",
+                'L4': get_colored_str(l4, last_batch_l4, ".2e"),
+                'L8': get_colored_str(l8, last_batch_l8, ".2e"),
+                'L16': get_colored_str(l16, last_batch_l16, ".2e")
             })
             
             last_batch_l4, last_batch_l8, last_batch_l16 = l4, l8, l16
@@ -309,11 +334,11 @@ def train():
             
         wandb.log(log_dict)
         
-        print(f"Epoch {epoch+1}: Avg Train (All): {avg_train_loss:.6f}, Avg Val (All): {get_colored_str(avg_val_loss, prev_val_loss)}")
+        print(f"Epoch {epoch+1}: Avg Train (All): {avg_train_loss:.4e}, Avg Val (All): {get_colored_str(avg_val_loss, prev_val_loss)}")
         print(f"  Target Losses -> Last4: {get_colored_str(avg_target_loss, prev_target_loss)}, "
               f"Last8: {get_colored_str(avg_target2_loss, prev_target2_loss)}, "
               f"Last16: {get_colored_str(avg_target3_loss, prev_target3_loss)}")
-        print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.6f}, 8th Step: {log_dict['val_loss_8th_step']:.6f}")
+        print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.4e}, 8th Step: {log_dict['val_loss_8th_step']:.4e}")
         
         # Update previous values for next epoch trend comparison
         prev_val_loss = avg_val_loss
@@ -338,7 +363,7 @@ def train():
             
             torch.save(checkpoint, model_save_path)
             wandb.save(model_save_path) # Also save model weights to wandb
-            print(f"Saved best model checkpoint to {model_save_path}")
+            print_rainbow(f"Saved best model checkpoint to {model_save_path}")
 
     wandb.finish()
 

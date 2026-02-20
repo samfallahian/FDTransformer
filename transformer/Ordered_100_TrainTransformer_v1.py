@@ -15,8 +15,8 @@ from transformer_model_v1 import OrderedTransformerV1
 # --- Configuration ---
 class Config:
     # Data paths
-    TRAIN_H5 = "/Users/kkreth/PycharmProjects/data/training_data.h5"
-    VAL_H5 = "/Users/kkreth/PycharmProjects/data/validation_data.h5"
+    TRAIN_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5"
+    VAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5"
     
     # Model architecture
     LATENT_DIM = 47
@@ -32,8 +32,8 @@ class Config:
     BIAS = True
     
     # Training
-    BATCH_SIZE = 256
-    LEARNING_RATE = 3e-4
+    BATCH_SIZE = 1024
+    LEARNING_RATE = 1e-4
     EPOCHS = 100
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     
@@ -89,7 +89,7 @@ def train():
     """
     # Initialize wandb
     wandb.init(
-        project="transformer_prepared_cubes",
+        project="transformer_OG_prepared_cubes",
         config={
             "learning_rate": Config.LEARNING_RATE,
             "epochs": Config.EPOCHS,
@@ -298,7 +298,11 @@ def train():
             "val_loss": avg_val_loss,
             "target_pos_loss": avg_target_loss,
             "target_pos2_loss": avg_target2_loss,
-            "target_pos3_loss": avg_target3_loss
+            "target_pos3_loss": avg_target3_loss,
+            # Scenario 1: Even steps (2, 4, 6, 8)
+            "val_loss_even_steps": np.mean(avg_time_step_losses[1::2]),
+            # Scenario 2: 8th step only
+            "val_loss_8th_step": avg_time_step_losses[7]
         }
         for t in range(Config.NUM_TIME):
             log_dict[f"val_loss_time_step_{t+1}"] = avg_time_step_losses[t]
@@ -309,6 +313,7 @@ def train():
         print(f"  Target Losses -> Last4: {get_colored_str(avg_target_loss, prev_target_loss)}, "
               f"Last8: {get_colored_str(avg_target2_loss, prev_target2_loss)}, "
               f"Last16: {get_colored_str(avg_target3_loss, prev_target3_loss)}")
+        print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.6f}, 8th Step: {log_dict['val_loss_8th_step']:.6f}")
         
         # Update previous values for next epoch trend comparison
         prev_val_loss = avg_val_loss

@@ -1,3 +1,41 @@
+"""
+Ordered_010_Prepare_Dataset.py
+
+This script prepares the dataset for the Transformer model by sampling sequences from precomputed latent space cubes.
+
+Overview:
+The script processes compressed pickle files containing latent representations of physical data. 
+It generates a specified number of samples for both training and validation sets. Each sample 
+is a spatio-temporal window: a sequence of 8 time steps at a fixed (y, z) coordinate, 
+covering all 26 points along the X-axis.
+
+File Structure:
+- Constants: Coordinate lists for X, Y, Z, latent feature names, and input/output paths.
+- parse_param: Utility to convert directory strings (e.g., '7p8') to float parameter values (7.8).
+- get_available_yz: Scans files to discover valid (y, z) coordinate pairs in the source data.
+- generate_sample_definitions: Creates random metadata (param, y, z, start_t) for dataset samples.
+- process_and_save: 
+    - Core logic that constructs 4D tensors and writes them to HDF5.
+    - Uses ThreadPoolExecutor to process parameter sets in parallel.
+    - Sorts samples by time to optimize file loading with a sliding window mechanism.
+- main: Handles CLI arguments and triggers processing for training and validation splits.
+
+Data Structure:
+The output HDF5 files contain a 'data' dataset with shape (N, 8, 26, 52):
+    - N: Number of samples.
+    - 8: Time steps (Temporal dimension).
+    - 26: X-coordinates (Spatial dimension).
+    - 52: Features per point:
+        - [0:47]: Latent features (47 dimensions).
+        - [47]: X-coordinate.
+        - [48]: Y-coordinate.
+        - [49]: Z-coordinate.
+        - [50]: Relative time (0-7).
+        - [51]: Parameter value (extracted from directory name).
+
+Usage:
+    python Ordered_010_Prepare_Dataset.py --num_samples 1000000 --test_run
+"""
 import os
 import pandas as pd
 import numpy as np
@@ -9,17 +47,17 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 # Constants from issue description
-X_COORDS = [-50, -46, -42, -38, -34, -30, -26, -22, -18, -14, -10, -6, -2, 2, 6, 10, 14, 18, 22, 25, 29, 33, 37, 41, 45, 49]
-Z_COORDS = [-33, -29, -25, -21, -17, -13, -9, -5, -1, 3, 7, 11, 14, 18, 22, 26, 30, 34]
-Y_COORDS = [-83, -80, -76, -72, -68, -64, -60, -56, -52, -48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 0, 4, 8, 12, 16, 20, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87]
+X_COORDS = [ -49, -45, -41, -37, -33, -29, -26, -22, -18, -14, -10, -6, -2, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49]
+Z_COORDS = [-21, -17, -13, -9, -5, -1, 2, 6, 10, 14, 18, 22]
+Y_COORDS = [-71, -67, -63, -59, -55, -51, -47, -43, -39, -35, -31, -28, -24, -20, -16, -12, -8, -4, 0, 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75]
 LATENT_COLS = [f"latent_{i}" for i in range(1, 48)]
 NUM_X = len(X_COORDS)
 NUM_TIME = 8
 # Features: 47 (latent) + 3 (x,y,z) + 1 (rel_time) + 1 (param_val) = 52
 NUM_FEATURES = 47 + 3 + 1 + 1 
 
-INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/simplified_cubes_wLatent"
-OUTPUT_DIR = "/Users/kkreth/PycharmProjects/cgan/transformer"
+INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
+OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/transformer_input"
 
 def parse_param(p_str):
     """Convert directory name like '7p8' to float 7.8."""

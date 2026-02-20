@@ -2,6 +2,7 @@ import os
 import h5py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
@@ -52,7 +53,7 @@ class Config:
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     
     # Fast experimentation
-    LIMIT_SAMPLES = 10000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
+    LIMIT_SAMPLES = 1000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
     
     # Target positions for focused evaluation (Last 4, 8, 16 positions in the last time period)
     TARGET_POSITIONS = list(range(SEQ_LEN - 4, SEQ_LEN)) 
@@ -189,6 +190,7 @@ def train():
     prev_target_loss = None
     prev_target2_loss = None
     prev_target3_loss = None
+    prev_ar_losses = {k: None for k in [7, 6, 5, 4, 3, 2, 1]}
     
     # Helper for coloring based on trend
     def get_colored_str(val, prev_val, fmt=".4e"):
@@ -259,6 +261,10 @@ def train():
         # Note: predicting time t requires information from at least the start of time t or end of t-1
         time_step_losses = np.zeros(Config.NUM_TIME)
         
+        # Track autoregressive losses for the 8th time step starting from different context lengths
+        ar_scenarios = [7, 6, 5, 4, 3, 2, 1]
+        ar_total_losses = {k: 0.0 for k in ar_scenarios}
+        
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(Config.DEVICE)
@@ -310,11 +316,24 @@ def train():
                         t_tgt = targets[:, target_indices_for_t, :]
                         time_step_losses[t] += criterion(t_out, t_tgt).item()
                 
+                # --- Autoregressive evaluation for predicting the 8th time slice ---
+                # We start predicting from the end of step k and evaluate on the 8th step.
+                for k in ar_scenarios:
+                    num_to_predict = (Config.NUM_TIME - k) * Config.NUM_X
+                    # Autoregressively predict until the end of the sequence
+                    pred_latents = model.predict_autoregressive(batch, num_to_predict)
+                    
+                    # Evaluation is strictly on the 8th time step (the last 26 positions)
+                    step8_pred = pred_latents[:, -Config.NUM_X:, :]
+                    step8_target = batch[:, -Config.NUM_X:, :Config.LATENT_DIM]
+                    ar_total_losses[k] += criterion(step8_pred, step8_target).item()
+                
         avg_val_loss = val_loss / len(val_loader)
         avg_target_loss = target_pos_loss / len(val_loader)
         avg_target2_loss = target_pos2_loss / len(val_loader)
         avg_target3_loss = target_pos3_loss / len(val_loader)
         avg_time_step_losses = time_step_losses / len(val_loader)
+        avg_ar_losses = {k: ar_total_losses[k] / len(val_loader) for k in ar_scenarios}
         
         # Log to wandb
         log_dict = {
@@ -329,6 +348,9 @@ def train():
             # Scenario 2: 8th step only
             "val_loss_8th_step": avg_time_step_losses[7]
         }
+        for k, loss_val in avg_ar_losses.items():
+            log_dict[f"ar_loss_T8_given_T1-{k}"] = loss_val
+            
         for t in range(Config.NUM_TIME):
             log_dict[f"val_loss_time_step_{t+1}"] = avg_time_step_losses[t]
             
@@ -340,11 +362,30 @@ def train():
               f"Last16: {get_colored_str(avg_target3_loss, prev_target3_loss)}")
         print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.4e}, 8th Step: {log_dict['val_loss_8th_step']:.4e}")
         
+        # --- Creative Autoregressive Results Display ---
+        print("\n\t" + "╔══════════════════════════════════════════════════════════╗")
+        print("\t" + "║      AUTOREGRESSIVE T8 PREDICTION (STAIRCASE EVAL)       ║")
+        print("\t" + "╟──────────────────────────────────────────────────────────╢")
+        for i, k in enumerate(ar_scenarios):
+            indent = "  " * i
+            label = f"Given T1-{k}:"
+            color_val = get_colored_str(avg_ar_losses[k], prev_ar_losses[k], ".4e")
+            # Calculate how many spaces to add to reach the right border
+            # label is 12 chars, indent is 2*i chars, color_val visible is 10 chars.
+            # Total visible: 2*i + 12 + 1 + 10 = 23 + 2*i.
+            # Max i=6 -> 23 + 12 = 35. 
+            # We want to fill up to 58 (width of box inside).
+            padding = " " * (58 - (len(indent) + len(label) + 1 + 10))
+            print(f"\t║ {indent}{label} {color_val}{padding} ║")
+        print("\t" + "╚══════════════════════════════════════════════════════════╝\n")
+        
         # Update previous values for next epoch trend comparison
         prev_val_loss = avg_val_loss
         prev_target_loss = avg_target_loss
         prev_target2_loss = avg_target2_loss
         prev_target3_loss = avg_target3_loss
+        for k in ar_scenarios:
+            prev_ar_losses[k] = avg_ar_losses[k]
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss

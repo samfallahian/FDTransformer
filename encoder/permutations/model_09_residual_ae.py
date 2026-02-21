@@ -1,5 +1,18 @@
 """
 Model 09: Residual Autoencoder (ResAE)
+Originally based on: "Deep Residual Learning for Image Recognition" (He et al., 2016).
+
+MLA Citations:
+1. He, Kaiming, et al. "Deep Residual Learning for Image Recognition." CVPR, 2016. https://arxiv.org/pdf/1512.03385.pdf
+2. (He et al. 770-78)
+3. He et al., "Deep Residual Learning," CVPR (2016).
+
+Deviations from Paper:
+- Adapts convolutional ResNet concepts to a fully connected (MLP) Autoencoder architecture for 375-dimensional input.
+- Uses skip connections (`out = activation(LayerNorm(Linear(x)) + x)`) in an encoder-decoder bottleneck structure rather than the classic residual block in a deep classifier.
+- Incorporates LayerNorm and ELU activations within the residual blocks.
+
+Relative Performance (MSE): 4.600e-05
 
 THEORETICAL FOUNDATION:
 =======================

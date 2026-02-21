@@ -45,6 +45,18 @@ class BaseAE(nn.Module):
 
 # 1. Baseline Model (similar to Model 09)
 class Model_GEN3_01_Baseline(BaseAE):
+    """
+    Model 01: Baseline Residual Autoencoder
+    Originally based on: "Deep Residual Learning for Image Recognition" (He et al., 2016).
+    
+    MLA Citation: He, Kaiming, et al. "Deep Residual Learning for Image Recognition." CVPR, 2016.
+    PDF: https://arxiv.org/pdf/1512.03385.pdf
+    
+    Deviations: Adapts convolutional ResNet concepts to a fully connected (MLP) architecture. 
+    Uses LayerNorm and ELU within residual blocks.
+    
+    Relative Performance (MSE): 1.334e-03 (WINNER)
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         self.dropout_rate = dropout_rate
@@ -89,6 +101,17 @@ class Model_GEN3_01_Baseline(BaseAE):
 
 # 2. Deep Model (More residual blocks)
 class Model_GEN3_02_Deep(BaseAE):
+    """
+    Model 02: Deep Residual Autoencoder
+    Originally based on: "Deep Residual Learning for Image Recognition" (He et al., 2016).
+    
+    MLA Citation: He, Kaiming, et al. "Deep Residual Learning for Image Recognition." CVPR, 2016.
+    PDF: https://arxiv.org/pdf/1512.03385.pdf
+    
+    Deviations: Significantly increases depth by using multiple residual blocks per stage.
+    
+    Relative Performance (MSE): 3.190e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -130,6 +153,17 @@ class Model_GEN3_02_Deep(BaseAE):
 
 # 3. Wide Model
 class Model_GEN3_03_Wide(BaseAE):
+    """
+    Model 03: Wide Residual Autoencoder
+    Originally based on: "Wide Residual Networks" (Zagoruyko & Komodakis, 2016).
+    
+    MLA Citation: Zagoruyko, Sergey, and Nikos Komodakis. "Wide Residual Networks." arXiv preprint arXiv:1605.07146, 2016.
+    PDF: https://arxiv.org/pdf/1605.07146.pdf
+    
+    Deviations: Increases layer width (512-256-128) instead of depth to capture broader features.
+    
+    Relative Performance (MSE): 4.207e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 512, 256, 128
@@ -171,6 +205,17 @@ class Model_GEN3_03_Wide(BaseAE):
 
 # 4. GELU Activation
 class Model_GEN3_04_GELU(BaseAE):
+    """
+    Model 04: GELU Residual Autoencoder
+    Originally based on: "Gaussian Error Linear Units (GELUs)" (Hendrycks & Gimpel, 2016).
+    
+    MLA Citation: Hendrycks, Dan, and Kevin Gimpel. "Gaussian Error Linear Units (GELUs)." arXiv preprint arXiv:1606.08415, 2016.
+    PDF: https://arxiv.org/pdf/1606.08415.pdf
+    
+    Deviations: Replaces ELU with GELU activations to weight inputs by their percentile.
+    
+    Relative Performance (MSE): 1.887e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -244,6 +289,17 @@ class SEResidualBlock(nn.Module):
         return self.activation(out + res)
 
 class Model_GEN3_05_AttentionSE(BaseAE):
+    """
+    Model 05: AttentionSE (Squeeze-and-Excitation)
+    Originally based on: "Squeeze-and-Excitation Networks" (Hu et al., 2017).
+    
+    MLA Citation: Hu, Jie, et al. "Squeeze-and-Excitation Networks." CVPR, 2018.
+    PDF: https://arxiv.org/pdf/1709.01507.pdf
+    
+    Deviations: Uses SE-Blocks for channel-wise feature recalibration of velocity components.
+    
+    Relative Performance (MSE): 1.359e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -296,6 +352,17 @@ class DenseBlock(nn.Module):
         return torch.cat([x, out], dim=1)
 
 class Model_GEN3_06_Dense(BaseAE):
+    """
+    Model 06: Dense Autoencoder
+    Originally based on: "Densely Connected Convolutional Networks" (Huang et al., 2017).
+    
+    MLA Citation: Huang, Gao, et al. "Densely Connected Convolutional Networks." CVPR, 2017.
+    PDF: https://arxiv.org/pdf/1608.06993.pdf
+    
+    Deviations: Implements dense connections with projection layers for efficiency.
+    
+    Relative Performance (MSE): 2.675e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         # Since we use cat, we need to handle increasing dimensions
@@ -355,6 +422,17 @@ class BNResidualBlock(nn.Module):
         return self.activation(out + res)
 
 class Model_GEN3_07_BatchNorm(BaseAE):
+    """
+    Model 07: BatchNorm Autoencoder
+    Originally based on: "Batch Normalization: Accelerating Deep Network Training" (Ioffe & Szegedy, 2015).
+    
+    MLA Citation: Ioffe, Sergey, and Christian Szegedy. "Batch Normalization: Accelerating Deep Network Training." ICML, 2015.
+    PDF: https://proceedings.mlr.press/v37/ioffe15.pdf
+    
+    Deviations: Swaps LayerNorm for BatchNorm1d to test batch-wise statistics on flow data.
+    
+    Relative Performance (MSE): 4.290e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -402,6 +480,17 @@ class Model_GEN3_07_BatchNorm(BaseAE):
 
 # 8. Skip connections between Encoder and Decoder (U-Net style)
 class Model_GEN3_08_Skip(BaseAE):
+    """
+    Model 08: Skip/U-Net Autoencoder
+    Originally based on: "U-Net: Convolutional Networks for Biomedical Image Segmentation" (Ronneberger et al., 2015).
+    
+    MLA Citation: Ronneberger, Olaf, et al. "U-Net: Convolutional Networks for Biomedical Image Segmentation." MICCAI, 2015.
+    PDF: https://arxiv.org/pdf/1505.04597.pdf
+    
+    Deviations: Implements long-range skip connections between encoder and decoder stages.
+    
+    Relative Performance (MSE): 1.423e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -458,6 +547,17 @@ class BottleneckBlock(nn.Module):
         return self.activation(out + res)
 
 class Model_GEN3_09_Bottleneck(BaseAE):
+    """
+    Model 09: Bottleneck Residual AE
+    Originally based on: "Deep Residual Learning for Image Recognition" (He et al., 2016).
+    
+    MLA Citation: He, Kaiming, et al. "Deep Residual Learning for Image Recognition." CVPR, 2016.
+    PDF: https://arxiv.org/pdf/1512.03385.pdf
+    
+    Deviations: Uses reduce-transform-expand bottleneck blocks for efficient depth.
+    
+    Relative Performance (MSE): 2.576e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100
@@ -515,6 +615,17 @@ class SimpleAttention(nn.Module):
         return v * attn
 
 class Model_GEN3_10_Attention(BaseAE):
+    """
+    Model 10: Gated Attention Autoencoder
+    Originally based on: "Attention Is All You Need" (Vaswani et al., 2017).
+    
+    MLA Citation: Vaswani, Ashish, et al. "Attention Is All You Need." NeurIPS, 2017.
+    PDF: https://arxiv.org/pdf/1706.03762.pdf
+    
+    Deviations: Uses a simplified self-attention gating mechanism in the middle layer.
+    
+    Relative Performance (MSE): 1.746e-03
+    """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
         h1, h2, h3 = 250, 150, 100

@@ -1,7 +1,18 @@
 """
 Model 10: Mixture Density Autoencoder
-Predicts parameters of a Gaussian mixture for each output dimension.
-Loss: Negative log likelihood of mixture distribution
+Originally based on: "Mixture Density Networks" (Bishop, 1994).
+
+MLA Citations:
+1. Bishop, Christopher M. "Mixture Density Networks." Neural Computing Research Group Report, 1994. https://publications.aston.ac.uk/id/eprint/373/1/NCRG_94_004.pdf
+2. (Bishop 1-26)
+3. Bishop, "Mixture Density Networks," NCRG (1994).
+
+Deviations from Paper:
+- Integrated MDN as an Autoencoder's decoder for predicting the target distribution parameters (pi, mu, sigma).
+- Combines Negative Log-Likelihood (NLL) with Mean Squared Error (MSE) as an auxiliary loss for reconstruction.
+- Uses modern ELU/ReLU activations and Dropout (0.2).
+
+Relative Performance (MSE): 3.260e-04
 """
 import torch
 from torch import nn

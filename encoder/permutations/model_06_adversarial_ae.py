@@ -1,7 +1,17 @@
 """
 Model 06: Adversarial Autoencoder
-Uses a discriminator network to match latent distribution to a prior.
-Loss: Reconstruction (MSE) + Adversarial loss
+Originally based on: "Adversarial Autoencoders" (Makhzani et al., 2015).
+
+MLA Citations:
+1. Makhzani, Alireza, et al. "Adversarial Autoencoders." arXiv preprint arXiv:1511.05644, 2015. https://arxiv.org/pdf/1511.05644.pdf
+2. (Makhzani et al. 1-16)
+3. Makhzani et al., "Adversarial Autoencoders," arXiv (2015).
+
+Deviations from Paper:
+- Uses a simplified 3-layer discriminator (128-64-1) for a 47D latent space.
+- Combined loss function in a single forward pass, while the paper often describes alternating training phases.
+
+Relative Performance (MSE): 2.840e-04
 """
 import torch
 from torch import nn

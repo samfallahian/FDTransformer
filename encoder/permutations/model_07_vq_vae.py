@@ -1,7 +1,17 @@
 """
 Model 07: Vector Quantized VAE (VQ-VAE)
-Uses a discrete latent space with learnable codebook vectors.
-Loss: Reconstruction + Codebook + Commitment losses
+Originally based on: "Neural Discrete Representation Learning" (van den Oord et al., 2017).
+
+MLA Citations:
+1. van den Oord, Aaron, et al. "Neural Discrete Representation Learning." Advances in Neural Information Processing Systems, vol. 30, 2017. https://arxiv.org/pdf/1711.00937.pdf
+2. (van den Oord et al. 1-11)
+3. van den Oord et al., "Neural Discrete Representation Learning," NeurIPS (2017).
+
+Deviations from Paper:
+- Adapted for 1D vectors (375-dimensional) rather than the 2D/3D feature maps used in image or audio tasks.
+- Uses a straight-through estimator implementation using `inputs + (quantized - inputs).detach()`.
+
+Relative Performance (MSE): 6.570e-04
 """
 import torch
 from torch import nn

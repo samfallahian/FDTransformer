@@ -15,7 +15,6 @@ sys.path.insert(0, PROJECT_ROOT)
 # Import model definitions
 # Assuming Ordered_100_TrainTransformer_v1.py is in the same directory as transformer_model_v1.py
 from transformer.transformer_model_v1 import OrderedTransformerV1
-from encoder.permutations.model_09_residual_ae import ResidualAE
 from TransformLatent import FloatConverter
 
 # ANSI Colors for Rainbow effect and highlighting
@@ -48,11 +47,11 @@ class Colors:
 class Config:
     # Model checkpoints
     TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/saved_models/Model_09_Residual_AE_epoch_500.pt"
+    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
     
     # Data path
-    EVAL_H5 = "/Users/kkreth/PycharmProjects/data/evaluation_data.h5"
-    VAL_H5 = "/Users/kkreth/PycharmProjects/data/validation_data.h5"
+    EVAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
+    VAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5"
     
     @staticmethod
     def get_data_path():
@@ -131,20 +130,9 @@ def load_models():
     transformer.to(Config.DEVICE)
     transformer.eval()
     
-    # 2. Load Residual AE (Encoder/Decoder)
-    print(f"Loading Residual AE from: {Colors.CYAN}{Config.ENCODER_CHECKPOINT}{Colors.RESET}")
-    ae_checkpoint = torch.load(Config.ENCODER_CHECKPOINT, map_location=Config.DEVICE, weights_only=False)
-    
-    if isinstance(ae_checkpoint, dict) and 'model' in ae_checkpoint:
-        ae = ae_checkpoint['model']
-    else:
-        # Standard initialization for ResidualAE
-        ae = ResidualAE()
-        if isinstance(ae_checkpoint, dict) and 'model_state_dict' in ae_checkpoint:
-            ae.load_state_dict(ae_checkpoint['model_state_dict'])
-        else:
-            ae.load_state_dict(ae_checkpoint)
-            
+    # 2. Load Encoder/Decoder (TorchScript "one file" approach)
+    print(f"Loading Scripted AE from: {Colors.CYAN}{Config.ENCODER_CHECKPOINT}{Colors.RESET}")
+    ae = torch.jit.load(Config.ENCODER_CHECKPOINT, map_location=Config.DEVICE)
     ae.to(Config.DEVICE)
     ae.eval()
     

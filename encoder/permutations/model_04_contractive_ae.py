@@ -1,8 +1,17 @@
 """
 Model 04: Contractive Autoencoder
-Penalizes the Frobenius norm of the Jacobian of the encoder to make representations
-robust to small perturbations in input space.
-Loss: Reconstruction (MSE) + λ * ||∂h/∂x||²
+Originally based on: "Contractive Auto-Encoders: Explicit Invariance Extraction through Loss Regularization" (Rifai et al., 2011).
+
+MLA Citations:
+1. Rifai, Salah, et al. "Contractive Auto-Encoders: Explicit Invariance Extraction through Loss Regularization." ICML, 2011. https://icml.cc/2011/papers/455_icmlpaper.pdf
+2. (Rifai et al. 833-40)
+3. Rifai et al., "Contractive Auto-Encoders," ICML (2011).
+
+Deviations from Paper:
+- Approximates the Jacobian Frobenius norm by iterating through latent dimensions and using `torch.autograd.grad`.
+- Uses ELU/ReLU activations and Dropout (0.2), while original research often utilized Sigmoid/Tanh for easier Jacobian derivation.
+
+Relative Performance (MSE): 2.920e-04
 """
 import torch
 from torch import nn

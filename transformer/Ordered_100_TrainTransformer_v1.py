@@ -8,6 +8,8 @@ import numpy as np
 from tqdm import tqdm
 import sys
 import wandb
+import shutil
+import glob
 
 # Add current directory to path to import the model
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +34,8 @@ class Config:
     # Data paths
     TRAIN_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5"
     VAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5"
+    CHECKPOINT_DIR = os.path.dirname(os.path.abspath(__file__))
+    CHECKPOINT_BASE_NAME = "best_ordered_transformer_v1"
     
     # Model architecture
     LATENT_DIM = 47
@@ -50,10 +54,12 @@ class Config:
     BATCH_SIZE = 512
     LEARNING_RATE = 1e-4
     EPOCHS = 100
+    MAX_CHECKPOINTS = 5
+    STAIRCASE_EVAL_FREQ = 10 # How often to run staircase eval (0 to disable) - This is a VERY expensive computation.
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     
     # Fast experimentation
-    LIMIT_SAMPLES = 1000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
+    LIMIT_SAMPLES = 2000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
     
     # Target positions for focused evaluation (Last 4, 8, 16 positions in the last time period)
     TARGET_POSITIONS = list(range(SEQ_LEN - 4, SEQ_LEN)) 
@@ -161,8 +167,12 @@ def train():
     start_epoch = 0
     
     # --- Load Checkpoint ---
-    model_save_dir = os.path.dirname(os.path.abspath(__file__))
-    model_save_path = os.path.join(model_save_dir, "best_ordered_transformer_v1.pt")
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    model_save_path = os.path.join(Config.CHECKPOINT_DIR, f"{Config.CHECKPOINT_BASE_NAME}.pt")
+    
+    # Initialize best_checkpoints list: list of dicts {'val_loss', 'epoch', 'path'}
+    best_checkpoints = []
+    
     if os.path.exists(model_save_path):
         print(f"Loading existing checkpoint from: {model_save_path}")
         try:
@@ -176,14 +186,58 @@ def train():
                 best_val_loss = checkpoint.get('best_val_loss', float('inf'))
                 start_epoch = checkpoint.get('epoch', 0)
                 print(f"Checkpoint loaded successfully. Resuming from epoch {start_epoch} (Best Val Loss: {best_val_loss:.4e})")
+                
+                # Add the loaded checkpoint to our best list
+                # Ensure it has an epoch-named copy for management
+                loaded_epoch_path = os.path.join(Config.CHECKPOINT_DIR, f"{Config.CHECKPOINT_BASE_NAME}_epoch_{start_epoch}.pt")
+                if not os.path.exists(loaded_epoch_path):
+                    shutil.copy2(model_save_path, loaded_epoch_path)
+                
+                best_checkpoints.append({
+                    'val_loss': best_val_loss,
+                    'epoch': start_epoch,
+                    'path': loaded_epoch_path
+                })
             else:
                 # Fallback for legacy state_dict only files
                 model.load_state_dict(checkpoint)
                 print("Legacy state_dict loaded successfully.")
+                # We don't have loss/epoch info for legacy, so we start fresh for best_checkpoints
         except Exception as e:
             print(f"Warning: Could not load checkpoint: {e}")
     else:
         print("No existing checkpoint found. Starting from scratch.")
+    
+    # Also scan for any other existing epoch-named checkpoints to populate the top 5
+    existing_checkpoints = glob.glob(os.path.join(Config.CHECKPOINT_DIR, f"{Config.CHECKPOINT_BASE_NAME}_epoch_*.pt"))
+    for cp_path in existing_checkpoints:
+        # Avoid adding the one we already added
+        if any(cp['path'] == cp_path for cp in best_checkpoints):
+            continue
+        try:
+            # Just load the metadata to get loss and epoch
+            cp_data = torch.load(cp_path, map_location="cpu", weights_only=False)
+            if isinstance(cp_data, dict) and 'best_val_loss' in cp_data:
+                best_checkpoints.append({
+                    'val_loss': cp_data['best_val_loss'],
+                    'epoch': cp_data.get('epoch', 0),
+                    'path': cp_path
+                })
+        except:
+            pass
+            
+    # Keep only the top MAX_CHECKPOINTS and sort them
+    best_checkpoints.sort(key=lambda x: x['val_loss'])
+    if len(best_checkpoints) > Config.MAX_CHECKPOINTS:
+        to_purge = best_checkpoints[Config.MAX_CHECKPOINTS:]
+        best_checkpoints = best_checkpoints[:Config.MAX_CHECKPOINTS]
+        for cp in to_purge:
+            if os.path.exists(cp['path']):
+                os.remove(cp['path'])
+                print(f"Purged old checkpoint: {cp['path']}")
+    
+    if best_checkpoints:
+        best_val_loss = best_checkpoints[0]['val_loss']
     
     # Track previous losses for coloring (Epoch level trend)
     prev_val_loss = None
@@ -265,6 +319,9 @@ def train():
         ar_scenarios = [7, 6, 5, 4, 3, 2, 1]
         ar_total_losses = {k: 0.0 for k in ar_scenarios}
         
+        # Determine if we should run staircase eval this epoch
+        do_staircase = Config.STAIRCASE_EVAL_FREQ > 0 and (epoch + 1) % Config.STAIRCASE_EVAL_FREQ == 0
+        
         with torch.no_grad():
             for batch in val_loader:
                 batch = batch.to(Config.DEVICE)
@@ -318,15 +375,16 @@ def train():
                 
                 # --- Autoregressive evaluation for predicting the 8th time slice ---
                 # We start predicting from the end of step k and evaluate on the 8th step.
-                for k in ar_scenarios:
-                    num_to_predict = (Config.NUM_TIME - k) * Config.NUM_X
-                    # Autoregressively predict until the end of the sequence
-                    pred_latents = model.predict_autoregressive(batch, num_to_predict)
-                    
-                    # Evaluation is strictly on the 8th time step (the last 26 positions)
-                    step8_pred = pred_latents[:, -Config.NUM_X:, :]
-                    step8_target = batch[:, -Config.NUM_X:, :Config.LATENT_DIM]
-                    ar_total_losses[k] += criterion(step8_pred, step8_target).item()
+                if do_staircase:
+                    for k in ar_scenarios:
+                        num_to_predict = (Config.NUM_TIME - k) * Config.NUM_X
+                        # Autoregressively predict until the end of the sequence
+                        pred_latents = model.predict_autoregressive(batch, num_to_predict)
+                        
+                        # Evaluation is strictly on the 8th time step (the last 26 positions)
+                        step8_pred = pred_latents[:, -Config.NUM_X:, :]
+                        step8_target = batch[:, -Config.NUM_X:, :Config.LATENT_DIM]
+                        ar_total_losses[k] += criterion(step8_pred, step8_target).item()
                 
         avg_val_loss = val_loss / len(val_loader)
         avg_target_loss = target_pos_loss / len(val_loader)
@@ -348,8 +406,9 @@ def train():
             # Scenario 2: 8th step only
             "val_loss_8th_step": avg_time_step_losses[7]
         }
-        for k, loss_val in avg_ar_losses.items():
-            log_dict[f"ar_loss_T8_given_T1-{k}"] = loss_val
+        if do_staircase:
+            for k, loss_val in avg_ar_losses.items():
+                log_dict[f"ar_loss_T8_given_T1-{k}"] = loss_val
             
         for t in range(Config.NUM_TIME):
             log_dict[f"val_loss_time_step_{t+1}"] = avg_time_step_losses[t]
@@ -363,48 +422,83 @@ def train():
         print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.4e}, 8th Step: {log_dict['val_loss_8th_step']:.4e}")
         
         # --- Creative Autoregressive Results Display ---
-        print("\n\t" + "╔══════════════════════════════════════════════════════════╗")
-        print("\t" + "║      AUTOREGRESSIVE T8 PREDICTION (STAIRCASE EVAL)       ║")
-        print("\t" + "╟──────────────────────────────────────────────────────────╢")
-        for i, k in enumerate(ar_scenarios):
-            indent = "  " * i
-            label = f"Given T1-{k}:"
-            color_val = get_colored_str(avg_ar_losses[k], prev_ar_losses[k], ".4e")
-            # Calculate how many spaces to add to reach the right border
-            # label is 12 chars, indent is 2*i chars, color_val visible is 10 chars.
-            # Total visible: 2*i + 12 + 1 + 10 = 23 + 2*i.
-            # Max i=6 -> 23 + 12 = 35. 
-            # We want to fill up to 58 (width of box inside).
-            padding = " " * (58 - (len(indent) + len(label) + 1 + 10))
-            print(f"\t║ {indent}{label} {color_val}{padding} ║")
-        print("\t" + "╚══════════════════════════════════════════════════════════╝\n")
+        if do_staircase:
+            print("\n\t" + "╔══════════════════════════════════════════════════════════╗")
+            print("\t" + "║      AUTOREGRESSIVE T8 PREDICTION (STAIRCASE EVAL)       ║")
+            print("\t" + "╟──────────────────────────────────────────────────────────╢")
+            for i, k in enumerate(ar_scenarios):
+                indent = "  " * i
+                label = f"Given T1-{k}:"
+                color_val = get_colored_str(avg_ar_losses[k], prev_ar_losses[k], ".4e")
+                # Calculate how many spaces to add to reach the right border
+                # label is 12 chars, indent is 2*i chars, color_val visible is 10 chars.
+                # Total visible: 2*i + 12 + 1 + 10 = 23 + 2*i.
+                # Max i=6 -> 23 + 12 = 35. 
+                # We want to fill up to 58 (width of box inside).
+                padding = " " * (58 - (len(indent) + len(label) + 1 + 10))
+                print(f"\t║ {indent}{label} {color_val}{padding} ║")
+            print("\t" + "╚══════════════════════════════════════════════════════════╝\n")
         
         # Update previous values for next epoch trend comparison
         prev_val_loss = avg_val_loss
         prev_target_loss = avg_target_loss
         prev_target2_loss = avg_target2_loss
         prev_target3_loss = avg_target3_loss
-        for k in ar_scenarios:
-            prev_ar_losses[k] = avg_ar_losses[k]
+        if do_staircase:
+            for k in ar_scenarios:
+                prev_ar_losses[k] = avg_ar_losses[k]
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            model_save_dir = os.path.dirname(os.path.abspath(__file__))
-            model_save_path = os.path.join(model_save_dir, "best_ordered_transformer_v1.pt")
+        # Management of top 5 checkpoints
+        if len(best_checkpoints) < Config.MAX_CHECKPOINTS or avg_val_loss < best_checkpoints[-1]['val_loss']:
+            new_path = os.path.join(Config.CHECKPOINT_DIR, f"{Config.CHECKPOINT_BASE_NAME}_epoch_{epoch+1}.pt")
             
             # Create a comprehensive checkpoint (The "Standard" format)
             checkpoint = {
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'best_val_loss': best_val_loss,
+                'best_val_loss': avg_val_loss,
                 'config': {k: v for k, v in Config.__dict__.items() if not k.startswith("__") and not callable(v)},
                 'model': model # Embedding the model object itself for maximum compatibility
             }
             
-            torch.save(checkpoint, model_save_path)
-            wandb.save(model_save_path) # Also save model weights to wandb
-            print_rainbow(f"Saved best model checkpoint to {model_save_path}")
+            torch.save(checkpoint, new_path)
+            wandb.save(new_path)
+            
+            best_checkpoints.append({
+                'val_loss': avg_val_loss,
+                'epoch': epoch + 1,
+                'path': new_path
+            })
+            best_checkpoints.sort(key=lambda x: x['val_loss'])
+            
+            # Purge the worst if it fell out of the top 5
+            if len(best_checkpoints) > Config.MAX_CHECKPOINTS:
+                worst = best_checkpoints.pop()
+                if os.path.exists(worst['path']):
+                    os.remove(worst['path'])
+                    # Try to purge from wandb
+                    try:
+                        api = wandb.Api()
+                        # wandb.run might be None if not initialized, but here it is
+                        run_path = f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
+                        run = api.run(run_path)
+                        filename = os.path.basename(worst['path'])
+                        file = run.file(filename)
+                        file.delete()
+                    except Exception as e:
+                        # Silently fail if wandb deletion fails (e.g. file not yet uploaded)
+                        pass
+                print(f"Purged checkpoint rank {Config.MAX_CHECKPOINTS+1}: {worst['path']}")
+
+            # If this is the new absolute best (Rank 1), also update the standard checkpoint file
+            if best_checkpoints[0]['val_loss'] == avg_val_loss:
+                best_val_loss = avg_val_loss
+                shutil.copy2(new_path, model_save_path)
+                wandb.save(model_save_path) # Update the main best checkpoint on wandb too
+                print_rainbow(f"New Rank 1 Best Val Loss: {best_val_loss:.4e}. Saved to {model_save_path}")
+            else:
+                print(f"Saved new Rank {best_checkpoints.index(next(cp for cp in best_checkpoints if cp['epoch'] == epoch+1)) + 1} checkpoint to {new_path}")
 
     wandb.finish()
 

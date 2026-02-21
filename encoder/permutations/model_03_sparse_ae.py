@@ -1,7 +1,17 @@
 """
 Model 03: Sparse Autoencoder
-Applies L1 regularization on latent activations to encourage sparsity.
-Loss: Reconstruction (MSE) + L1 penalty on latent space
+Originally based on: "Sparse Autoencoder" (Ng, 2011).
+
+MLA Citations:
+1. Ng, Andrew. "Sparse Autoencoder." CS294A Lecture Notes, Stanford University, 2011. https://web.stanford.edu/class/cs294a/sparseAutoencoder.pdf
+2. (Ng 1-19)
+3. Ng, "Sparse Autoencoder," Stanford (2011).
+
+Deviations from Paper:
+- Uses a direct L1 penalty on latent activations instead of the KL-divergence-based sparsity penalty described in original notes.
+- Inclusion of Dropout (0.2), which was not a standard feature in early sparse autoencoder formulations.
+
+Relative Performance (MSE): 2.890e-04
 """
 import torch
 from torch import nn

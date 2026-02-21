@@ -1,7 +1,17 @@
 """
 Model 08: Deep Autoencoder
-Uses more layers with varied activation functions for deeper representations.
-Loss: Reconstruction (MSE) + L2 weight decay
+Originally based on: "Reducing the Dimensionality of Data with Neural Networks" (Hinton & Salakhutdinov, 2006).
+
+MLA Citations:
+1. Hinton, Geoffrey E., and Ruslan R. Salakhutdinov. "Reducing the Dimensionality of Data with Neural Networks." Science, vol. 313, no. 5786, 2006, pp. 504-07. https://www.science.org/doi/10.1126/science.1127647 (PDF: https://www.cs.toronto.edu/~hinton/science.pdf)
+2. (Hinton and Salakhutdinov 504-07)
+3. Hinton and Salakhutdinov, "Reducing the Dimensionality," Science (2006).
+
+Deviations from Paper:
+- Trained end-to-end with backpropagation; original paper relied on RBM-based pre-training.
+- Uses modern activation functions (GELU, ELU, LeakyReLU) and LayerNorm, which were not available at the time of publication.
+
+Relative Performance (MSE): 5.730e-04
 """
 import torch
 from torch import nn

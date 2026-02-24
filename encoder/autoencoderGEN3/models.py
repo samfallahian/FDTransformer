@@ -55,7 +55,8 @@ class Model_GEN3_01_Baseline(BaseAE):
     Deviations: Adapts convolutional ResNet concepts to a fully connected (MLP) architecture. 
     Uses LayerNorm and ELU within residual blocks.
     
-    Relative Performance (MSE): 1.334e-03 (WINNER)
+    Relative Performance (MSE): 1.334e-03 (WINNER - Best Short-term Baseline)
+    Note: Original benchmarks used a 1% random sample; this model struggled with higher data variability compared to AttentionSE.
     """
     def __init__(self, dropout_rate=0.2):
         super().__init__()
@@ -298,7 +299,8 @@ class Model_GEN3_05_AttentionSE(BaseAE):
     
     Deviations: Uses SE-Blocks for channel-wise feature recalibration of velocity components.
     
-    Relative Performance (MSE): 1.359e-03
+    Relative Performance: 7.695e-04 RMSE (WINNER - Best Long-term) / 1.359e-03 MSE (Short-term)
+    Note: Superior at maintaining performance and continuous improvement as data variability increased beyond the initial 1% benchmarks.
     """
     def __init__(self, dropout_rate=0.2):
         super().__init__()

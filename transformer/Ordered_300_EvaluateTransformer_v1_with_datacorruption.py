@@ -75,7 +75,7 @@ class Config:
 
 # --- Dataset ---
 class EvalDataset(torch.utils.data.Dataset):
-    def __init__(self, h5_path, max_samples=None):
+    def __init__(self, h5_path, max_samples=None, random_seed=None):
         self.h5_path = h5_path
         self._file = None
         if not os.path.exists(h5_path):
@@ -83,10 +83,16 @@ class EvalDataset(torch.utils.data.Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             total_available = f['data'].shape[0]
             self.has_originals = 'originals' in f
+            
             if max_samples is not None:
                 self.length = min(max_samples, total_available)
+                # Select random indices from the entire available set
+                if random_seed is not None:
+                    np.random.seed(random_seed)
+                self.indices = np.random.choice(total_available, self.length, replace=False)
             else:
                 self.length = total_available
+                self.indices = np.arange(total_available)
             
     def __len__(self):
         return self.length
@@ -94,12 +100,16 @@ class EvalDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self._file is None:
             self._file = h5py.File(self.h5_path, 'r')
-        data = self._file['data'][idx] # (8, 26, 52)
+        
+        # Map the requested idx to our sampled indices
+        real_idx = self.indices[idx]
+        
+        data = self._file['data'][real_idx] # (8, 26, 52)
         # Flatten time and space: (208, 52)
         data = data.reshape(Config.SEQ_LEN, Config.INPUT_DIM)
         
         if self.has_originals:
-            orig = self._file['originals'][idx] # (26, 3)
+            orig = self._file['originals'][real_idx] # (26, 3)
             return torch.from_numpy(data).float(), torch.from_numpy(orig).float()
             
         return torch.from_numpy(data).float(), torch.zeros((Config.NUM_X, 3))
@@ -170,7 +180,7 @@ def load_models():
 def corrupt_data(data, corruption_fraction):
     """
     Corrupt the latent part of the input (first 47 dimensions) 
-    by replacing a fraction of values with random values between 0 and 1.
+    by replacing a fraction of values with random values between -1 and 1.
     data: (B, T, 52) tensor
     """
     if corruption_fraction <= 0:
@@ -187,8 +197,9 @@ def corrupt_data(data, corruption_fraction):
         # We'll flatten the B, T, LATENT_DIM indices
         flat_indices = torch.randperm(B * T * Config.LATENT_DIM)[:num_elements_to_corrupt]
         
-        # Random values between 0 and 1
-        random_values = torch.rand(num_elements_to_corrupt, device=data.device)
+        # Random values between -1 and 1
+        # torch.rand gives [0, 1), so 2*torch.rand-1 gives [-1, 1)
+        random_values = 2 * torch.rand(num_elements_to_corrupt, device=data.device) - 1
         
         # Reshape corrupted_data to easily apply indices
         # We only care about the first LATENT_DIM columns
@@ -269,8 +280,12 @@ def main():
     try:
         data_path = Config.get_data_path()
         print(f"Using dataset: {Colors.YELLOW}{data_path}{Colors.RESET}")
-        dataset = EvalDataset(data_path, max_samples=Config.LIMIT_SAMPLES)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=False)
+        
+        # Pass None to random_seed for truly different samples each run, 
+        # or a fixed number for reproducibility.
+        dataset = EvalDataset(data_path, max_samples=Config.LIMIT_SAMPLES, random_seed=None)
+        
+        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
     except Exception as e:
         print(f"{Colors.RED}Error loading dataset: {e}{Colors.RESET}")
         return

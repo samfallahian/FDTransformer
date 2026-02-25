@@ -47,6 +47,11 @@ def plot_cube_mapping():
     # Adjust view angle for better depth perception
     ax.view_init(elev=20, azim=45)
     
+    # Set axis ticks to integers only
+    ax.set_xticks(indices)
+    ax.set_yticks(indices)
+    ax.set_zticks(indices)
+    
     plt.tight_layout()
     plt.savefig('Documentation/mapping_visualization.png', dpi=1200, bbox_inches='tight')
     plt.close()

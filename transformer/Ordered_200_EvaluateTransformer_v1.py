@@ -79,6 +79,12 @@ class Config:
     
     # Fast evaluation
     LIMIT_SAMPLES = 10000 # Only process 10,000 of the 1MM records
+    
+    # Staircase Evaluation Settings
+    # We want to predict the 8th spatial position of the 8th time period (Global Index 189)
+    # given 1 to 7 spatial positions of the 8th time period as context.
+    STAIRCASE_TARGET_IDX = 189 
+    STAIRCASE_CONTEXT_COUNTS = list(range(1, 8)) # 1, 2, 3, 4, 5, 6, 7
 
 # --- Dataset ---
 class EvalDataset(torch.utils.data.Dataset):
@@ -189,6 +195,7 @@ def main():
     detailed_reports = []
     NUM_DETAILED = 3
     stats_data = []
+    staircase_data = [] # To store {context_count: [sq_errors]}
 
     with torch.no_grad():
         for batch_idx, (batch, originals_batch) in enumerate(tqdm(loader, desc="Evaluating Transformer")):
@@ -196,7 +203,7 @@ def main():
             originals_batch = originals_batch.to(Config.DEVICE) # (B, 26, 3)
             B = batch.shape[0]
             
-            # 1. Transformer Prediction
+            # 1. Standard Transformer Prediction (Full sequence)
             inputs = batch[:, :-1, :]
             outputs = transformer(inputs) # (B, 207, Config.LATENT_DIM)
             
@@ -246,6 +253,55 @@ def main():
                         'z': coords_t8[i, j, 2].item()
                     })
             
+            # --- Staircase Evaluation ---
+            # Predict STAIRCASE_TARGET_IDX (189) given varying context from T8 (182 onwards)
+            target_idx = Config.STAIRCASE_TARGET_IDX
+            
+            # GT Velocity for point 189
+            # In our current batch processing for T8, index 189 is j=7
+            gt_v_staircase = gt_denorm_v[:, 7, :] # (B, 3)
+            
+            for k in Config.STAIRCASE_CONTEXT_COUNTS:
+                # k is number of points from T8 given.
+                # If k=7, we have 182...188. Prediction for 189 is at index 188.
+                # If k < 7, we need to autoregressively predict up to 189.
+                
+                # Context sequence length
+                context_len = 182 + k
+                
+                if k == 7:
+                    # Single step prediction sufficient
+                    staircase_pred_latent = outputs[:, context_len - 1, :] # (B, 47)
+                else:
+                    # Autoregressive prediction
+                    # We start with context_len points and need to reach 189+1 points
+                    # predict_autoregressive expects (1, L, 52)
+                    # We'll do it manually here for the batch to be faster
+                    current_seq = batch[:, :context_len, :].clone()
+                    for step in range(context_len, target_idx + 1):
+                        step_out = transformer(current_seq)
+                        next_latent = step_out[:, -1, :] # (B, 47)
+                        
+                        # Prepare next input: we need to append the next point's metadata
+                        # but we only have metadata for the batch.
+                        if step < 208:
+                            # Use metadata from the original batch
+                            new_token = batch[:, step:step+1, :].clone()
+                            new_token[:, 0, :Config.LATENT_DIM] = next_latent
+                            current_seq = torch.cat([current_seq, new_token], dim=1)
+                    staircase_pred_latent = next_latent
+                
+                # Decode and denormalize
+                dec_v = ae.decode(staircase_pred_latent) # (B, 375)
+                pred_v_63_staircase = dec_v.reshape(B, 125, 3)[:, Config.TRIPLET_IDX, :]
+                pred_denorm_v_staircase = converter.unconvert(pred_v_63_staircase.cpu().numpy()) # (B, 3)
+                
+                # Calculate SQ Error
+                sq_err_staircase = np.sum((gt_v_staircase - pred_denorm_v_staircase)**2, axis=1) # (B,)
+                
+                for err in sq_err_staircase:
+                    staircase_data.append({'context_count': k, 'sq_error': err})
+            
             # Detailed reporting for first few samples
             if batch_idx == 0:
                 for i in range(min(B, NUM_DETAILED)):
@@ -286,6 +342,10 @@ def main():
     
     # RMSE per position
     rmse_per_pos = df.groupby('pos_idx')['sq_error'].mean().apply(np.sqrt)
+
+    # Staircase RMSE
+    df_staircase = pd.DataFrame(staircase_data)
+    rmse_staircase = df_staircase.groupby('context_count')['sq_error'].mean().apply(np.sqrt)
     
     # RMSE for prediction windows
     # j ranges from 0 (idx 182) to 25 (idx 207)
@@ -306,7 +366,7 @@ def main():
     plt.axvspan(22, 25, alpha=0.2, color='red', label='L4 Window')
     plt.axvspan(18, 25, alpha=0.1, color='orange', label='L8 Window')
     plt.axvspan(10, 25, alpha=0.05, color='yellow', label='L16 Window')
-    plt.title('RMSE per Position in T8')
+    plt.title('RMSE per Position in T8 (Velocity Units)')
     plt.xlabel('Position Index (0-25)')
     plt.ylabel('RMSE (Velocity Units)')
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
@@ -320,19 +380,36 @@ def main():
     vals = [rmse_l4, rmse_l8, rmse_l16, rmse_overall]
     colors = ['red', 'orange', 'gold', 'green']
     plt.bar(windows, vals, color=colors)
-    plt.title('RMSE per Prediction Window')
+    plt.title('RMSE per Prediction Window (Velocity Units)')
     plt.ylabel('RMSE (Velocity Units)')
     for i, v in enumerate(vals):
-        plt.text(i, v + (max(vals)*0.01), f"{v:.4f}", ha='center', fontweight='bold')
+        plt.text(i, v + (max(vals)*0.01), f"{v:.4e}", ha='center', fontweight='bold')
     plt.savefig('rmse_per_window.png')
     print(f"Saved: {Colors.CYAN}rmse_per_window.png{Colors.RESET}")
     
+    # 2b. Staircase RMSE
+    plt.figure(figsize=(10, 6))
+    plt.plot(rmse_staircase.index, rmse_staircase.values, marker='s', linestyle='--', color='purple')
+    plt.title('Staircase Evaluation: RMSE of Position 8 vs Context Count (Velocity Units)')
+    plt.xlabel('Number of Context Points provided from T8')
+    plt.ylabel('RMSE (Velocity Units)')
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
+    for x, y in zip(rmse_staircase.index, rmse_staircase.values):
+        plt.text(x, y, f"{y:.4e}", verticalalignment='bottom')
+    plt.savefig('rmse_staircase.png')
+    print(f"Saved: {Colors.CYAN}rmse_staircase.png{Colors.RESET}")
+
     # 3. RMSE per Experiment
     plt.figure(figsize=(12, 6))
-    rmse_per_param.plot(kind='bar', color='skyblue')
-    plt.title('RMSE per Experiment (Param)')
+    ax = rmse_per_param.plot(kind='bar', color='skyblue')
+    plt.title('RMSE per Experiment (Param) (Velocity Units)')
     plt.ylabel('RMSE (Velocity Units)')
     plt.xlabel('Experiment Param')
+    
+    # Format x-axis labels to avoid floating point artifacts (e.g., 3.6 instead of 3.599999)
+    # We use format string to round to 1 decimal place as mentioned by user
+    ax.set_xticklabels([f"{float(label.get_text()):.1f}" for label in ax.get_xticklabels()])
+    
     plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig('rmse_per_experiment.png')
@@ -345,8 +422,8 @@ def main():
     yz_stats.columns = ['y', 'z', 'rmse']
     
     sc = plt.scatter(yz_stats['y'], yz_stats['z'], c=yz_stats['rmse'], cmap='viridis', s=50, alpha=0.8)
-    plt.colorbar(sc, label='RMSE')
-    plt.title('RMSE Distribution in Y-Z Coordinate Space')
+    plt.colorbar(sc, label='RMSE (Velocity Units)')
+    plt.title('RMSE Distribution in Y-Z Coordinate Space (Velocity Units)')
     plt.xlabel('Y Coordinate')
     plt.ylabel('Z Coordinate')
     plt.grid(True, linestyle='--', alpha=0.3)
@@ -362,11 +439,11 @@ def main():
     img = ax.scatter3D(yz_stats['y'], yz_stats['z'], yz_stats['rmse'], 
                        c=yz_stats['rmse'], cmap='magma', s=60)
     
-    ax.set_title('3D Error Magnitude across Y-Z Space')
+    ax.set_title('3D Error Magnitude across Y-Z Space (Velocity Units)')
     ax.set_xlabel('Y Coordinate')
     ax.set_ylabel('Z Coordinate')
-    ax.set_zlabel('RMSE')
-    fig.colorbar(img, ax=ax, label='RMSE', shrink=0.5, aspect=10)
+    ax.set_zlabel('RMSE (Velocity Units)')
+    fig.colorbar(img, ax=ax, label='RMSE (Velocity Units)', shrink=0.5, aspect=10)
     
     # Add a "shadow" on the floor for better depth perception
     ax.scatter3D(yz_stats['y'], yz_stats['z'], np.zeros_like(yz_stats['rmse']), 
@@ -379,22 +456,26 @@ def main():
     plt.figure(figsize=(10, 8))
     # We use all raw points for hexbin to show "density" of error samples if they overlap
     hb = plt.hexbin(df['y'], df['z'], C=df['sq_error'].apply(np.sqrt), gridsize=25, cmap='magma', reduce_C_function=np.mean)
-    cb = plt.colorbar(hb, label='Mean RMSE')
-    plt.title('Hexbin RMSE Density Map (Y-Z Plane)')
+    cb = plt.colorbar(hb, label='Mean RMSE (Velocity Units)')
+    plt.title('Hexbin RMSE Density Map (Y-Z Plane) (Velocity Units)')
     plt.xlabel('Y Coordinate')
     plt.ylabel('Z Coordinate')
     plt.savefig('rmse_yz_hexbin.png')
     print(f"Saved: {Colors.CYAN}rmse_yz_hexbin.png{Colors.RESET}")
 
     # --- Final Report ---
-    print(f"\n{Colors.BOLD}SUMMARY STATISTICS{Colors.RESET}")
+    print(f"\n{Colors.BOLD}SUMMARY STATISTICS (Velocity Units){Colors.RESET}")
     print("-" * 50)
-    print(f"Overall RMSE:       {Colors.GREEN}{rmse_overall:.6f}{Colors.RESET}")
-    print(f"RMSE (Last 4):      {Colors.YELLOW}{rmse_l4:.6f}{Colors.RESET}")
-    print(f"RMSE (Last 8):      {Colors.YELLOW}{rmse_l8:.6f}{Colors.RESET}")
-    print(f"RMSE (Last 16):     {Colors.YELLOW}{rmse_l16:.6f}{Colors.RESET}")
+    print(f"Overall RMSE:       {Colors.GREEN}{rmse_overall:.4e}{Colors.RESET}")
+    print(f"RMSE (Last 4):      {Colors.YELLOW}{rmse_l4:.4e}{Colors.RESET}")
+    print(f"RMSE (Last 8):      {Colors.YELLOW}{rmse_l8:.4e}{Colors.RESET}")
+    print(f"RMSE (Last 16):     {Colors.YELLOW}{rmse_l16:.4e}{Colors.RESET}")
     print("-" * 50)
-    print(f"RMSE per Experiment (First 10 Params):\n{rmse_per_param.head(10)}")
+    print(f"STAIRCASE EVALUATION (Velocity Units):")
+    for k, val in rmse_staircase.items():
+        print(f"Given {k} in T8 -> Pred pos 8 RMSE: {Colors.CYAN}{val:.4e}{Colors.RESET}")
+    print("-" * 50)
+    print(f"RMSE per Experiment (First 10 Params):\n{rmse_per_param.head(10).apply(lambda x: f'{x:.4e}')}")
     print("-" * 50)
 
     print(f"\n{Colors.BOLD}DETAILED SAMPLES (First {NUM_DETAILED}){Colors.RESET}")
@@ -413,7 +494,7 @@ def main():
             pred_denorm_str = f"({pred_denorm[0]:.4f}, {pred_denorm[1]:.4f}, {pred_denorm[2]:.4f})"
             
             row_style = Colors.BOLD if "L" in pos['label'] else ""
-            err_col = f"{Colors.CYAN}{err:.6f}{Colors.RESET}"
+            err_col = f"{Colors.CYAN}{err:.4e}{Colors.RESET}"
             
             print(f"{row_style}{pos['idx']-182:<4} | {pos['x']:<6.1f} | {pos['label']:<6} | {gt_str:<30} | {pred_denorm_str:<30} | {err_col}{Colors.RESET}")
         print()

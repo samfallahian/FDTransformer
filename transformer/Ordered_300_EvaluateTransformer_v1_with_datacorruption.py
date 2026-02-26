@@ -276,7 +276,7 @@ def main():
         traceback.print_exc()
         return
 
-    # Load dataset
+    # Load datasets
     try:
         data_path = Config.get_data_path()
         print(f"Using dataset: {Colors.YELLOW}{data_path}{Colors.RESET}")

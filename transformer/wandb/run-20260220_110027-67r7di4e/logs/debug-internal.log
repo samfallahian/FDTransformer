@@ -1,0 +1,12 @@
+{"time":"2026-02-20T11:00:27.667184-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/Users/kkreth/PycharmProjects/cgan/transformer/wandb/run-20260220_110027-67r7di4e/logs/debug-core.log"}
+{"time":"2026-02-20T11:00:27.861621-05:00","level":"INFO","msg":"created new stream","id":"67r7di4e"}
+{"time":"2026-02-20T11:00:27.861652-05:00","level":"INFO","msg":"stream: started","id":"67r7di4e"}
+{"time":"2026-02-20T11:00:27.861672-05:00","level":"INFO","msg":"sender: started","stream_id":"67r7di4e"}
+{"time":"2026-02-20T11:00:27.861689-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"67r7di4e"}
+{"time":"2026-02-20T11:00:27.86167-05:00","level":"INFO","msg":"handler: started","stream_id":"67r7di4e"}
+{"time":"2026-02-20T11:00:28.127611-05:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2026-02-20T11:51:31.723545-05:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/pvl-data/transformer_OG_prepared_cubes/67r7di4e/file_stream\": read tcp 192.168.1.106:51004->35.186.228.49:443: read: operation timed out"}
+{"time":"2026-02-20T11:51:52.40575-05:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/pvl-data/transformer_OG_prepared_cubes/67r7di4e/file_stream\": read tcp 192.168.1.106:51007->35.186.228.49:443: read: operation timed out"}
+{"time":"2026-02-20T11:52:14.990879-05:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/pvl-data/transformer_OG_prepared_cubes/67r7di4e/file_stream\": read tcp 192.168.1.106:51012->35.186.228.49:443: read: operation timed out"}
+{"time":"2026-02-20T11:52:42.38712-05:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/files/pvl-data/transformer_OG_prepared_cubes/67r7di4e/file_stream\": read tcp 192.168.1.106:51016->35.186.228.49:443: read: operation timed out"}
+{"time":"2026-02-20T14:23:01.640212-05:00","level":"INFO","msg":"api: retrying error","error":"Post \"https://api.wandb.ai/graphql\": net/http: request canceled (Client.Timeout exceeded while awaiting headers)"}

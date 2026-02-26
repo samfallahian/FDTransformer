@@ -1,0 +1,44 @@
+{
+  "os": "macOS-26.3-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.13.12",
+  "startedAt": "2026-02-20T21:00:02.626215Z",
+  "program": "/Users/kkreth/PycharmProjects/cgan/transformer/Ordered_100_TrainTransformer_v1.py",
+  "codePath": "transformer/Ordered_100_TrainTransformer_v1.py",
+  "git": {
+    "remote": "https://github.com/samfallahian/cgan.git",
+    "commit": "28dae36ee4b2da11a54bf6fdaba17a6b0b2c41bb"
+  },
+  "email": "kekreth@uncc.edu",
+  "root": "/Users/kkreth/PycharmProjects/cgan/transformer",
+  "host": "Skirt",
+  "executable": "/Users/kkreth/PycharmProjects/venv_python_3.13/bin/python",
+  "codePathLocal": "Ordered_100_TrainTransformer_v1.py",
+  "cpu_count": 14,
+  "cpu_count_logical": 14,
+  "disk": {
+    "/": {
+      "total": "3996329328640",
+      "used": "3741580939264"
+    },
+    "/System/Volumes/Data": {
+      "total": "3996329328640",
+      "used": "3741580939264"
+    }
+  },
+  "memory": {
+    "total": "68719476736"
+  },
+  "cpu": {
+    "count": 14,
+    "countLogical": 14
+  },
+  "apple": {
+    "name": "Apple M4 Pro",
+    "ecpuCores": 4,
+    "pcpuCores": 10,
+    "gpuCores": 20,
+    "memoryGb": 64,
+    "swapTotalBytes": "10737418240",
+    "ramTotalBytes": "68719476736"
+  }
+}

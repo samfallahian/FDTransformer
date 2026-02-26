@@ -1,0 +1,7 @@
+{"time":"2026-02-18T11:30:48.275073-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/wandb/run-20260218_113048-zobzww8p/logs/debug-core.log"}
+{"time":"2026-02-18T11:30:48.603305-05:00","level":"INFO","msg":"created new stream","id":"zobzww8p"}
+{"time":"2026-02-18T11:30:48.603371-05:00","level":"INFO","msg":"stream: started","id":"zobzww8p"}
+{"time":"2026-02-18T11:30:48.603415-05:00","level":"INFO","msg":"handler: started","stream_id":"zobzww8p"}
+{"time":"2026-02-18T11:30:48.603509-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"zobzww8p"}
+{"time":"2026-02-18T11:30:48.603548-05:00","level":"INFO","msg":"sender: started","stream_id":"zobzww8p"}
+{"time":"2026-02-18T11:30:48.873447-05:00","level":"INFO","msg":"Starting system monitor"}

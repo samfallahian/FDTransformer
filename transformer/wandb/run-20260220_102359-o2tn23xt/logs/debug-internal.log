@@ -1,0 +1,7 @@
+{"time":"2026-02-20T10:23:59.780506-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/Users/kkreth/PycharmProjects/cgan/transformer/wandb/run-20260220_102359-o2tn23xt/logs/debug-core.log"}
+{"time":"2026-02-20T10:23:59.973824-05:00","level":"INFO","msg":"created new stream","id":"o2tn23xt"}
+{"time":"2026-02-20T10:23:59.97387-05:00","level":"INFO","msg":"stream: started","id":"o2tn23xt"}
+{"time":"2026-02-20T10:23:59.973884-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"o2tn23xt"}
+{"time":"2026-02-20T10:23:59.975232-05:00","level":"INFO","msg":"sender: started","stream_id":"o2tn23xt"}
+{"time":"2026-02-20T10:23:59.975292-05:00","level":"INFO","msg":"handler: started","stream_id":"o2tn23xt"}
+{"time":"2026-02-20T10:24:00.456179-05:00","level":"INFO","msg":"Starting system monitor"}

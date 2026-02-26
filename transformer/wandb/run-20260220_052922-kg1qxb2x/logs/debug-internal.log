@@ -1,0 +1,15 @@
+{"time":"2026-02-20T05:29:22.889234-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/Users/kkreth/PycharmProjects/cgan/transformer/wandb/run-20260220_052922-kg1qxb2x/logs/debug-core.log"}
+{"time":"2026-02-20T05:29:23.075735-05:00","level":"INFO","msg":"created new stream","id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.075771-05:00","level":"INFO","msg":"stream: started","id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.075778-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.075797-05:00","level":"INFO","msg":"sender: started","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.075786-05:00","level":"INFO","msg":"handler: started","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.299408-05:00","level":"INFO","msg":"Starting system monitor"}
+{"time":"2026-02-20T05:29:23.549614-05:00","level":"INFO","msg":"stream: closing","id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:23.549914-05:00","level":"INFO","msg":"Stopping system monitor"}
+{"time":"2026-02-20T05:29:23.549929-05:00","level":"INFO","msg":"Stopped system monitor"}
+{"time":"2026-02-20T05:29:24.38435-05:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-02-20T05:29:24.579051-05:00","level":"INFO","msg":"handler: closed","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:24.579083-05:00","level":"INFO","msg":"sender: closed","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:24.579335-05:00","level":"INFO","msg":"writer: Close: closed","stream_id":"kg1qxb2x"}
+{"time":"2026-02-20T05:29:24.579439-05:00","level":"INFO","msg":"stream: closed","id":"kg1qxb2x"}

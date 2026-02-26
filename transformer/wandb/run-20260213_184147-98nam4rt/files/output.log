@@ -1,0 +1,7 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/validation_data.h5
+Loading existing checkpoint from: /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Legacy state_dict loaded successfully.
+Epoch 1/100:  23%|██▎       | 36/157 [04:23<12:29,  6.19s/it, AvgAll=0.00010, L4=[32m0.00008[0m, L8=[32m0.00008[0m, L16=[32m0.00008[0m]

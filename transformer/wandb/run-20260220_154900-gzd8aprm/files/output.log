@@ -1,0 +1,25 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5
+Loading existing checkpoint from: /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Checkpoint loaded successfully. Resuming from epoch 30 (Best Val Loss: 5.9542e-06)
+Epoch 31/100: 100%|██████████| 4/4 [00:57<00:00, 14.37s/it, AvgAll=8.76e-06, L4=[31m7.58e-06[0m, L8=[31m6.67e-06[0m, L16=[31m5.95e-06[0m]
+Epoch 31: Avg Train (All): 7.6850e-06, Avg Val (All): 7.4465e-06
+  Target Losses -> Last4: 7.2422e-06, Last8: 6.2180e-06, Last16: 5.4314e-06
+  Queries -> Even Steps (2,4,6,8): 7.0958e-06, 8th Step: 7.2224e-06
+
+	╔══════════════════════════════════════════════════════════╗
+	║      AUTOREGRESSIVE T8 PREDICTION (STAIRCASE EVAL)       ║
+	╟──────────────────────────────────────────────────────────╢
+	║ Given T1-7: 4.2880e-05                                     ║
+	║   Given T1-6: 7.7333e-05                                   ║
+	║     Given T1-5: 1.2792e-04                                 ║
+	║       Given T1-4: 1.9124e-04                               ║
+	║         Given T1-3: 2.7058e-04                             ║
+	║           Given T1-2: 3.6287e-04                           ║
+	║             Given T1-1: 4.7753e-04                         ║
+	╚══════════════════════════════════════════════════════════╝
+
+Saved new Rank 2 checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1_epoch_31.pt
+Epoch 32/100:   0%|          | 0/4 [00:00<?, ?it/s]

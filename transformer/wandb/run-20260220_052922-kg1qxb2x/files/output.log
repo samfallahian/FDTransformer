@@ -1,0 +1,5 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/transformer/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/transformer/validation_data.h5
+Error: HDF5 file not found: /Users/kkreth/PycharmProjects/data/transformer/training_data.h5

@@ -1,0 +1,16 @@
+{
+  "os": "macOS-26.3-arm64-arm-64bit-Mach-O",
+  "python": "CPython 3.13.12",
+  "startedAt": "2026-02-20T10:29:22.888642Z",
+  "program": "/Users/kkreth/PycharmProjects/cgan/transformer/Ordered_100_TrainTransformer_v1.py",
+  "codePath": "transformer/Ordered_100_TrainTransformer_v1.py",
+  "git": {
+    "remote": "https://github.com/samfallahian/cgan.git",
+    "commit": "761fd93dd53a7100d9ff1e59779a4fe8f96bf098"
+  },
+  "email": "kekreth@uncc.edu",
+  "root": "/Users/kkreth/PycharmProjects/cgan/transformer",
+  "host": "Skirt",
+  "executable": "/Users/kkreth/PycharmProjects/venv_python_3.13/bin/python",
+  "codePathLocal": "Ordered_100_TrainTransformer_v1.py"
+}

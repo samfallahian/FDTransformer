@@ -1,0 +1,9 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/validation_data.h5
+Epoch 1/100: 100%|██████████| 15625/15625 [2:37:16<00:00,  1.66it/s, loss=0.00003, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]  
+Epoch 1: Train Loss: 0.000297, Val Loss: 0.000024
+  Target Losses -> Last4: 0.000013, Last8: 0.000012, Last16: 0.000012
+Saved best model to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 2/100:  46%|████▌     | 7141/15625 [1:18:26<1:14:05,  1.91it/s, loss=0.00002, L4=[31m0.00002[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]

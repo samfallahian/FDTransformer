@@ -1,0 +1,16 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5
+Loading existing checkpoint from: /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Checkpoint loaded successfully. Resuming from epoch 29 (Best Val Loss: 0.000007)
+Epoch 30/100: 100%|██████████| 20/20 [02:07<00:00,  6.39s/it, AvgAll=0.00001, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 30: Avg Train (All): 0.000008, Avg Val (All): 0.000006
+  Target Losses -> Last4: 0.000005, Last8: 0.000004, Last16: 0.000004
+  Queries -> Even Steps (2,4,6,8): 0.000006, 8th Step: 0.000006
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 31/100: 100%|██████████| 20/20 [26:08<00:00, 78.41s/it, AvgAll=0.00001, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m] 
+Epoch 31: Avg Train (All): 0.000008, Avg Val (All): [31m0.000006[0m
+  Target Losses -> Last4: [31m0.000005[0m, Last8: [31m0.000005[0m, Last16: [31m0.000004[0m
+  Queries -> Even Steps (2,4,6,8): 0.000006, 8th Step: 0.000006
+Epoch 32/100:   0%|          | 0/20 [00:00<?, ?it/s]

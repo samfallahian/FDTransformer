@@ -1,0 +1,7 @@
+{"time":"2026-02-20T10:05:56.773816-05:00","level":"INFO","msg":"stream: starting","core version":"0.19.10","symlink path":"/Users/kkreth/PycharmProjects/cgan/transformer/wandb/run-20260220_100556-pz6lvl28/logs/debug-core.log"}
+{"time":"2026-02-20T10:05:56.969653-05:00","level":"INFO","msg":"created new stream","id":"pz6lvl28"}
+{"time":"2026-02-20T10:05:56.969679-05:00","level":"INFO","msg":"stream: started","id":"pz6lvl28"}
+{"time":"2026-02-20T10:05:56.969687-05:00","level":"INFO","msg":"writer: Do: started","stream_id":"pz6lvl28"}
+{"time":"2026-02-20T10:05:56.969698-05:00","level":"INFO","msg":"handler: started","stream_id":"pz6lvl28"}
+{"time":"2026-02-20T10:05:56.969695-05:00","level":"INFO","msg":"sender: started","stream_id":"pz6lvl28"}
+{"time":"2026-02-20T10:05:57.259576-05:00","level":"INFO","msg":"Starting system monitor"}

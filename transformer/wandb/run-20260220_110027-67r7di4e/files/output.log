@@ -1,0 +1,35 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5
+Loading existing checkpoint from: /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Checkpoint loaded successfully. Resuming from epoch 30 (Best Val Loss: 5.9542e-06)
+Epoch 31/100: 100%|██████████| 20/20 [03:07<00:00,  9.39s/it, AvgAll=7.47e-06, L4=[32m5.77e-06[0m, L8=[32m5.22e-06[0m, L16=[32m4.97e-06[0m]
+Epoch 31: Avg Train (All): 8.8754e-06, Avg Val (All): 7.2648e-06
+  Target Losses -> Last4: 6.1922e-06, Last8: 5.5818e-06, Last16: 5.2411e-06
+  Queries -> Even Steps (2,4,6,8): 6.8868e-06, 8th Step: 7.0391e-06
+Epoch 32/100: 100%|██████████| 20/20 [25:47<00:00, 77.40s/it, AvgAll=8.19e-06, L4=[31m7.22e-06[0m, L8=[31m6.56e-06[0m, L16=[31m5.93e-06[0m]
+Epoch 32: Avg Train (All): 8.5233e-06, Avg Val (All): [32m6.5416e-06[0m
+  Target Losses -> Last4: [32m5.3938e-06[0m, Last8: [32m4.9285e-06[0m, Last16: [32m4.6640e-06[0m
+  Queries -> Even Steps (2,4,6,8): 6.1748e-06, 8th Step: 6.3576e-06
+Epoch 33/100: 100%|██████████| 20/20 [39:29<00:00, 118.48s/it, AvgAll=9.16e-06, L4=[32m7.64e-06[0m, L8=[32m7.03e-06[0m, L16=[32m6.60e-06[0m]
+Epoch 33: Avg Train (All): 8.8217e-06, Avg Val (All): [31m7.1212e-06[0m
+  Target Losses -> Last4: [31m5.7974e-06[0m, Last8: [31m5.3262e-06[0m, Last16: [31m5.0873e-06[0m
+  Queries -> Even Steps (2,4,6,8): 6.7521e-06, 8th Step: 6.9083e-06
+Epoch 34/100: 100%|██████████| 20/20 [37:34<00:00, 112.73s/it, AvgAll=7.03e-06, L4=[32m5.22e-06[0m, L8=[32m4.90e-06[0m, L16=[32m4.88e-06[0m]
+Epoch 34: Avg Train (All): 8.0803e-06, Avg Val (All): [32m6.0183e-06[0m
+  Target Losses -> Last4: [32m4.3166e-06[0m, Last8: [32m4.0702e-06[0m, Last16: [32m4.0823e-06[0m
+  Queries -> Even Steps (2,4,6,8): 5.6439e-06, 8th Step: 5.8186e-06
+Epoch 35/100: 100%|██████████| 20/20 [46:39<00:00, 139.96s/it, AvgAll=1.04e-05, L4=[31m1.17e-05[0m, L8=[31m1.00e-05[0m, L16=[31m8.23e-06[0m]
+Epoch 35: Avg Train (All): 7.7457e-06, Avg Val (All): [31m9.9451e-06[0m
+  Target Losses -> Last4: [31m1.1791e-05[0m, Last8: [31m9.9996e-06[0m, Last16: [31m8.1215e-06[0m
+  Queries -> Even Steps (2,4,6,8): 9.6028e-06, 8th Step: 9.6549e-06
+Epoch 36/100: 100%|██████████| 20/20 [48:39<00:00, 145.99s/it, AvgAll=7.94e-06, L4=[32m6.83e-06[0m, L8=[32m6.19e-06[0m, L16=[32m5.63e-06[0m]
+Epoch 36: Avg Train (All): 9.1682e-06, Avg Val (All): [32m6.7788e-06[0m
+  Target Losses -> Last4: [32m5.7473e-06[0m, Last8: [32m5.2544e-06[0m, Last16: [32m4.9215e-06[0m
+  Queries -> Even Steps (2,4,6,8): 6.4069e-06, 8th Step: 6.5945e-06
+Epoch 37/100: 100%|██████████| 20/20 [53:40<00:00, 161.04s/it, AvgAll=9.45e-06, L4=[31m7.43e-06[0m, L8=[31m7.01e-06[0m, L16=[31m6.82e-06[0m]
+Epoch 37: Avg Train (All): 7.9960e-06, Avg Val (All): [31m7.8630e-06[0m
+  Target Losses -> Last4: [31m6.3433e-06[0m, Last8: [31m6.0611e-06[0m, Last16: [31m6.0260e-06[0m
+  Queries -> Even Steps (2,4,6,8): 7.4874e-06, 8th Step: 7.6644e-06
+Epoch 38/100:   0%|          | 0/20 [00:00<?, ?it/s]

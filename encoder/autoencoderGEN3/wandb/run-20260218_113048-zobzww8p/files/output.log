@@ -1,0 +1,38 @@
+2026-02-18 11:31:11,599 - __main__ - INFO - Epoch 1/1000: Train RMSE=0.002514, Val RMSE=0.001125
+2026-02-18 11:31:11,942 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_1.pt
+2026-02-18 11:31:29,600 - __main__ - INFO - Epoch 2/1000: Train RMSE=0.001228, Val RMSE=0.001132
+2026-02-18 11:31:29,871 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_2.pt
+2026-02-18 11:31:45,466 - __main__ - INFO - Epoch 3/1000: Train RMSE=0.001210, Val RMSE=0.001059
+2026-02-18 11:31:45,677 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_3.pt
+2026-02-18 11:31:59,852 - __main__ - INFO - Epoch 4/1000: Train RMSE=0.001203, Val RMSE=0.001062
+2026-02-18 11:32:00,091 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_4.pt
+2026-02-18 11:32:14,652 - __main__ - INFO - Epoch 5/1000: Train RMSE=0.001214, Val RMSE=0.001040
+2026-02-18 11:32:14,944 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_5.pt
+2026-02-18 11:32:29,556 - __main__ - INFO - Epoch 6/1000: Train RMSE=0.001212, Val RMSE=0.001067
+2026-02-18 11:32:30,005 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_6.pt
+2026-02-18 11:32:45,839 - __main__ - INFO - Epoch 7/1000: Train RMSE=0.001234, Val RMSE=0.001058
+2026-02-18 11:32:46,035 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_7.pt
+2026-02-18 11:32:59,980 - __main__ - INFO - Epoch 8/1000: Train RMSE=0.001228, Val RMSE=0.001100
+2026-02-18 11:33:00,243 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_8.pt
+2026-02-18 11:33:15,505 - __main__ - INFO - Epoch 9/1000: Train RMSE=0.001327, Val RMSE=0.001045
+2026-02-18 11:33:15,699 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_9.pt
+2026-02-18 11:33:29,712 - __main__ - INFO - Epoch 10/1000: Train RMSE=0.001172, Val RMSE=0.001371
+2026-02-18 11:33:30,056 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_10.pt
+2026-02-18 11:33:45,987 - __main__ - INFO - Epoch 11/1000: Train RMSE=0.001224, Val RMSE=0.001055
+2026-02-18 11:33:46,215 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_11.pt
+2026-02-18 11:34:00,123 - __main__ - INFO - Epoch 12/1000: Train RMSE=0.001866, Val RMSE=0.001225
+2026-02-18 11:34:00,348 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_12.pt
+2026-02-18 11:34:17,403 - __main__ - INFO - Epoch 13/1000: Train RMSE=0.001210, Val RMSE=0.001063
+2026-02-18 11:34:17,714 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_13.pt
+2026-02-18 11:34:33,629 - __main__ - INFO - Epoch 14/1000: Train RMSE=0.001154, Val RMSE=0.001050
+2026-02-18 11:34:33,828 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_14.pt
+2026-02-18 11:34:48,026 - __main__ - INFO - Epoch 15/1000: Train RMSE=0.001162, Val RMSE=0.001050
+2026-02-18 11:34:48,253 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_15.pt
+2026-02-18 11:35:03,233 - __main__ - INFO - Epoch 16/1000: Train RMSE=0.001191, Val RMSE=0.001038
+2026-02-18 11:35:03,548 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_16.pt
+2026-02-18 11:35:16,989 - __main__ - INFO - Epoch 17/1000: Train RMSE=0.001197, Val RMSE=0.001208
+2026-02-18 11:35:17,218 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_17.pt
+2026-02-18 11:35:35,946 - __main__ - INFO - Epoch 18/1000: Train RMSE=0.001207, Val RMSE=0.001061
+2026-02-18 11:35:36,225 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_18.pt
+2026-02-18 11:35:52,432 - __main__ - INFO - Epoch 19/1000: Train RMSE=0.001222, Val RMSE=0.001184
+2026-02-18 11:35:52,707 - __main__ - INFO - Purged old checkpoint: Model_GEN3_05_AttentionSE_epoch_19.pt

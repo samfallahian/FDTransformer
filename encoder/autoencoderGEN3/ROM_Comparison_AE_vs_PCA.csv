@@ -1,0 +1,2 @@
+latent_dim,pca_variance_explained,rmse_pca_norm,rmse_ae_norm,rmse_pca_raw,rmse_ae_raw,improvement_pct
+47,0.9997588584168957,0.0009021644,0.00083038147,0.00041620812,0.00038309084,7.9569035

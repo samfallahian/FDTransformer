@@ -1,0 +1,101 @@
+wandb: WARNING Saving files without folders. If you want to preserve subdirectories pass base_path to wandb.save, i.e. wandb.save("/mnt/folder/file.h5", base_path="/mnt")
+Using device: mps
+Loading training data from: /Users/kkreth/PycharmProjects/data/training_data.h5
+Loading validation data from: /Users/kkreth/PycharmProjects/data/validation_data.h5
+Loading existing checkpoint from: /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Legacy state_dict loaded successfully.
+Epoch 1/100: 100%|██████████| 391/391 [30:33<00:00,  4.69s/it, AvgAll=0.00003, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 1: Avg Train (All): 0.000055, Avg Val (All): 0.000022
+  Target Losses -> Last4: 0.000011, Last8: 0.000011, Last16: 0.000010
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 2/100: 100%|██████████| 391/391 [15:01<00:00,  2.31s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 2: Avg Train (All): 0.000025, Avg Val (All): [32m0.000021[0m
+  Target Losses -> Last4: [32m0.000010[0m, Last8: [32m0.000010[0m, Last16: [32m0.000010[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 3/100: 100%|██████████| 391/391 [15:10<00:00,  2.33s/it, AvgAll=0.00003, L4=[31m0.00002[0m, L8=[31m0.00002[0m, L16=[31m0.00001[0m]
+Epoch 3: Avg Train (All): 0.000025, Avg Val (All): [31m0.000023[0m
+  Target Losses -> Last4: [31m0.000013[0m, Last8: [31m0.000012[0m, Last16: [31m0.000012[0m
+Epoch 4/100: 100%|██████████| 391/391 [15:09<00:00,  2.33s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 4: Avg Train (All): 0.000025, Avg Val (All): [32m0.000019[0m
+  Target Losses -> Last4: [32m0.000009[0m, Last8: [32m0.000009[0m, Last16: [32m0.000009[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 5/100: 100%|██████████| 391/391 [15:15<00:00,  2.34s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 5: Avg Train (All): 0.000025, Avg Val (All): [32m0.000019[0m
+  Target Losses -> Last4: [31m0.000010[0m, Last8: [31m0.000010[0m, Last16: [31m0.000009[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 6/100: 100%|██████████| 391/391 [15:32<00:00,  2.39s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 6: Avg Train (All): 0.000023, Avg Val (All): [32m0.000018[0m
+  Target Losses -> Last4: [32m0.000010[0m, Last8: [32m0.000009[0m, Last16: [32m0.000009[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 7/100: 100%|██████████| 391/391 [16:01<00:00,  2.46s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 7: Avg Train (All): 0.000023, Avg Val (All): [32m0.000017[0m
+  Target Losses -> Last4: [32m0.000010[0m, Last8: [32m0.000009[0m, Last16: [32m0.000009[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 8/100: 100%|██████████| 391/391 [15:58<00:00,  2.45s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 8: Avg Train (All): 0.000022, Avg Val (All): [32m0.000017[0m
+  Target Losses -> Last4: [31m0.000010[0m, Last8: [31m0.000010[0m, Last16: [31m0.000009[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 9/100: 100%|██████████| 391/391 [15:48<00:00,  2.43s/it, AvgAll=0.00003, L4=[31m0.00002[0m, L8=[31m0.00002[0m, L16=[31m0.00002[0m]
+Epoch 9: Avg Train (All): 0.000021, Avg Val (All): [31m0.000022[0m
+  Target Losses -> Last4: [31m0.000015[0m, Last8: [31m0.000015[0m, Last16: [31m0.000015[0m
+Epoch 10/100: 100%|██████████| 391/391 [16:12<00:00,  2.49s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 10: Avg Train (All): 0.000020, Avg Val (All): [32m0.000018[0m
+  Target Losses -> Last4: [32m0.000012[0m, Last8: [32m0.000011[0m, Last16: [32m0.000011[0m
+Epoch 11/100: 100%|██████████| 391/391 [18:08<00:00,  2.78s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 11: Avg Train (All): 0.000020, Avg Val (All): [32m0.000015[0m
+  Target Losses -> Last4: [32m0.000009[0m, Last8: [32m0.000008[0m, Last16: [32m0.000008[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 12/100: 100%|██████████| 391/391 [19:05<00:00,  2.93s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 12: Avg Train (All): 0.000019, Avg Val (All): [31m0.000015[0m
+  Target Losses -> Last4: [31m0.000010[0m, Last8: [31m0.000009[0m, Last16: [31m0.000009[0m
+Epoch 13/100: 100%|██████████| 391/391 [20:54<00:00,  3.21s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 13: Avg Train (All): 0.000019, Avg Val (All): [31m0.000016[0m
+  Target Losses -> Last4: [31m0.000011[0m, Last8: [31m0.000010[0m, Last16: [31m0.000010[0m
+Epoch 14/100: 100%|██████████| 391/391 [21:09<00:00,  3.25s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 14: Avg Train (All): 0.000018, Avg Val (All): [32m0.000013[0m
+  Target Losses -> Last4: [32m0.000008[0m, Last8: [32m0.000007[0m, Last16: [32m0.000007[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 15/100: 100%|██████████| 391/391 [21:19<00:00,  3.27s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 15: Avg Train (All): 0.000018, Avg Val (All): [31m0.000014[0m
+  Target Losses -> Last4: [31m0.000009[0m, Last8: [31m0.000008[0m, Last16: [31m0.000008[0m
+Epoch 16/100: 100%|██████████| 391/391 [21:26<00:00,  3.29s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 16: Avg Train (All): 0.000017, Avg Val (All): [32m0.000013[0m
+  Target Losses -> Last4: [32m0.000008[0m, Last8: [32m0.000008[0m, Last16: [32m0.000007[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 17/100: 100%|██████████| 391/391 [21:26<00:00,  3.29s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 17: Avg Train (All): 0.000017, Avg Val (All): [31m0.000014[0m
+  Target Losses -> Last4: [31m0.000009[0m, Last8: [31m0.000009[0m, Last16: [31m0.000009[0m
+Epoch 18/100: 100%|██████████| 391/391 [21:33<00:00,  3.31s/it, AvgAll=0.00002, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 18: Avg Train (All): 0.000016, Avg Val (All): [32m0.000012[0m
+  Target Losses -> Last4: [32m0.000008[0m, Last8: [32m0.000007[0m, Last16: [32m0.000006[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 19/100: 100%|██████████| 391/391 [21:26<00:00,  3.29s/it, AvgAll=0.00001, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 19: Avg Train (All): 0.000016, Avg Val (All): [32m0.000011[0m
+  Target Losses -> Last4: [32m0.000007[0m, Last8: [32m0.000007[0m, Last16: [32m0.000006[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 20/100: 100%|██████████| 391/391 [50:38<00:00,  7.77s/it, AvgAll=0.00002, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 20: Avg Train (All): 0.000015, Avg Val (All): [31m0.000018[0m
+  Target Losses -> Last4: [31m0.000014[0m, Last8: [31m0.000014[0m, Last16: [31m0.000013[0m
+Epoch 21/100: 100%|██████████| 391/391 [1:24:25<00:00, 12.95s/it, AvgAll=0.00001, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 21: Avg Train (All): 0.000015, Avg Val (All): [32m0.000010[0m
+  Target Losses -> Last4: [32m0.000006[0m, Last8: [32m0.000006[0m, Last16: [32m0.000005[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 22/100: 100%|██████████| 391/391 [1:30:39<00:00, 13.91s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 22: Avg Train (All): 0.000015, Avg Val (All): [31m0.000016[0m
+  Target Losses -> Last4: [31m0.000012[0m, Last8: [31m0.000011[0m, Last16: [31m0.000011[0m
+Epoch 23/100: 100%|██████████| 391/391 [1:28:03<00:00, 13.51s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m]
+Epoch 23: Avg Train (All): 0.000014, Avg Val (All): [32m0.000010[0m
+  Target Losses -> Last4: [32m0.000007[0m, Last8: [32m0.000007[0m, Last16: [32m0.000006[0m
+Epoch 24/100: 100%|██████████| 391/391 [1:29:40<00:00, 13.76s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 24: Avg Train (All): 0.000014, Avg Val (All): [32m0.000010[0m
+  Target Losses -> Last4: [32m0.000007[0m, Last8: [32m0.000006[0m, Last16: [32m0.000006[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 25/100: 100%|██████████| 391/391 [1:18:56<00:00, 12.11s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 25: Avg Train (All): 0.000013, Avg Val (All): [32m0.000009[0m
+  Target Losses -> Last4: [32m0.000006[0m, Last8: [32m0.000005[0m, Last16: [32m0.000005[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 26/100: 100%|██████████| 391/391 [1:16:17<00:00, 11.71s/it, AvgAll=0.00001, L4=[32m0.00001[0m, L8=[32m0.00001[0m, L16=[32m0.00001[0m]
+Epoch 26: Avg Train (All): 0.000013, Avg Val (All): [32m0.000009[0m
+  Target Losses -> Last4: [32m0.000006[0m, Last8: [32m0.000005[0m, Last16: [32m0.000005[0m
+Saved best model checkpoint to /Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt
+Epoch 27/100:  80%|████████  | 314/391 [52:13<03:18,  2.58s/it, AvgAll=0.00001, L4=[31m0.00001[0m, L8=[31m0.00001[0m, L16=[31m0.00001[0m] 

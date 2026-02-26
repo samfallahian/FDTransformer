@@ -112,6 +112,17 @@ class EvalDataset(torch.utils.data.Dataset):
         return torch.from_numpy(data).float(), torch.zeros((Config.NUM_X, 3))
 
 def load_models():
+    # Patch for torch._dynamo compatibility issues (e.g., missing ConvertFrameBox)
+    try:
+        import torch._dynamo.convert_frame
+        if not hasattr(torch._dynamo.convert_frame, 'ConvertFrameBox'):
+            class DummyConvertFrameBox:
+                def __setstate__(self, state):
+                    self.__dict__.update(state)
+            torch._dynamo.convert_frame.ConvertFrameBox = DummyConvertFrameBox
+    except (ImportError, AttributeError):
+        pass
+
     # 1. Load Transformer
     print(f"Loading Transformer from: {Colors.CYAN}{Config.TRANSFORMER_CHECKPOINT}{Colors.RESET}")
     checkpoint = torch.load(Config.TRANSFORMER_CHECKPOINT, map_location=Config.DEVICE, weights_only=False)
@@ -119,6 +130,14 @@ def load_models():
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         # Use the embedded model object for maximum compatibility
         transformer = checkpoint['model']
+        
+        # If it's a compiled model (OptimizedModule), get the original model
+        if hasattr(transformer, '_orig_mod'):
+            print("Detected compiled model, extracting original module...")
+            transformer = transformer._orig_mod
+        elif hasattr(transformer, 'module'):
+            # In some cases it might be wrapped in DataParallel/DistributedDataParallel
+            transformer = transformer.module
     else:
         # Reconstruct if necessary (using config in checkpoint)
         print("Reconstructing Transformer model from checkpoint config...")

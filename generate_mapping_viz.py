@@ -4,6 +4,15 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import os
 
+# Use a publication-quality font (e.g., Times New Roman style)
+plt.rcParams['font.family'] = 'serif'
+plt.rcParams['font.serif'] = ['Times New Roman', 'DejaVu Serif', 'Liberation Serif', 'Bitstream Vera Serif', 'serif']
+plt.rcParams['mathtext.fontset'] = 'stix' # Stix is designed for publication and matches Times well
+plt.rcParams['font.weight'] = 'bold'
+plt.rcParams['axes.labelweight'] = 'bold'
+plt.rcParams['axes.titleweight'] = 'bold'
+plt.rcParams['font.size'] = 12 # Default size incremented if needed, but we'll adjust explicit ones too
+
 def plot_cube_mapping():
     fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection='3d')
@@ -26,10 +35,10 @@ def plot_cube_mapping():
             ax.plot([i, i], [j, j], [-2, 2], color='gray', alpha=0.15, linewidth=0.5)
 
     # Labeling with LaTeX-style formatting
-    ax.set_xlabel(r'$\Delta x$ (Grid Units)', fontsize=12)
-    ax.set_ylabel(r'$\Delta y$ (Grid Units)', fontsize=12)
-    ax.set_zlabel(r'$\Delta z$ (Grid Units)', fontsize=12)
-    ax.set_title(r'Volumetric Sampling Neighborhood ($5 \times 5 \times 5$ Cube)', fontsize=16, pad=20)
+    ax.set_xlabel(r'$\mathbf{\Delta x}$ (Grid Units)', fontsize=14, labelpad=10, fontweight='bold')
+    ax.set_ylabel(r'$\mathbf{\Delta y}$ (Grid Units)', fontsize=14, labelpad=10, fontweight='bold')
+    ax.set_zlabel(r'$\mathbf{\Delta z}$ (Grid Units)', fontsize=14, labelpad=15, fontweight='bold')
+    ax.set_title(r'Volumetric Sampling Neighborhood ($5 \times 5 \times 5$ Cube)', fontsize=18, pad=20, fontweight='bold')
     
     # Add a descriptive text box
     info_text = (
@@ -39,10 +48,10 @@ def plot_cube_mapping():
         "• Feature Vector Length: 375\n"
         r"• Spatial Extent: $\pm 2$ grid units"
     )
-    ax.text2D(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=12, 
+    ax.text2D(0.02, 0.98, info_text, transform=ax.transAxes, fontsize=14, fontweight='bold',
               verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    ax.legend(loc='upper right', fontsize=12)
+    ax.legend(loc='upper right', fontsize=14)
     
     # Adjust view angle for better depth perception
     ax.view_init(elev=20, azim=45)
@@ -130,14 +139,14 @@ def plot_experimental_box():
     # Axes and labels
     # Title removed per request
     
-    ax.set_xlabel('X (mm) [Streamwise]', fontsize=8, labelpad=15)
+    ax.set_xlabel('X (mm) [Streamwise]', fontsize=10, labelpad=15, fontweight='bold')
     
     # Label only half of the y-axis ticks
     y_ticks = ax.get_yticks()
     ax.set_yticks(y_ticks[::2])
     # Set z-axis ticks to 20, 40, 60, 80
     ax.set_zticks([20, 40, 60, 80])
-    ax.set_zlabel('Z (mm) [Wall-normal]', fontsize=8, labelpad=25)
+    ax.set_zlabel('Z (mm) [Wall-normal]', fontsize=10, labelpad=25, fontweight='bold')
     
     # Force axis limits slightly larger to create internal buffer
     ax.set_xlim(-5, L + 5)
@@ -152,7 +161,7 @@ def plot_experimental_box():
         Line2D([0], [0], marker='o', color='w', markerfacecolor='crimson', markersize=4, alpha=0.4, label='Centroids')
     ]
     # Configuration: Legend at bottom center
-    ax.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=3, fontsize=7, frameon=True)
+    ax.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, -0.05), ncol=3, fontsize=9, frameon=True, prop={'weight':'bold', 'size':9})
 
     # Adjust view - Configuration from perm_116
     ax.view_init(elev=10, azim=-45)

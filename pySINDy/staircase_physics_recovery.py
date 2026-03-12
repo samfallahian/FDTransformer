@@ -254,6 +254,7 @@ def main():
                 
                 print(f"--- Predicting T8 using {t_ctx} Ground-Truth Timesteps as history ---")
                 V = np.zeros((nx, ny, nz, 3)) # Placeholder for the reconstructed velocity volume
+                V_gt = np.zeros((nx, ny, nz, 3)) # Ground truth T8 volume
                 
                 # 7. Autoregressive Prediction for each spatial point in the grid
                 for idx in tqdm(grid_indices, desc=f"Predicting Grid (Re={reynolds}, T={t_ctx})", leave=True):
@@ -263,6 +264,13 @@ def main():
                     
                     sample_data = data_ds[idx] # Full 8-timestep sample (8, 26, 52)
                     sample_flat = sample_data.reshape(-1, 52)
+                    
+                    # Store Ground Truth for RMSE calculation (Timestep 8, indices 182 to 207)
+                    t8_gt_latent = sample_flat[182:208, :47]
+                    decoded_gt = ae.decode(torch.from_numpy(t8_gt_latent).float().to(device))
+                    v_gt_full = decoded_gt.reshape(26, 125, 3)
+                    v_gt_center = v_gt_full[:, TRIPLET_IDX, :].cpu().numpy()
+                    V_gt[:, iy, iz, :] = converter.unconvert(v_gt_center)
                     
                     # Provide history tokens (T1 to T_ctx)
                     ctx_len = t_ctx * 26
@@ -304,10 +312,14 @@ def main():
                 hel_res = run_sindy_helicity(u, v, w, wx, wy, wz, helicity)
                 ens_res = run_sindy_enstrophy(wx, wy, wz, enstrophy)
                 
+                # 10. Calculate T8 Prediction RMSE
+                t8_rmse = np.sqrt(np.mean((V - V_gt)**2))
+                
                 # Package results
                 row = {
                     'Reynolds': reynolds,
-                    'TemporalContext': t_ctx
+                    'TemporalContext': t_ctx,
+                    'T8_RMSE': t8_rmse
                 }
                 row.update(ke_res)
                 row.update(hel_res)
@@ -328,14 +340,14 @@ def main():
 
 def plot_results(df):
     """
-    Generates summary plots showing how SINDy MSE changes with Reynolds number
-    and temporal context.
+    Generates summary plots showing how SINDy MSE and Prediction RMSE change 
+    with Reynolds number and temporal context.
     """
     print("Generating visualization...")
-    metrics = ['KE_MSE', 'Helicity_MSE', 'Enstrophy_MSE']
+    metrics = ['T8_RMSE', 'KE_MSE', 'Helicity_MSE', 'Enstrophy_MSE']
     reynolds_list = df['Reynolds'].unique()
     
-    fig, axes = plt.subplots(3, 1, figsize=(12, 18))
+    fig, axes = plt.subplots(4, 1, figsize=(12, 24))
     
     for i, metric in enumerate(metrics):
         ax = axes[i]
@@ -343,10 +355,12 @@ def plot_results(df):
             subset = df[df['Reynolds'] == reynolds].sort_values('TemporalContext')
             ax.plot(subset['TemporalContext'], subset[metric], marker='o', label=f"Re={reynolds}")
         
-        ax.set_yscale('log')
+        if metric != 'T8_RMSE':
+            ax.set_yscale('log')
+        
         ax.set_title(f'{metric} vs Temporal Context (Timesteps)')
         ax.set_xlabel('Number of Ground Truth Timesteps provided as context')
-        ax.set_ylabel('SINDy Recovery MSE')
+        ax.set_ylabel('Metric Value (Log Scale)' if metric != 'T8_RMSE' else 'Metric Value')
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, which='both', linestyle='--', alpha=0.5)
 

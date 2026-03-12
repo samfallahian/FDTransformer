@@ -30,18 +30,23 @@ def load_models():
     TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
     ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
     
-    # Using 'cpu' by default, but user can change to 'mps' if on Apple Silicon.
-    DEVICE = "cpu"
+    # Detect and use the best available device (MPS, CUDA, or CPU)
+    if torch.backends.mps.is_available():
+        DEVICE = "mps"
+    elif torch.cuda.is_available():
+        DEVICE = "cuda"
+    else:
+        DEVICE = "cpu"
     print(f"--- Loading models onto device: {DEVICE} ---")
     
     # This is a technical patch to handle some internal PyTorch compatibility issues
     # with the 'dynamo' optimization engine during model loading.
     try:
-        import torch._dynamo.convert_frame
-        if not hasattr(torch._dynamo.convert_frame, 'ConvertFrameBox'):
+        import torch._dynamo.convert_frame as t_cf
+        if not hasattr(t_cf, 'ConvertFrameBox'):
             class Dummy: pass
-            torch._dynamo.convert_frame.ConvertFrameBox = Dummy
-    except: 
+            t_cf.ConvertFrameBox = Dummy
+    except Exception:
         pass
 
     # Ensure the transformer directory is available for imports
@@ -170,9 +175,10 @@ def main():
     
     # Parameters for the evaluation
     REYNOLDS_NUMBERS = [3.6, 4.6, 5.2, 6.4, 6.6, 7.2, 7.8, 8.4, 10.4, 11.4]
-    TEMPORAL_CONTEXTS = [5, 6, 7] # We provide T1 through T_ctx as ground truth history
+    TEMPORAL_CONTEXTS = [7, 6, 5, 4, 3, 2, 1] # Providing T1 through T_ctx as ground truth history
     
-    CSV_PATH = 'pySINDy/staircase_physics_results.csv'
+    CSV_PATH = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_results.csv')
+    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
     all_results = []
     
     # 2. Handle Restarts: Load existing results from CSV if it exists
@@ -190,7 +196,8 @@ def main():
     with h5py.File(h5_path, 'r') as f:
         data_ds = f['data']
         print("Extracting Reynolds number parameters from the entire dataset (1M samples)...")
-        # Extracting the Reynolds parameter (index 51) for the first token of each sample
+        # Since we don't have a separate index for the Reynolds number, we must
+        # scan the metadata field (index 51) across all samples to find matches.
         full_params = data_ds[:, 0, 0, 51]
         
         # 4. Loop through each Reynolds Number (Flow Condition)
@@ -228,6 +235,9 @@ def main():
             unique_z = np.sort(np.unique(grid_coords[:, 1]))
             
             print(f"Using {len(grid_indices)} grid points. Spatial extent: {len(unique_y)} Y-planes x {len(unique_z)} Z-planes.")
+            print("Explanation: The 'Spatial extent' represents the number of unique Y and Z coordinate planes ")
+            print("covered by the selected 30 grid points. This defines the dimensions of the reconstructed ")
+            print("3D velocity volume (nx, ny, nz) used for physics calculations.")
             
             # Setup coordinate maps for grid reconstruction
             ny, nz = len(unique_y), len(unique_z)
@@ -340,9 +350,10 @@ def plot_results(df):
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, which='both', linestyle='--', alpha=0.5)
 
+    PLOT_PATH = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_trends.png')
     plt.tight_layout()
-    plt.savefig('pySINDy/staircase_physics_trends.png')
-    print("Plot saved to pySINDy/staircase_physics_trends.png")
+    plt.savefig(PLOT_PATH)
+    print(f"Plot saved to {PLOT_PATH}")
 
 if __name__ == "__main__":
     main()

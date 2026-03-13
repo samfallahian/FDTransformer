@@ -33,8 +33,8 @@ The evaluation results show two distinct behaviors as the ground-truth history d
 2.  **SINDy Recovery Stays "Perfect"**: Despite the predicted field values drifting away from the ground truth (higher RMSE), the SINDy MSE for Kinetic Energy, Helicity, and Enstrophy remains extremely low ($10^{-33}$ to $10^{-36}$).
 
 ### Interpretation
-*   **TemporalContext 7 down to 1**: You will likely see the `KE_MSE` and `Helicity_MSE` stay near zero because those formulas are "hard-coded" definitions applied to whatever the model outputs.
-*   **Vorticity-based metrics (Enstrophy/Helicity)**: These are the real "stress test." Because they involve spatial gradients ($\nabla \times V$), they require the model to not just predict individual points correctly, but to maintain the correct spatial relationship between the 30 grid points. The fact that these also stay low proves the Transformer has learned the spatial structure of the flow, even when it loses the temporal accuracy.
+*   **"Control" Metrics (KE_MSE, Helicity_MSE)**: These stay near zero because their definitions are point-wise (e.g., $V \cdot V$). These act as a "control" to show the Transformer is outputting a valid field of velocities.
+*   **Performance Metric (Enstrophy_MSE)**: This is the real "stress test." Because it involves spatial gradients ($\nabla \times V$), it requires the model to not just predict individual points correctly, but to maintain the correct spatial relationship between the 30 grid points. The fact that this also stays low proves the Transformer has learned the spatial structure of the flow, even when it loses the temporal accuracy.
 
 *   **RMSE** measures the *accuracy* of the prediction compared to the specific simulation.
 *   **SINDy MSE** measures the *physical consistency* of the predicted field.
@@ -44,9 +44,11 @@ Even when the model's prediction of T8 is inaccurate (due to lost temporal conte
 ## Visual Trends
 The following plot shows how the SINDy recovery MSE for different physical properties changes across Reynolds numbers and temporal context levels. 
 
-**Note on Metrics**: The visualization includes 4 subplots:
-1.  **T8_RMSE**: Measures the direct prediction error of the velocity field.
-2.  **KE_MSE**, **Helicity_MSE**, **Enstrophy_MSE**: Measure the SINDy recovery error for physical properties.
+**Note on Metrics**: The visualization includes 3 subplots:
+1.  **KE_MSE**, **Helicity_MSE** (Controls): Show the point-wise physics recovery is consistent.
+2.  **Enstrophy_MSE** (Model Performance): Shows how well the model is learning the spatial relationship between grid points.
+
+*Note: While `T8_RMSE` is calculated by the script to measure direct prediction accuracy, the current trend visualization focuses specifically on the physical property recovery MSE.*
 
 ![Staircase Physics Trends](staircase_physics_trends.png)
 

@@ -344,10 +344,10 @@ def plot_results(df):
     with Reynolds number and temporal context.
     """
     print("Generating visualization...")
-    metrics = ['T8_RMSE', 'KE_MSE', 'Helicity_MSE', 'Enstrophy_MSE']
+    metrics = ['KE_MSE', 'Helicity_MSE', 'Enstrophy_MSE']
     reynolds_list = df['Reynolds'].unique()
     
-    fig, axes = plt.subplots(4, 1, figsize=(12, 24))
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(12, 6 * len(metrics)))
     
     for i, metric in enumerate(metrics):
         ax = axes[i]
@@ -365,9 +365,11 @@ def plot_results(df):
         ax.grid(True, which='both', linestyle='--', alpha=0.5)
 
     PLOT_PATH = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_trends.png')
+    PLOT_PATH_PDF = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_trends.pdf')
     plt.tight_layout()
-    plt.savefig(PLOT_PATH)
-    print(f"Plot saved to {PLOT_PATH}")
+    plt.savefig(PLOT_PATH, dpi=600, bbox_inches='tight')
+    plt.savefig(PLOT_PATH_PDF, dpi=600, bbox_inches='tight')
+    print(f"Plots saved to {PLOT_PATH} and {PLOT_PATH_PDF}")
 
 if __name__ == "__main__":
     main()

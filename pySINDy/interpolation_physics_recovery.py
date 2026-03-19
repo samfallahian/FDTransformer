@@ -401,9 +401,11 @@ def plot_results(df):
             plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
 
         PLOT_PATH = os.path.join(PROJECT_ROOT, f'Documentation/interpolation_{metric.lower()}.png')
+        PLOT_PATH_PDF = os.path.join(PROJECT_ROOT, f'Documentation/interpolation_{metric.lower()}.pdf')
         plt.tight_layout()
-        plt.savefig(PLOT_PATH)
-        print(f"Plot saved to {PLOT_PATH}")
+        plt.savefig(PLOT_PATH, dpi=600, bbox_inches='tight')
+        plt.savefig(PLOT_PATH_PDF, dpi=600, bbox_inches='tight')
+        print(f"Plots saved to {PLOT_PATH} and {PLOT_PATH_PDF}")
 
 if __name__ == "__main__":
     main()

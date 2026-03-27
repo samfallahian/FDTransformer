@@ -1,15 +1,15 @@
 """
 This script prepares an evaluation dataset for the Transformer model by creating an HDF5 file 
-containing random samples of 8-timestep windows. Each sample consists of a (y, z) coordinate line 
+containing random samples of 80-timestep windows. Each sample consists of a (y, z) coordinate line 
 across all 26 X coordinates.
 
 For each point in the window, it stores 52 features:
 - 47 latent variables
 - x, y, z coordinates
-- Relative time (0-7)
+- Relative time (0-79)
 - Parameter value
 
-Additionally, it saves the original velocities (vx, vy, vz) for the 8th timestep (t_idx=7) 
+Additionally, it saves the original velocities (vx, vy, vz) for the 80th timestep (t_idx=79) 
 as ground truth for evaluation. The sampling process is designed to align with the 
 validation data from Ordered_010_Prepare_Dataset.py.
 """
@@ -30,7 +30,7 @@ Y_COORDS = [-71, -67, -63, -59, -55, -51, -47, -43, -39, -35, -31, -28, -24, -20
 
 LATENT_COLS = [f"latent_{i}" for i in range(1, 48)]
 NUM_X = len(X_COORDS)
-NUM_TIME = 8
+NUM_TIME = 80
 # Features: 47 (latent) + 3 (x,y,z) + 1 (rel_time) + 1 (param_val) = 52
 NUM_FEATURES = 47 + 3 + 1 + 1 
 
@@ -41,41 +41,51 @@ def parse_param(p_str):
     """Convert directory name like '7p8' to float 7.8."""
     return float(p_str.replace('p', '.'))
 
-def get_available_yz(param_set):
-    """Identify which (y, z) pairs from the allowed lists are present in the data."""
+def get_available_yz_and_t(param_set):
+    """Identify which (y, z) pairs and how many time steps are present in the data."""
     p_dir = os.path.join(INPUT_ROOT, param_set)
     files = sorted([f for f in os.listdir(p_dir) if f.endswith('.pkl.gz')])
     if not files:
-        return []
+        return [], 0
+    
+    # Extract maximum time index from filenames (e.g., '1200.pkl.gz' -> 1200)
+    try:
+        max_t = int(files[-1].split('.')[0])
+    except:
+        max_t = len(files)
+        
     # Check a file in the middle to ensure good coverage
     sample_file = os.path.join(p_dir, files[len(files)//2])
     try:
         df = pd.read_pickle(sample_file, compression='gzip')
         yz = df[['y', 'z']].drop_duplicates()
         valid = yz[yz['y'].isin(Y_COORDS) & yz['z'].isin(Z_COORDS)]
-        return valid.values.tolist()
+        return valid.values.tolist(), max_t
     except Exception as e:
         print(f"Error reading {sample_file}: {e}")
-        return []
+        return [], 0
 
 def generate_sample_definitions(param_sets, n_total):
     """Generate random (param_set, y, z, start_t) combinations."""
     ps_yz_map = {}
+    ps_max_t_map = {}
     
-    def get_yz(ps):
-        return ps, get_available_yz(ps)
+    def get_info(ps):
+        yz, max_t = get_available_yz_and_t(ps)
+        return ps, yz, max_t
 
     with ThreadPoolExecutor() as executor:
-        results = list(tqdm(executor.map(get_yz, param_sets), 
+        results = list(tqdm(executor.map(get_info, param_sets), 
                             total=len(param_sets), 
-                            desc=f"Gathering coordinates for {len(param_sets)} parameter sets"))
+                            desc=f"Gathering metadata for {len(param_sets)} parameter sets"))
     
-    for ps, valid_yz in results:
-        if valid_yz:
+    for ps, valid_yz, max_t in results:
+        if valid_yz and max_t >= NUM_TIME:
             ps_yz_map[ps] = valid_yz
+            ps_max_t_map[ps] = max_t
     
     if not ps_yz_map:
-        raise ValueError("No valid coordinates found in any parameter set.")
+        raise ValueError(f"No valid data found or all parameter sets have fewer than {NUM_TIME} time steps.")
 
     print(f"Found {len(ps_yz_map)} parameter sets with valid data.")
     samples = []
@@ -84,13 +94,15 @@ def generate_sample_definitions(param_sets, n_total):
     for _ in range(n_total):
         ps = random.choice(param_list)
         y, z = random.choice(ps_yz_map[ps])
-        start_t = random.randint(1, 1192)
+        max_t = ps_max_t_map[ps]
+        # Ensure we can fit a sequence of length NUM_TIME
+        start_t = random.randint(1, max_t - NUM_TIME + 1)
         samples.append({'param_set': ps, 'y': y, 'z': z, 'start_t': start_t})
     
     return samples
 
 def process_and_save(samples, output_path):
-    """Extract data for samples and save to HDF5, including original velocities for T8."""
+    """Extract data for samples and save to HDF5, including original velocities for T80."""
     n = len(samples)
     samples_by_ps = {}
     for i, s in enumerate(samples):
@@ -102,16 +114,16 @@ def process_and_save(samples, output_path):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
     with h5py.File(output_path, 'w') as f:
-        # Standard dataset: (N, 8, 26, 52)
+        # Standard dataset: (N, 80, 26, 52)
         ds = f.create_dataset('data', (n, NUM_TIME, NUM_X, NUM_FEATURES), dtype='float32', chunks=(1, NUM_TIME, NUM_X, NUM_FEATURES))
         
-        # New dataset for original velocities at 8th timestep: (N, 26, 3)
+        # New dataset for original velocities at 80th timestep: (N, 26, 3)
         ds_orig = f.create_dataset('originals', (n, NUM_X, 3), dtype='float32', chunks=(1, NUM_X, 3))
         
         # Metadata attributes
         f.attrs['x_coords'] = X_COORDS
-        f.attrs['feature_description'] = "0-46: latent, 47: x, 48: y, 49: z, 50: relative_time, 51: parameter_value"
-        f.attrs['originals_description'] = "Original vx, vy, vz for the 8th timestep (t_idx=7)"
+        f.attrs['feature_description'] = f"0-46: latent, 47: x, 48: y, 49: z, 50: relative_time (0-{NUM_TIME-1}), 51: parameter_value"
+        f.attrs['originals_description'] = f"Original vx, vy, vz for the {NUM_TIME}th timestep (t_idx={NUM_TIME-1})"
 
         with tqdm(total=n, desc=f"Processing {os.path.basename(output_path)}") as pbar:
             def process_ps(ps):
@@ -127,7 +139,7 @@ def process_and_save(samples, output_path):
                     y_val = s['y']
                     z_val = s['z']
                     
-                    needed_times = range(start_t, start_t + 8)
+                    needed_times = range(start_t, start_t + NUM_TIME)
                     
                     # Cleanup window
                     for t in list(current_window.keys()):
@@ -177,8 +189,8 @@ def process_and_save(samples, output_path):
                                 combined = np.column_stack([latents, xs, ys, zs, ts, pv])
                                 sample_tensor[t_idx] = combined
 
-                                # Capture original velocities for the 8th timestep
-                                if t_idx == 7:
+                                # Capture original velocities for the 80th timestep
+                                if t_idx == NUM_TIME - 1:
                                     orig_v = rows[['original_vx', 'original_vy', 'original_vz']].values.astype('float32')
                                     original_velocities = np.nan_to_num(orig_v)
                     
@@ -191,7 +203,7 @@ def process_and_save(samples, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare Evaluation dataset with original velocity metadata.")
-    parser.add_argument("--num_samples", type=int, default=1000000, help="Number of samples.")
+    parser.add_argument("--num_samples", type=int, default=250000, help="Number of samples.")
     parser.add_argument("--test_run", action="store_true", help="Run with very few samples for testing.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     args = parser.parse_args()

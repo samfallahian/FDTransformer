@@ -78,15 +78,27 @@ class Config:
     TARGET_POSITIONS_2 = list(range(SEQ_LEN - 8, SEQ_LEN))
     TARGET_POSITIONS_3 = list(range(SEQ_LEN - 16, SEQ_LEN))
     
-    # Fast evaluation
-    LIMIT_SAMPLES = 100 # Only process 10,000 of the 1MM records
+    # Batch size
+    BATCH_SIZE = 1 # Reduced to avoid MPS OOM
     
-    # Staircase Evaluation Settings
-    # We want to predict the 8th spatial position of the 80th time period (Global Index 2061)
-    # given 1 to 7 spatial positions of the 80th time period as context.
-    # 80th time period starts at 79 * 26 = 2054. 8th position is 2054 + 7 = 2061.
-    STAIRCASE_TARGET_IDX = 2061 
-    STAIRCASE_CONTEXT_COUNTS = list(range(1, 8)) # 1, 2, 3, 4, 5, 6, 7
+    # Micro-batching for evaluation loops
+    # If BATCH_SIZE > 1, some operations might still OOM.
+    # We can further process the batch in smaller chunks.
+    MICRO_BATCH_SIZE = 1 
+    
+    # Fast evaluation
+    LIMIT_SAMPLES = 50 # Randomly select 50 of the 1MM records (to speed up multiple permutations)
+    
+    # Staircase settings
+    STAIRCASE_CONTEXTS = [1, 10, 20, 40, 60, 79]
+    
+    # Interleave Evaluation Settings
+    # 1. Predict each even frame given the odd frame (T1->T2, T1-3->T4, ...)
+    # 2. Predict every 2nd and 3rd only given 1 (C=1, P=2)
+    # 3. Predict every 2nd, 3rd, 4th, 5th given 1 (C=1, P=4)
+    # 4. Predict P=1 given C=2, P=2 given C=2, ...
+    # 5. Collapse limit: RMSE > 0.05
+    RMSE_LIMIT = 0.05
 
 # --- Dataset ---
 class EvalDataset(torch.utils.data.Dataset):
@@ -98,10 +110,16 @@ class EvalDataset(torch.utils.data.Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             total_available = f['data'].shape[0]
             self.has_originals = 'originals' in f
+            
             if max_samples is not None:
                 self.length = min(max_samples, total_available)
+                # Randomly pick indices from the whole dataset
+                self.indices = np.random.choice(total_available, self.length, replace=False)
+                # Sort indices to improve HDF5 access performance
+                self.indices.sort()
             else:
                 self.length = total_available
+                self.indices = np.arange(total_available)
             
     def __len__(self):
         return self.length
@@ -109,12 +127,15 @@ class EvalDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         if self._file is None:
             self._file = h5py.File(self.h5_path, 'r')
-        data = self._file['data'][idx] # (80, 26, 52)
+        
+        # Map the requested idx to our random index
+        actual_idx = self.indices[idx]
+        data = self._file['data'][actual_idx] # (80, 26, 52)
         # Flatten time and space: (2080, 52)
         data = data.reshape(Config.SEQ_LEN, Config.INPUT_DIM)
         
         if self.has_originals:
-            orig = self._file['originals'][idx] # (26, 3)
+            orig = self._file['originals'][actual_idx] # (26, 3)
             return torch.from_numpy(data).float(), torch.from_numpy(orig).float()
             
         return torch.from_numpy(data).float(), torch.zeros((Config.NUM_X, 3))
@@ -165,6 +186,78 @@ def load_models():
     
     return transformer, ae
 
+def evaluate_permutation(transformer, ae, converter, batch, num_context_t, num_predict_t, triplet_idx=62):
+    """
+    Evaluates a single permutation: (Context Time Steps, Prediction Time Steps).
+    Returns the average RMSE across the prediction window.
+    Processes in micro-batches to avoid MPS OOM.
+    """
+    B_full = batch.shape[0]
+    num_x = 26
+    latent_dim = 47
+    
+    context_len = num_context_t * num_x
+    predict_len = num_predict_t * num_x
+    total_len = context_len + predict_len
+    
+    if total_len > 2080:
+        return None
+    
+    # Indices for the prediction window (time steps starting from context_len)
+    pred_indices = range(context_len, total_len)
+    
+    all_rmse = []
+    
+    # Process each sample in the batch individually (Micro-batching)
+    for i in range(0, B_full, Config.MICRO_BATCH_SIZE):
+        micro_batch = batch[i:i+Config.MICRO_BATCH_SIZE]
+        B = micro_batch.shape[0]
+        
+        # Autoregressive prediction
+        current_seq = micro_batch[:, :context_len, :].clone()
+        
+        for step in range(context_len, total_len):
+            step_out = transformer(current_seq)
+            next_latent = step_out[:, -1, :] # (B, 47)
+            
+            # Prepare next token using metadata from 'micro_batch'
+            new_token = micro_batch[:, step:step+1, :].clone()
+            new_token[:, 0, :latent_dim] = next_latent
+            current_seq = torch.cat([current_seq, new_token], dim=1)
+            
+        # Extract predicted and ground truth latents for the prediction window
+        pred_latents = current_seq[:, pred_indices, :latent_dim]
+        gt_latents = micro_batch[:, pred_indices, :latent_dim]
+        
+        # Decode and denormalize
+        pred_latents_flat = pred_latents.reshape(-1, latent_dim)
+        gt_latents_flat = gt_latents.reshape(-1, latent_dim)
+        
+        pred_dec_v = ae.decode(pred_latents_flat) # (B*pred_len, 375)
+        gt_dec_v = ae.decode(gt_latents_flat) # (B*pred_len, 375)
+        
+        # Extract 63rd triplet
+        pred_v_63 = pred_dec_v.reshape(B, num_predict_t, num_x, 125, 3)[:, :, :, triplet_idx, :]
+        gt_v_63 = gt_dec_v.reshape(B, num_predict_t, num_x, 125, 3)[:, :, :, triplet_idx, :]
+        
+        # Denormalize
+        pred_v_63_np = pred_v_63.cpu().numpy()
+        gt_v_63_np = gt_v_63.cpu().numpy()
+        
+        pred_denorm = converter.unconvert(pred_v_63_np.reshape(-1, 3)).reshape(B, num_predict_t, num_x, 3)
+        gt_denorm = converter.unconvert(gt_v_63_np.reshape(-1, 3)).reshape(B, num_predict_t, num_x, 3)
+        
+        # Calculate RMSE
+        sq_err = np.sum((gt_denorm - pred_denorm)**2, axis=-1) # (B, P, 26)
+        rmse_per_sample = np.sqrt(np.mean(sq_err, axis=(1, 2))) # (B,)
+        all_rmse.extend(rmse_per_sample.tolist())
+        
+        # Explicit memory cleanup
+        if Config.DEVICE == "mps":
+            torch.mps.empty_cache()
+    
+    return float(np.mean(all_rmse))
+
 def main():
     # Big Rainbow Message
     msg = f"USING DEVICE: {Config.DEVICE.upper()} - MODEL IS IN EVAL MODE AND CANNOT BE TRAINED"
@@ -185,7 +278,7 @@ def main():
         data_path = Config.get_data_path()
         print(f"Using dataset: {Colors.YELLOW}{data_path}{Colors.RESET}")
         dataset = EvalDataset(data_path, max_samples=Config.LIMIT_SAMPLES)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=8, shuffle=False)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
     except Exception as e:
         print(f"{Colors.RED}Error loading dataset: {e}{Colors.RESET}")
         return
@@ -198,6 +291,7 @@ def main():
     NUM_DETAILED = 3
     stats_data = []
     staircase_data = [] # To store {context_count: [sq_errors]}
+    interleave_results = [] # To store {context: C, predict: P, rmse: R}
 
     with torch.no_grad():
         for batch_idx, (batch, originals_batch) in enumerate(tqdm(loader, desc="Evaluating Transformer")):
@@ -206,8 +300,17 @@ def main():
             B = batch.shape[0]
             
             # 1. Standard Transformer Prediction (Full sequence)
-            inputs = batch[:, :-1, :]
-            outputs = transformer(inputs) # (B, 2079, Config.LATENT_DIM)
+            # (Keep existing evaluation logic for overall stats)
+            # Process in micro-batches if B > MICRO_BATCH_SIZE to avoid OOM
+            outputs_list = []
+            for i in range(0, B, Config.MICRO_BATCH_SIZE):
+                micro_inputs = batch[i:i+Config.MICRO_BATCH_SIZE, :-1, :]
+                micro_outputs = transformer(micro_inputs) # (mB, 2079, Config.LATENT_DIM)
+                outputs_list.append(micro_outputs)
+                if Config.DEVICE == "mps":
+                    torch.mps.empty_cache()
+            
+            outputs = torch.cat(outputs_list, dim=0) # (B, 2079, Config.LATENT_DIM)
             
             # 2. Extract 80th time step predictions
             # 80th time period starts at 79 * 26 = 2054, ends at 80 * 26 = 2080
@@ -222,15 +325,32 @@ def main():
             param_t80 = batch[:, t80_target_indices, 51] # (B, 26)
             
             # 3. Decode Latents to Velocities
-            pred_latents_flat = pred_latents_t80.reshape(-1, Config.LATENT_DIM)
-            gt_latents_flat = gt_latents_t80.reshape(-1, Config.LATENT_DIM)
+            # Process in micro-batches to avoid OOM
+            pred_v_63_list = []
+            gt_v_63_list = []
             
-            pred_velocities_full = ae.decode(pred_latents_flat) # (B*26, 375)
-            gt_velocities_full = ae.decode(gt_latents_flat) # (B*26, 375)
-            
-            # Reshape and extract 63rd triplet (Central Velocity)
-            pred_v_63 = pred_velocities_full.reshape(B, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
-            gt_v_63 = gt_velocities_full.reshape(B, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
+            for i in range(0, B, Config.MICRO_BATCH_SIZE):
+                m_pred_latents = pred_latents_t80[i:i+Config.MICRO_BATCH_SIZE]
+                m_gt_latents = gt_latents_t80[i:i+Config.MICRO_BATCH_SIZE]
+                mB = m_pred_latents.shape[0]
+                
+                m_pred_latents_flat = m_pred_latents.reshape(-1, Config.LATENT_DIM)
+                m_gt_latents_flat = m_gt_latents.reshape(-1, Config.LATENT_DIM)
+                
+                m_pred_velocities_full = ae.decode(m_pred_latents_flat) # (mB*26, 375)
+                m_gt_velocities_full = ae.decode(m_gt_latents_flat) # (mB*26, 375)
+                
+                m_pred_v_63 = m_pred_velocities_full.reshape(mB, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
+                m_gt_v_63 = m_gt_velocities_full.reshape(mB, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
+                
+                pred_v_63_list.append(m_pred_v_63)
+                gt_v_63_list.append(m_gt_v_63)
+                
+                if Config.DEVICE == "mps":
+                    torch.mps.empty_cache()
+
+            pred_v_63 = torch.cat(pred_v_63_list, dim=0)
+            gt_v_63 = torch.cat(gt_v_63_list, dim=0)
             
             # 4. Denormalize for statistics
             pred_v_63_np = pred_v_63.cpu().numpy()
@@ -257,53 +377,47 @@ def main():
                     })
             
             # --- Staircase Evaluation ---
-            # Predict STAIRCASE_TARGET_IDX (2061) given varying context from T80 (2054 onwards)
-            target_idx = Config.STAIRCASE_TARGET_IDX
+            # Evaluate prediction of the 80th time step given varying context
+            for c in Config.STAIRCASE_CONTEXTS:
+                # To predict the 80th time step, we need to predict until T80
+                # num_predict_t = 80 - c
+                p = 80 - c
+                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
+                staircase_data.append({
+                    'context_time_steps': c,
+                    'rmse': rmse
+                })
+
+            # --- New Permutations Evaluation ---
+            # These are computationally expensive, so we only do them for a subset of the batch
+            # or we do them once for the whole batch and average.
+            # Let's do it for the whole batch to get stable stats.
             
-            # GT Velocity for point 2061
-            # In our current batch processing for T80, index 2061 is j=7
-            gt_v_staircase = gt_denorm_v[:, 7, :] # (B, 3)
-            
-            for k in Config.STAIRCASE_CONTEXT_COUNTS:
-                # k is number of points from T80 given.
-                # If k=7, we have 2054...2060. Prediction for 2061 is at index 2060.
-                # If k < 7, we need to autoregressively predict up to 2061.
-                
-                # Context sequence length
-                context_len = 2054 + k
-                
-                if k == 7:
-                    # Single step prediction sufficient
-                    staircase_pred_latent = outputs[:, context_len - 1, :] # (B, 47)
-                else:
-                    # Autoregressive prediction
-                    # We start with context_len points and need to reach 2061+1 points
-                    # predict_autoregressive expects (1, L, 52)
-                    # We'll do it manually here for the batch to be faster
-                    current_seq = batch[:, :context_len, :].clone()
-                    for step in range(context_len, target_idx + 1):
-                        step_out = transformer(current_seq)
-                        next_latent = step_out[:, -1, :] # (B, 47)
-                        
-                        # Prepare next input: we need to append the next point's metadata
-                        # but we only have metadata for the batch.
-                        if step < Config.SEQ_LEN:
-                            # Use metadata from the original batch
-                            new_token = batch[:, step:step+1, :].clone()
-                            new_token[:, 0, :Config.LATENT_DIM] = next_latent
-                            current_seq = torch.cat([current_seq, new_token], dim=1)
-                    staircase_pred_latent = next_latent
-                
-                # Decode and denormalize
-                dec_v = ae.decode(staircase_pred_latent) # (B, 375)
-                pred_v_63_staircase = dec_v.reshape(B, 125, 3)[:, Config.TRIPLET_IDX, :]
-                pred_denorm_v_staircase = converter.unconvert(pred_v_63_staircase.cpu().numpy()) # (B, 3)
-                
-                # Calculate SQ Error
-                sq_err_staircase = np.sum((gt_v_staircase - pred_denorm_v_staircase)**2, axis=1) # (B,)
-                
-                for err in sq_err_staircase:
-                    staircase_data.append({'context_count': k, 'sq_error': err})
+            # 1. Interleave: Context T(1..2n-1) -> Predict T(2n)
+            # n = 1..40 (max T80)
+            for n in range(1, 41):
+                c = 2*n - 1
+                p = 1
+                if c + p > 80: break
+                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
+                interleave_results.append({'mode': 'interleave', 'c': c, 'p': p, 'rmse': rmse})
+                if rmse > Config.RMSE_LIMIT: break
+
+            # 2. Fixed Context (C=1): Predict P=2, 4, 8, ... until RMSE > 0.05
+            p = 2
+            while p < 80:
+                rmse = evaluate_permutation(transformer, ae, converter, batch, 1, p)
+                interleave_results.append({'mode': 'jump_c1', 'c': 1, 'p': p, 'rmse': rmse})
+                if rmse > Config.RMSE_LIMIT: break
+                p *= 2 # Exponential jumps
+
+            # 3. Variable Context (C=2, 3, 5, 10...): Predict P until collapse
+            for c in [2, 5, 10, 20]:
+                for p in [1, 2, 5, 10, 20]:
+                    if c + p > 80: break
+                    rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
+                    interleave_results.append({'mode': f'var_c{c}', 'c': c, 'p': p, 'rmse': rmse})
+                    if rmse > Config.RMSE_LIMIT: break
             
             # Detailed reporting for first few samples
             if batch_idx == 0:
@@ -348,7 +462,7 @@ def main():
 
     # Staircase RMSE
     df_staircase = pd.DataFrame(staircase_data)
-    rmse_staircase = df_staircase.groupby('context_count')['sq_error'].mean().apply(np.sqrt)
+    rmse_staircase = df_staircase.groupby('context_time_steps')['rmse'].mean()
     
     # RMSE for prediction windows
     # j ranges from 0 (idx 2054) to 25 (idx 2079)
@@ -366,6 +480,10 @@ def main():
     yz_stats = df.groupby(['y', 'z'])['sq_error'].mean().apply(np.sqrt).reset_index()
     yz_stats.columns = ['y', 'z', 'rmse']
 
+    # Aggregate Interleave Results
+    df_interleave = pd.DataFrame(interleave_results)
+    summary_interleave = df_interleave.groupby(['mode', 'c', 'p'])['rmse'].mean().reset_index()
+
     results = {
         'rmse_per_pos': rmse_per_pos.to_dict(),
         'rmse_staircase': rmse_staircase.to_dict(),
@@ -375,7 +493,8 @@ def main():
         'rmse_l8': float(rmse_l8),
         'rmse_l16': float(rmse_l16),
         'rmse_overall': float(rmse_overall),
-        'detailed_reports': detailed_reports
+        'detailed_reports': detailed_reports,
+        'interleave_summary': summary_interleave.to_dict(orient='records')
     }
 
     # Helper to convert numpy types for JSON serialization
@@ -403,7 +522,7 @@ def main():
     print("-" * 50)
     print(f"STAIRCASE EVALUATION (Velocity Units):")
     for k, val in rmse_staircase.items():
-        print(f"Given {k} in T80 -> Pred pos 8 RMSE: {Colors.CYAN}{val:.4e}{Colors.RESET}")
+        print(f"Given {k} time steps -> T80 RMSE: {Colors.CYAN}{val:.4e}{Colors.RESET}")
     print("-" * 50)
     print(f"RMSE per Experiment (First 10 Params):\n{rmse_per_param.head(10).apply(lambda x: f'{x:.4e}')}")
     print("-" * 50)

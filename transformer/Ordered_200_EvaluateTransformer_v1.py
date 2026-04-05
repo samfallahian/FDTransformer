@@ -7,6 +7,7 @@ import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D # Required for 3d projection
+from concurrent.futures import ThreadPoolExecutor
 
 # Add project root to sys.path to allow imports from other modules
 PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
@@ -87,7 +88,7 @@ class Config:
     MICRO_BATCH_SIZE = 1 
     
     # Fast evaluation
-    LIMIT_SAMPLES = 50 # Randomly select 50 of the 1MM records (to speed up multiple permutations)
+    LIMIT_SAMPLES = 10 # Randomly select 50 of the 1MM records (to speed up multiple permutations)
     
     # Staircase settings
     STAIRCASE_CONTEXTS = [1, 10, 20, 40, 60, 79]
@@ -140,7 +141,10 @@ class EvalDataset(torch.utils.data.Dataset):
             
         return torch.from_numpy(data).float(), torch.zeros((Config.NUM_X, 3))
 
-def load_models():
+def load_models(device=None):
+    if device is None:
+        device = Config.DEVICE
+        
     # Patch for torch._dynamo compatibility issues (e.g., missing ConvertFrameBox)
     try:
         import torch._dynamo.convert_frame
@@ -153,8 +157,8 @@ def load_models():
         pass
 
     # 1. Load Transformer
-    print(f"Loading Transformer from: {Colors.CYAN}{Config.TRANSFORMER_CHECKPOINT}{Colors.RESET}")
-    checkpoint = torch.load(Config.TRANSFORMER_CHECKPOINT, map_location=Config.DEVICE, weights_only=False)
+    print(f"Loading Transformer to {Colors.MAGENTA}{device}{Colors.RESET} from: {Colors.CYAN}{Config.TRANSFORMER_CHECKPOINT}{Colors.RESET}")
+    checkpoint = torch.load(Config.TRANSFORMER_CHECKPOINT, map_location=device, weights_only=False)
     
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         # Use the embedded model object for maximum compatibility
@@ -162,31 +166,31 @@ def load_models():
         
         # If it's a compiled model (OptimizedModule), get the original model
         if hasattr(transformer, '_orig_mod'):
-            print("Detected compiled model, extracting original module...")
+            print(f"Detected compiled model for {device}, extracting original module...")
             transformer = transformer._orig_mod
         elif hasattr(transformer, 'module'):
             # In some cases it might be wrapped in DataParallel/DistributedDataParallel
             transformer = transformer.module
     else:
         # Reconstruct if necessary (using config in checkpoint)
-        print("Reconstructing Transformer model from checkpoint config...")
+        print(f"Reconstructing Transformer model for {device} from checkpoint config...")
         from types import SimpleNamespace
         cfg = SimpleNamespace(**checkpoint['config'])
         transformer = OrderedTransformerV1(cfg)
         transformer.load_state_dict(checkpoint['model_state_dict'])
         
-    transformer.to(Config.DEVICE)
+    transformer.to(device)
     transformer.eval()
     
     # 2. Load Encoder/Decoder (TorchScript "one file" approach)
-    print(f"Loading Scripted AE from: {Colors.CYAN}{Config.ENCODER_CHECKPOINT}{Colors.RESET}")
-    ae = torch.jit.load(Config.ENCODER_CHECKPOINT, map_location=Config.DEVICE)
-    ae.to(Config.DEVICE)
+    print(f"Loading Scripted AE to {Colors.MAGENTA}{device}{Colors.RESET} from: {Colors.CYAN}{Config.ENCODER_CHECKPOINT}{Colors.RESET}")
+    ae = torch.jit.load(Config.ENCODER_CHECKPOINT, map_location=device)
+    ae.to(device)
     ae.eval()
     
     return transformer, ae
 
-def evaluate_permutation(transformer, ae, converter, batch, num_context_t, num_predict_t, triplet_idx=62):
+def evaluate_permutation(transformer, ae, converter, batch, num_context_t, num_predict_t, triplet_idx=62, device='cpu'):
     """
     Evaluates a single permutation: (Context Time Steps, Prediction Time Steps).
     Returns the average RMSE across the prediction window.
@@ -253,79 +257,67 @@ def evaluate_permutation(transformer, ae, converter, batch, num_context_t, num_p
         all_rmse.extend(rmse_per_sample.tolist())
         
         # Explicit memory cleanup
-        if Config.DEVICE == "mps":
+        if device == "mps":
             torch.mps.empty_cache()
     
     return float(np.mean(all_rmse))
 
-def main():
-    # Big Rainbow Message
-    msg = f"USING DEVICE: {Config.DEVICE.upper()} - MODEL IS IN EVAL MODE AND CANNOT BE TRAINED"
-    print("\n" + "="*80)
-    print(Colors.rainbow(f"  {msg}  "))
-    print("="*80 + "\n")
+def evaluate_on_device(device, indices, data_path, has_originals):
+    """Run evaluation on a specific device using a subset of data indices."""
+    print(f"{Colors.BOLD}Starting evaluation on {Colors.CYAN}{device}{Colors.RESET} for {len(indices)} samples")
     
-    # Load models
     try:
-        transformer, ae = load_models()
+        transformer, ae = load_models(device)
         converter = FloatConverter()
     except Exception as e:
-        print(f"{Colors.RED}Error loading models: {e}{Colors.RESET}")
-        return
+        print(f"{Colors.RED}Error loading models on {device}: {e}{Colors.RESET}")
+        return None
 
-    # Load dataset
-    try:
-        data_path = Config.get_data_path()
-        print(f"Using dataset: {Colors.YELLOW}{data_path}{Colors.RESET}")
-        dataset = EvalDataset(data_path, max_samples=Config.LIMIT_SAMPLES)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
-    except Exception as e:
-        print(f"{Colors.RED}Error loading dataset: {e}{Colors.RESET}")
-        return
+    # Custom subset loader
+    class IndexedEvalDataset(EvalDataset):
+        def __init__(self, h5_path, indices):
+            super().__init__(h5_path)
+            self.indices = indices
+            self.length = len(indices)
 
-    print(f"Validation dataset size: {len(dataset)}")
-    
-    # Evaluation Loop
-    total_samples_processed = 0
-    detailed_reports = []
-    NUM_DETAILED = 3
+    dataset = IndexedEvalDataset(data_path, indices)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+
     stats_data = []
-    staircase_data = [] # To store {context_count: [sq_errors]}
-    interleave_results = [] # To store {context: C, predict: P, rmse: R}
+    staircase_data = []
+    interleave_results = []
+    detailed_reports = []
+    NUM_DETAILED = 1 if device == "cpu" else 2 # Just to have some diversity
+    total_samples_processed = 0
 
     with torch.no_grad():
-        for batch_idx, (batch, originals_batch) in enumerate(tqdm(loader, desc="Evaluating Transformer")):
-            batch = batch.to(Config.DEVICE) # (B, 2080, 52)
-            originals_batch = originals_batch.to(Config.DEVICE) # (B, 26, 3)
+        for batch_idx, (batch, originals_batch) in enumerate(tqdm(loader, desc=f"Eval {device}")):
+            batch = batch.to(device)
+            originals_batch = originals_batch.to(device)
             B = batch.shape[0]
             
-            # 1. Standard Transformer Prediction (Full sequence)
-            # (Keep existing evaluation logic for overall stats)
-            # Process in micro-batches if B > MICRO_BATCH_SIZE to avoid OOM
+            # 1. Standard Transformer Prediction
             outputs_list = []
             for i in range(0, B, Config.MICRO_BATCH_SIZE):
                 micro_inputs = batch[i:i+Config.MICRO_BATCH_SIZE, :-1, :]
-                micro_outputs = transformer(micro_inputs) # (mB, 2079, Config.LATENT_DIM)
+                micro_outputs = transformer(micro_inputs)
                 outputs_list.append(micro_outputs)
-                if Config.DEVICE == "mps":
+                if device == "mps":
                     torch.mps.empty_cache()
             
-            outputs = torch.cat(outputs_list, dim=0) # (B, 2079, Config.LATENT_DIM)
+            outputs = torch.cat(outputs_list, dim=0)
             
             # 2. Extract 80th time step predictions
-            # 80th time period starts at 79 * 26 = 2054, ends at 80 * 26 = 2080
             t80_target_indices = range(2054, 2080)
             t80_output_indices = [i-1 for i in t80_target_indices]
             
-            pred_latents_t80 = outputs[:, t80_output_indices, :] # (B, 26, 47)
-            gt_latents_t80 = batch[:, t80_target_indices, :Config.LATENT_DIM] # (B, 26, 47)
+            pred_latents_t80 = outputs[:, t80_output_indices, :]
+            gt_latents_t80 = batch[:, t80_target_indices, :Config.LATENT_DIM]
             
-            # Metadata for 80th time step
-            coords_t80 = batch[:, t80_target_indices, 47:50] # (B, 26, 3)
-            param_t80 = batch[:, t80_target_indices, 51] # (B, 26)
+            coords_t80 = batch[:, t80_target_indices, 47:50]
+            param_t80 = batch[:, t80_target_indices, 51]
             
             # 3. Decode Latents to Velocities
-            # Process in micro-batches to avoid OOM
             pred_v_63_list = []
             gt_v_63_list = []
             
@@ -337,8 +329,8 @@ def main():
                 m_pred_latents_flat = m_pred_latents.reshape(-1, Config.LATENT_DIM)
                 m_gt_latents_flat = m_gt_latents.reshape(-1, Config.LATENT_DIM)
                 
-                m_pred_velocities_full = ae.decode(m_pred_latents_flat) # (mB*26, 375)
-                m_gt_velocities_full = ae.decode(m_gt_latents_flat) # (mB*26, 375)
+                m_pred_velocities_full = ae.decode(m_pred_latents_flat)
+                m_gt_velocities_full = ae.decode(m_gt_latents_flat)
                 
                 m_pred_v_63 = m_pred_velocities_full.reshape(mB, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
                 m_gt_v_63 = m_gt_velocities_full.reshape(mB, 26, 125, 3)[:, :, Config.TRIPLET_IDX, :]
@@ -346,25 +338,24 @@ def main():
                 pred_v_63_list.append(m_pred_v_63)
                 gt_v_63_list.append(m_gt_v_63)
                 
-                if Config.DEVICE == "mps":
+                if device == "mps":
                     torch.mps.empty_cache()
 
             pred_v_63 = torch.cat(pred_v_63_list, dim=0)
             gt_v_63 = torch.cat(gt_v_63_list, dim=0)
             
-            # 4. Denormalize for statistics
+            # 4. Denormalize
             pred_v_63_np = pred_v_63.cpu().numpy()
             pred_denorm_v = converter.unconvert(pred_v_63_np.reshape(-1, 3)).reshape(B, 26, 3)
             
-            if dataset.has_originals:
+            if has_originals:
                 gt_denorm_v = originals_batch.cpu().numpy()
             else:
                 gt_v_63_np = gt_v_63.cpu().numpy()
                 gt_denorm_v = converter.unconvert(gt_v_63_np.reshape(-1, 3)).reshape(B, 26, 3)
                 
-            # Calculate squared errors
-            sq_errors = np.sum((gt_denorm_v - pred_denorm_v)**2, axis=2) # (B, 26)
-            params = param_t80[:, 0].cpu().numpy() # (B,)
+            sq_errors = np.sum((gt_denorm_v - pred_denorm_v)**2, axis=2)
+            params = param_t80[:, 0].cpu().numpy()
             
             for i in range(B):
                 for j in range(26):
@@ -377,53 +368,38 @@ def main():
                     })
             
             # --- Staircase Evaluation ---
-            # Evaluate prediction of the 80th time step given varying context
             for c in Config.STAIRCASE_CONTEXTS:
-                # To predict the 80th time step, we need to predict until T80
-                # num_predict_t = 80 - c
                 p = 80 - c
-                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
-                staircase_data.append({
-                    'context_time_steps': c,
-                    'rmse': rmse
-                })
+                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p, device=device)
+                staircase_data.append({'context_time_steps': c, 'rmse': rmse})
 
             # --- New Permutations Evaluation ---
-            # These are computationally expensive, so we only do them for a subset of the batch
-            # or we do them once for the whole batch and average.
-            # Let's do it for the whole batch to get stable stats.
-            
-            # 1. Interleave: Context T(1..2n-1) -> Predict T(2n)
-            # n = 1..40 (max T80)
             for n in range(1, 41):
                 c = 2*n - 1
                 p = 1
                 if c + p > 80: break
-                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
+                rmse = evaluate_permutation(transformer, ae, converter, batch, c, p, device=device)
                 interleave_results.append({'mode': 'interleave', 'c': c, 'p': p, 'rmse': rmse})
                 if rmse > Config.RMSE_LIMIT: break
 
-            # 2. Fixed Context (C=1): Predict P=2, 4, 8, ... until RMSE > 0.05
-            p = 2
-            while p < 80:
-                rmse = evaluate_permutation(transformer, ae, converter, batch, 1, p)
-                interleave_results.append({'mode': 'jump_c1', 'c': 1, 'p': p, 'rmse': rmse})
+            p_jump = 2
+            while p_jump < 80:
+                rmse = evaluate_permutation(transformer, ae, converter, batch, 1, p_jump, device=device)
+                interleave_results.append({'mode': 'jump_c1', 'c': 1, 'p': p_jump, 'rmse': rmse})
                 if rmse > Config.RMSE_LIMIT: break
-                p *= 2 # Exponential jumps
+                p_jump *= 2
 
-            # 3. Variable Context (C=2, 3, 5, 10...): Predict P until collapse
-            for c in [2, 5, 10, 20]:
-                for p in [1, 2, 5, 10, 20]:
-                    if c + p > 80: break
-                    rmse = evaluate_permutation(transformer, ae, converter, batch, c, p)
-                    interleave_results.append({'mode': f'var_c{c}', 'c': c, 'p': p, 'rmse': rmse})
+            for c_var in [2, 5, 10, 20]:
+                for p_var in [1, 2, 5, 10, 20]:
+                    if c_var + p_var > 80: break
+                    rmse = evaluate_permutation(transformer, ae, converter, batch, c_var, p_var, device=device)
+                    interleave_results.append({'mode': f'var_c{c_var}', 'c': c_var, 'p': p_var, 'rmse': rmse})
                     if rmse > Config.RMSE_LIMIT: break
             
-            # Detailed reporting for first few samples
             if batch_idx == 0:
                 for i in range(min(B, NUM_DETAILED)):
                     sample_report = {
-                        'sample_idx': i,
+                        'sample_idx': total_samples_processed + i,
                         'param': params[i],
                         'y': coords_t80[i, 0, 1].item(),
                         'z': coords_t80[i, 0, 2].item(),
@@ -431,11 +407,9 @@ def main():
                     }
                     for j in range(26):
                         original_pos_idx = t80_target_indices[j]
-                        is_target = original_pos_idx in Config.TARGET_POSITIONS
-                        is_target_2 = original_pos_idx in Config.TARGET_POSITIONS_2
-                        is_target_3 = original_pos_idx in Config.TARGET_POSITIONS_3
-                        
-                        target_label = "L4" if is_target else "L8" if is_target_2 else "L16" if is_target_3 else "T80"
+                        target_label = "L4" if original_pos_idx in Config.TARGET_POSITIONS else \
+                                       "L8" if original_pos_idx in Config.TARGET_POSITIONS_2 else \
+                                       "L16" if original_pos_idx in Config.TARGET_POSITIONS_3 else "T80"
                         
                         sample_report['positions'].append({
                             'idx': original_pos_idx,
@@ -449,6 +423,77 @@ def main():
                     detailed_reports.append(sample_report)
 
             total_samples_processed += B
+
+    return {
+        'stats_data': stats_data,
+        'staircase_data': staircase_data,
+        'interleave_results': interleave_results,
+        'detailed_reports': detailed_reports,
+        'total_samples_processed': total_samples_processed
+    }
+
+def main():
+    # Big Rainbow Message
+    msg = f"INTERLEAVED EVALUATION: CPU + {Config.DEVICE.upper()}"
+    print("\n" + "="*80)
+    print(Colors.rainbow(f"  {msg}  "))
+    print("="*80 + "\n")
+    
+    # Load dataset to get indices
+    try:
+        data_path = Config.get_data_path()
+        print(f"Using dataset: {Colors.YELLOW}{data_path}{Colors.RESET}")
+        
+        # Initial access to get total available and check for originals
+        with h5py.File(data_path, 'r') as f:
+            total_available = f['data'].shape[0]
+            has_originals = 'originals' in f
+            
+        limit = min(Config.LIMIT_SAMPLES, total_available)
+        all_indices = np.random.choice(total_available, limit, replace=False)
+        all_indices.sort()
+        
+        # Split indices for CPU and GPU
+        mid = len(all_indices) // 2
+        gpu_indices = all_indices[:mid]
+        cpu_indices = all_indices[mid:]
+        
+        print(f"Total samples: {len(all_indices)} (GPU: {len(gpu_indices)}, CPU: {len(cpu_indices)})")
+    except Exception as e:
+        print(f"{Colors.RED}Error preparing dataset: {e}{Colors.RESET}")
+        return
+
+    # Run evaluation in parallel
+    results_list = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = []
+        if len(gpu_indices) > 0:
+            futures.append(executor.submit(evaluate_on_device, Config.DEVICE, gpu_indices, data_path, has_originals))
+        if len(cpu_indices) > 0:
+            futures.append(executor.submit(evaluate_on_device, 'cpu', cpu_indices, data_path, has_originals))
+            
+        for future in futures:
+            res = future.result()
+            if res:
+                results_list.append(res)
+
+    # Merge results
+    stats_data = []
+    staircase_data = []
+    interleave_results = []
+    detailed_reports = []
+    total_samples_processed = 0
+    
+    for res in results_list:
+        stats_data.extend(res['stats_data'])
+        staircase_data.extend(res['staircase_data'])
+        interleave_results.extend(res['interleave_results'])
+        detailed_reports.extend(res['detailed_reports'])
+        total_samples_processed += res['total_samples_processed']
+
+    if total_samples_processed == 0:
+        print(f"{Colors.RED}No samples were processed.{Colors.RESET}")
+        return
 
     # --- Statistics Calculation ---
     print(f"\n{Colors.BOLD}CALCULATING SUMMARY STATISTICS...{Colors.RESET}")
@@ -527,7 +572,7 @@ def main():
     print(f"RMSE per Experiment (First 10 Params):\n{rmse_per_param.head(10).apply(lambda x: f'{x:.4e}')}")
     print("-" * 50)
 
-    print(f"\n{Colors.BOLD}DETAILED SAMPLES (First {NUM_DETAILED}){Colors.RESET}")
+    print(f"\n{Colors.BOLD}DETAILED SAMPLES{Colors.RESET}")
     for report in detailed_reports:
         print(f"{Colors.MAGENTA}Sample {report['sample_idx']} | Param: {report['param']:.2f} | Y: {report['y']:.4f} | Z: {report['z']:.4f}{Colors.RESET}")
         header = f"{'Pos':<4} | {'X':<6} | {'Label':<6} | {'Truth (vx, vy, vz)':<30} | {'Predicted (vx, vy, vz)':<30} | {'Error'}"

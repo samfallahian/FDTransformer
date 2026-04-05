@@ -11,14 +11,14 @@ The Staircase measures how accuracy for a fixed future target ($T_{80}$) improve
 
 *   **Pointer:** See `Documentation/diagram_staircase_concept.pdf` for the conceptual workflow.
 *   **Result:** Providing $c=79$ context steps versus $c=1$ step resulted in a **5.5% reduction in RMSE** (from 0.0307 to 0.0290).
-*   **Analysis:** In chaotic fluid systems, a 5.5% improvement at a **500ms** horizon (80 steps) is non-trivial. It indicates the Transformer is successfully leveraging "Vortex Memory" to constrain the evolution of the flow, rather than just performing one-step extrapolations.
+*   **Analysis:** In chaotic fluid systems, a 5.5% improvement at a **667ms** horizon (80 steps) is non-trivial. It indicates the Transformer is successfully leveraging "Vortex Memory" to constrain the evolution of the flow, rather than just performing one-step extrapolations.
 
 ### B. Interleave Evaluation (Sequential "Warming Up")
 Interleave tests the model's one-step-ahead reliability as the context window fills up ($P(T_{c+1} | T_{1 \dots c})$).
 
 *   **Pointer:** See `Documentation/diagram_interleave_concept.pdf`.
 *   **Result:** RMSE drops from **0.0330** to **0.0094** as the window ($c$) increases to 25.
-*   **Interpretation:** The model requires a "warm-up" period of approximately 25 frames (roughly 150ms). Once the attention mechanism has sufficient temporal history, it achieves near-perfect tracking of the fluid gradients.
+*   **Interpretation:** The model requires a "warm-up" period of approximately 25 frames (roughly **208ms**). Once the attention mechanism has sufficient temporal history, it achieves near-perfect tracking of the fluid gradients.
 
 ### C. Jump Evaluation (Temporal Teleportation)
 The "Jump" is the most rigorous test: giving the model only the **first frame** ($T_1$) and asking it to predict a state far in the future ($T_{1+p}$) without any intermediate updates.

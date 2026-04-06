@@ -63,17 +63,45 @@ class OrderedTransformerV1(nn.Module):
             Block(config.EMBED_SIZE, config.N_HEADS, config.DROPOUT) 
             for _ in range(config.N_LAYERS)
         ])
-        
+    
         # Final normalization and output head
         self.ln_f = nn.LayerNorm(config.EMBED_SIZE)
         self.output_head = nn.Linear(config.EMBED_SIZE, config.LATENT_DIM, bias=config.BIAS)
-        
+    
         # Pre-calculate and register time/space indices for the flattened sequence
         # (8, 26) grid -> 208 sequence
         time_ids = torch.arange(config.NUM_TIME).repeat_interleave(config.NUM_X)
         space_ids = torch.arange(config.NUM_X).repeat(config.NUM_TIME)
         self.register_buffer("time_ids", time_ids)
         self.register_buffer("space_ids", space_ids)
+
+        # KV Cache initialization
+        self._kv_cache = None
+
+    def _reset_kv_cache(self):
+        self._kv_cache = [None] * len(self.blocks)
+
+    def forward_with_cache(self, x, pos):
+        """
+        x: (B, 1, InputDim) - single new token
+        pos: integer position in sequence
+        """
+        B, T, C = x.shape
+        assert T == 1
+    
+        # 1. Project
+        x = self.input_projection(x)
+    
+        # 2. Add embeddings
+        x = x + self.time_embeddings(self.time_ids[pos:pos+1]) + self.space_embeddings(self.space_ids[pos:pos+1])
+    
+        # 3. Pass through blocks with manual attention to handle cache
+        # Since nn.TransformerEncoderLayer doesn't easily expose KV cache,
+        # we'd need to implement the attention part manually or use a trick.
+        # For now, let's optimize the full forward by using the mask correctly.
+        # Actually, standard torch.nn.Transformer handles the mask.
+        # Let's stick to full forward but optimize the loop in the evaluation script.
+        return self.forward(x) # Placeholder for now, real optimization is in eval script
 
     def forward(self, x):
         # x shape: (B, T, InputDim) where T <= 208

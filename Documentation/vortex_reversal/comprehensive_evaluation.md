@@ -30,11 +30,9 @@ The evaluation reveals a critical threshold for prediction stability:
 The following high-resolution documentation has been generated to support these findings:
 
 - **[PDF] [Sparse Evaluation Comparison (1200 DPI)](sparse_evaluation_comparison.pdf)**: Shows side-by-side performance for (T=1, C=5), (T=12, C=26), and (T=40, C=26).
-- **[PDF] [Context Sensitivity Heatmap (1200 DPI)](context_sensitivity_heatmap.pdf)**: Illustrates the RMSE of $\omega_z$ across the full sweep of time and space variations. *(Generated via sparse sampling and architectural interpolation)*.
+- **[PDF] [Context Sensitivity Heatmap (1200 DPI)](context_sensitivity_heatmap.pdf)**: Illustrates the RMSE of $\omega_z$ across the full sweep of time and space variations, averaged across all ≥90% vortex core (y, z) coordinates from 18 reversal events. *(Generated via sparse sampling and cubic interpolation)*.
 - **[PDF] [Direct Vortex Reversal Evaluation (1200 DPI)](vortex_reversal_evaluation.pdf)**: Detailed prediction plots for primary identified reversal events.
-- **[PDF] [Phase Space Portraits (1200 DPI)](vortex_phase_portrait.pdf)**: Topological "orbits" showing state stability.
-- **[PDF] [Normalized State Prediction (1200 DPI)](normalized_vorticity_state.pdf)**: Demonstrates perfect phase-lock in timing and sign.
-- **[PDF] [Temporal Synchronization Score (1200 DPI)](prediction_synchronization.pdf)**: Quantitative Pearson correlation of flow regimes.
+- **[PDF] [Core Temporal Autocorrelation](core_temporal_correlation.pdf)**: For each reversal event, shows the Pearson correlation of vorticity magnitude at the ≥90% core grid points vs. the same locations at varying timestep lags (±1 to ±50 steps). Quantifies how quickly the vortex core structure decorrelates over time.
 
 ## 4. Conclusion
 

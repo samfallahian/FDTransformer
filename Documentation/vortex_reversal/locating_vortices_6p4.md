@@ -1,6 +1,6 @@
 # Identification and Documentation of Vortex Reversals in 6p4 Dataset
 
-This document provides a technical summary of the vortex reversal events identified in the `6p4` fluid dynamics dataset. It details the methodology for 3D vortex identification, the temporal stability of these events, and the visualization suite developed for scientific documentation.
+This document provides a technical summary of the vortex reversal events identified for the `6p4` dataset. It details the methodology for 3D vortex identification, the temporal stability of these events, and the visualization suite developed for scientific documentation.
 
 ## 1. Methodology: 3D Vortex Identification
 
@@ -21,20 +21,32 @@ $$Q = \frac{1}{2}(||\Omega||^2 - ||S||^2)$$
 ### C. Vortex Core Localization (Region-Based)
 Rather than reporting a single point, each vortex core is characterized as a **spatial region**. For each timestep, we:
 
-1. Compute the vorticity magnitude field $|\vec{\omega}|$ across the 3D velocity grid data (`.pkl.gz` files) within the interaction region $x \in [-30, 30]$.
+1. Compute the vorticity magnitude field $|\vec{\omega}|$ across the 3D velocity grid data within the interaction region $x \in [-30, 30]$.
 2. Identify the **peak vorticity magnitude** and define the core region as all grid points where $|\vec{\omega}| \geq 90\%$ of the peak value.
 3. Compute the **vorticity-weighted centroid** $(c_x, c_y, c_z)$ of this core region, where each grid point's position is weighted by its vorticity magnitude.
 4. Report the **half-span extent** $(\pm e_x, \pm e_y, \pm e_z)$ — half the bounding box of the core region — to characterize the spatial spread.
 5. **Store every individual core grid point** exhaustively in `vorticity_core_points.csv`, with its $(x, y, z)$ coordinates, vorticity magnitude, and full vorticity vector $(\omega_x, \omega_y, \omega_z)$.
 
-This approach captures the physical reality that vortex cores are spatially extended structures, not point singularities. The positional data file (`6p4.txt`) is used **only** to identify candidate timesteps where the tracked object reaches local $y$-extrema (trajectory reversals), which correlate with vortex reversal events.
+This approach captures the physical reality that vortex cores are spatially extended structures, not point singularities.
 
-### D. Output Files
+### D. Files
+
+**Input**
+
+| File | Description |
+| :--- | :--- |
+| `6p4.txt` | Positional trajectory data. Used only to identify candidate timesteps where the tracked object reaches local $y$-extrema (trajectory reversals). Not used for position values.[^1] |
+| Per-timestep velocity snapshots | Per-timestep volumetric velocity fields from which vorticity and Q-criterion are computed.[^2] |
+
+**Output**
 
 | File | Description |
 | :--- | :--- |
 | `vorticity_search_full.csv` | One row per timestep (900 rows). Columns: step, centroid (cx, cy, cz), extent (ex, ey, ez), peak location, core point count, vorticity at centroid. |
-| `vorticity_core_points.csv` | One row per core grid point per timestep (5,135 total records). Columns: step, x, y, z, vort_mag, omega_x, omega_y, omega_z. This is the **exhaustive** listing of every grid point at ≥90% of peak vorticity magnitude. |
+| `vorticity_core_points.csv` | One row per core grid point per timestep. Columns: step, x, y, z, vort_mag, omega_x, omega_y, omega_z. This is the **exhaustive** listing of every grid point at ≥90% of peak vorticity magnitude. |
+
+[^1]: `6p4.txt` provides the object trajectory; the $y$-extrema in this file are used as candidate reversal timesteps. Position values are taken from the velocity grid data, not from this file.
+[^2]: Stored as compressed binary snapshots (e.g., `step_0292.pkl.gz`). These files were first referenced in [Section C](#c-vortex-core-localization-region-based) as the source of the 3D velocity grid $\vec{v} = (v_x, v_y, v_z)$.
 
 ## 2. Summary of Vortex Reversal Events
 
@@ -67,7 +79,7 @@ Each event was verified for temporal stability to ensure the reversal represents
 
 *   **100ms Pre-Reversal:** The vortex maintains a consistent rotational sign (e.g., $\omega_z > 0$) for at least 12 steps (100ms at 120Hz) leading into the event.
 *   **100ms Post-Reversal:** The vortex re-establishes a stable rotation in the opposite direction for at least 100ms (12 steps) following the sign-flip.
-*   **Physical Correlation:** 100% of identified reversals correlate with the "top" or "bottom" points in the positional data from `6p4.txt`, where the $y$-velocity vector reverses direction. Note: `6p4.txt` is used only for timestep identification, not for position values.
+*   **Physical Correlation:** 100% of identified reversals correlate with the "top" or "bottom" points in the positional data from `6p4.txt`[^1], where the $y$-velocity vector reverses direction.
 
 ## 4. Documentation Suite (1200 DPI & Interactive)
 
@@ -87,7 +99,7 @@ Created using the **Plotly** scientific package, these files allow for:
 ## 5. Related Analysis
 
 *   **[Comprehensive Evaluation of Vortex Reversal Prediction](comprehensive_evaluation.md)** — Sensitivity analysis of the transformer model's prediction accuracy as a function of temporal context and spatial density.
-*   **[PDF] [Context Sensitivity Heatmap (1200 DPI)](context_sensitivity_heatmap.pdf)** — RMSE of $\omega_z$ across the full sweep of time and space variations, averaged across all ≥90% vortex core (y, z) coordinates from 18 reversal events.
+*   **[PDF] [Context Sensitivity Heatmap (1200 DPI)](context_sensitivity_heatmap.pdf)** — RMSE of $\omega_z$ across the full sweep of time and space variations, averaged across all ≥90% vortex core (y, z) coordinates from 18 reversal events. A notable observation is that spatial coordinate density has surprisingly little effect on reconstruction accuracy compared to temporal context. Our conjecture is that the transformer's **Spatio-Temporal Flattening** compensates: the model architecture flattens spatial and temporal inputs together, allowing it to implicitly interpolate spatial structure from neighboring points across time. As a result, the spatial axis exhibits diminishing returns once sufficient temporal context is provided — **time is the scarce resource, space is cheap**.
 *   **[PDF] [Sparse Evaluation Comparison (1200 DPI)](sparse_evaluation_comparison.pdf)** — Side-by-side performance for varying context windows.
 *   **[PDF] [Vortex Reversal Evaluation (1200 DPI)](vortex_reversal_evaluation.pdf)** — Detailed prediction plots for primary reversal events.
 *   **[PDF] [Core Temporal Autocorrelation](core_temporal_correlation.pdf)** — Pearson correlation of vorticity magnitude at ≥90% core points vs. same locations at varying timestep lags (±1 to ±50 steps).

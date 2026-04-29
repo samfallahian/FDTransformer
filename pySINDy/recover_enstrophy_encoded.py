@@ -2,8 +2,11 @@ import numpy as np
 import pysindy as ps
 from sklearn.metrics import mean_squared_error
 
-def recover_enstrophy_encoded():
-    data = np.load("pySINDy/encoded_data_grad.npz")
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
+def recover_enstrophy_encoded(input_path):
+    data = np.load(input_path)
     wx = data['wx'].flatten()
     wy = data['wy'].flatten()
     wz = data['wz'].flatten()
@@ -37,4 +40,8 @@ def recover_enstrophy_encoded():
     print(f"MSE: {mse:.4e}")
 
 if __name__ == "__main__":
-    recover_enstrophy_encoded()
+    parser = make_parser("Recover the enstrophy relation from encoded-gradient NPZ data.", common_paths=False, runtime=False)
+    parser.add_argument("--input", help="Input NPZ file. Defaults to outputs.encoded_grad in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    recover_enstrophy_encoded(args.input or output_path(config, "encoded_grad", create_parent=False))

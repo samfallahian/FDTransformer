@@ -43,7 +43,24 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from encoder.autoencoderGEN3.models import get_model_by_index, ORIGINAL_DIM, LATENT_DIM
-from Ordered_001_Initialize import HostPreferences
+try:
+    from .config import (
+        add_config_argument,
+        choose_path,
+        config_get,
+        configured_path,
+        load_config,
+        optional_path,
+    )
+except ImportError:
+    from config import (
+        add_config_argument,
+        choose_path,
+        config_get,
+        configured_path,
+        load_config,
+        optional_path,
+    )
 
 # Configuration
 MODEL_IDX = 4  # Model 5 (AttentionSE)
@@ -51,9 +68,9 @@ DEFAULT_BATCH_SIZE = 4096
 DEFAULT_LR = 1e-4
 DEFAULT_EPOCHS = 1000
 DATA_PERCENTAGE = 100
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_models_production')
-GEN3_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models', 'Model_GEN3_05_AttentionSE_best.pt')
-BASE_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'saved_models', 'Model_09_Residual_AE_epoch_500.pt')
+DEFAULT_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_models_production')
+DEFAULT_GEN3_CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models', 'Model_GEN3_05_AttentionSE_best.pt')
+DEFAULT_BASE_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'saved_models', 'Model_09_Residual_AE_epoch_500.pt')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -72,9 +89,8 @@ def print_rainbow(text):
     colored_text = "".join(colors[i % len(colors)] + char for i, char in enumerate(text))
     print(colored_text + reset)
 
-def cleanup_wandb():
+def cleanup_wandb(wandb_dir):
     """Purges any existing wandb artifacts in the current directory."""
-    wandb_dir = os.path.join(os.getcwd(), 'wandb')
     if os.path.exists(wandb_dir):
         print_rainbow(f"--- PURGING WANDB ARTIFACTS AT {wandb_dir} ---")
         try:
@@ -100,14 +116,29 @@ def accelerator_report():
     print_rainbow(f"*** FINAL SELECTION: {device.type.upper()} IS ACTIVE ***")
     return device
 
-def load_data(sample_percentage=100):
-    preferences_path = os.path.join(PROJECT_ROOT, "experiment.preferences")
-    prefs = HostPreferences(filename=preferences_path)
-    root_dir = getattr(prefs, 'root_path', os.getcwd())
-    
-    train_path = os.path.join(root_dir, 'training_auto_encoder.pkl')
-    val_path = os.path.join(root_dir, 'validation_auto_encoder.pkl')
-    
+def resolve_training_paths(args, config):
+    train_path = optional_path(args.train_path, base_dir=os.getcwd()) or configured_path(config, "data.train_path")
+    val_path = optional_path(args.val_path, base_dir=os.getcwd()) or configured_path(config, "data.val_path")
+    if train_path and val_path:
+        return train_path, val_path
+
+    data_root = optional_path(args.data_root, base_dir=os.getcwd()) or configured_path(config, "data.data_root")
+    train_filename = config_get(config, "data.train_filename", "training_auto_encoder.pkl")
+    val_filename = config_get(config, "data.val_filename", "validation_auto_encoder.pkl")
+    if data_root:
+        return (
+            train_path or os.path.join(data_root, train_filename),
+            val_path or os.path.join(data_root, val_filename),
+        )
+
+    raise ValueError(
+        "Training and validation data paths are required. Set data.train_path and "
+        "data.val_path in autoencoderGEN3/config.json, set data.data_root, or pass "
+        "--train_path/--val_path on the command line."
+    )
+
+
+def load_data(train_path, val_path, sample_percentage=100):
     def load_file(path):
         with open(path, 'rb') as f:
             arr = pickle.load(f).astype(np.float32)
@@ -116,14 +147,16 @@ def load_data(sample_percentage=100):
         return arr
 
     logger.info(f"Loading {sample_percentage}% of data...")
+    logger.info(f"Training data: {train_path}")
+    logger.info(f"Validation data: {val_path}")
     train_np = load_file(train_path)
     val_np = load_file(val_path)
     return train_np, val_np
 
-def purge_old_checkpoints(model_name, keep=5):
+def purge_old_checkpoints(model_name, save_dir, keep=5):
     """Keeps only the last N checkpoints for the given model."""
     # Find all .pt files (excluding scripted versions for sorting)
-    pattern = os.path.join(SAVE_DIR, f"{model_name}_epoch_*.pt")
+    pattern = os.path.join(save_dir, f"{model_name}_epoch_*.pt")
     ckpts = [f for f in glob.glob(pattern) if not f.endswith("_scripted.pt")]
     
     # Sort by epoch number extracted from filename
@@ -150,21 +183,43 @@ def purge_old_checkpoints(model_name, keep=5):
 
 def main():
     parser = argparse.ArgumentParser(description="Model 5 Production Training")
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument('--data_percentage', type=int, default=DATA_PERCENTAGE)
+    add_config_argument(parser)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--data_percentage', type=int, default=None)
+    parser.add_argument('--train_path', type=str, default=None, help="Path to training_auto_encoder.pkl")
+    parser.add_argument('--val_path', type=str, default=None, help="Path to validation_auto_encoder.pkl")
+    parser.add_argument('--data_root', type=str, default=None, help="Directory containing training and validation pickle files")
+    parser.add_argument('--save_dir', type=str, default=None, help="Directory for production checkpoints")
+    parser.add_argument('--gen3_checkpoint_path', type=str, default=None, help="Optional GEN3 comparison checkpoint to initialize from")
+    parser.add_argument('--base_weights_path', type=str, default=None, help="Optional legacy checkpoint fallback")
+    parser.add_argument('--wandb_dir', type=str, default=None, help="Directory for wandb artifacts")
     parser.add_argument('--no_wandb', action='store_true')
     args = parser.parse_args()
 
+    config = load_config(args.config)
+    epochs = args.epochs if args.epochs is not None else int(config_get(config, "training.epochs", DEFAULT_EPOCHS))
+    batch_size = args.batch_size if args.batch_size is not None else int(config_get(config, "training.batch_size", DEFAULT_BATCH_SIZE))
+    lr = args.lr if args.lr is not None else float(config_get(config, "training.learning_rate", DEFAULT_LR))
+    data_percentage = args.data_percentage if args.data_percentage is not None else int(config_get(config, "training.data_percentage", DATA_PERCENTAGE))
+    save_dir = choose_path(args.save_dir, config, "paths.production_save_dir", DEFAULT_SAVE_DIR)
+    gen3_checkpoint_path = choose_path(args.gen3_checkpoint_path, config, "paths.gen3_checkpoint_path", DEFAULT_GEN3_CHECKPOINT_PATH)
+    base_weights_path = choose_path(args.base_weights_path, config, "paths.legacy_base_weights_path", DEFAULT_BASE_WEIGHTS_PATH)
+    wandb_dir = choose_path(args.wandb_dir, config, "paths.wandb_dir", os.path.join(os.getcwd(), "wandb"))
+    train_path, val_path = resolve_training_paths(args, config)
+
     # Initial cleanup
-    cleanup_wandb()
-    os.makedirs(SAVE_DIR, exist_ok=True)
+    cleanup_wandb(wandb_dir)
+    if not args.no_wandb:
+        os.makedirs(wandb_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
     
     device = accelerator_report()
-    train_np, val_np = load_data(sample_percentage=args.data_percentage)
+    train_np, val_np = load_data(train_path, val_path, sample_percentage=data_percentage)
     
-    train_loader = DataLoader(TensorDataset(torch.from_numpy(train_np)), batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_np)), batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(train_np)), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_np)), batch_size=batch_size, shuffle=False)
     
     model = get_model_by_index(MODEL_IDX).to(device)
     model_name = type(model).__name__
@@ -173,11 +228,11 @@ def main():
     loaded_any = False
     
     # Priority 1: Specific GEN3 Model 5 checkpoint
-    if os.path.exists(GEN3_CHECKPOINT_PATH):
-        print_rainbow(f"*** DETECTED GEN3 MODEL 5 CHECKPOINT AT {GEN3_CHECKPOINT_PATH} ***")
+    if os.path.exists(gen3_checkpoint_path):
+        print_rainbow(f"*** DETECTED GEN3 MODEL 5 CHECKPOINT AT {gen3_checkpoint_path} ***")
         print_rainbow("--- INITIATING MYRIAD LOADING SEQUENCE ---")
         try:
-            checkpoint = torch.load(GEN3_CHECKPOINT_PATH, map_location=device, weights_only=False)
+            checkpoint = torch.load(gen3_checkpoint_path, map_location=device, weights_only=False)
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             
             missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
@@ -197,10 +252,10 @@ def main():
             print_rainbow(f"FAILED TO LOAD GEN3 CHECKPOINT: {e}")
 
     # Priority 2: Fallback to Model 09 weights if nothing loaded yet
-    if not loaded_any and os.path.exists(BASE_WEIGHTS_PATH):
+    if not loaded_any and os.path.exists(base_weights_path):
         print_rainbow(f"*** GEN3 CHECKPOINT NOT FOUND, FALLING BACK TO MODEL 09 BASE WEIGHTS ***")
         try:
-            checkpoint = torch.load(BASE_WEIGHTS_PATH, map_location=device, weights_only=False)
+            checkpoint = torch.load(base_weights_path, map_location=device, weights_only=False)
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             model.load_state_dict(state_dict, strict=False)
             print_rainbow("SUCCESS: BASE WEIGHTS FROM MODEL 09 INJECTED!")
@@ -213,14 +268,21 @@ def main():
     else:
         print_rainbow("--- MODEL WEIGHTS SEEDED SUCCESSFULLY ---")
     
-    optimizer = optim.Adam(model.parameters(), lr=DEFAULT_LR)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     
     if not args.no_wandb:
-        wandb.init(project="autoencoder-GEN3-production", name=f"{model_name}-1000epochs", config=vars(args))
+        wandb.init(project="autoencoder-GEN3-production", name=f"{model_name}-{epochs}epochs", dir=wandb_dir, config={
+            **vars(args),
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "data_percentage": data_percentage,
+            "save_dir": save_dir,
+        })
 
     best_val_rmse = float('inf')
     
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         model.train()
         train_sse, train_elements = 0.0, 0
         for batch in train_loader:
@@ -251,10 +313,10 @@ def main():
         if not args.no_wandb:
             wandb.log({"epoch": epoch+1, "train_rmse": train_rmse, "val_rmse": val_rmse})
             
-        logger.info(f"Epoch {epoch+1}/{args.epochs}: Train RMSE={train_rmse:.6f}, Val RMSE={val_rmse:.6f}")
+        logger.info(f"Epoch {epoch+1}/{epochs}: Train RMSE={train_rmse:.6f}, Val RMSE={val_rmse:.6f}")
         
         # Save every epoch
-        save_path = os.path.join(SAVE_DIR, f"{model_name}_epoch_{epoch+1}.pt")
+        save_path = os.path.join(save_dir, f"{model_name}_epoch_{epoch+1}.pt")
         torch.save({
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
@@ -270,12 +332,12 @@ def main():
             pass
             
         # Purge all but last 5
-        purge_old_checkpoints(model_name, keep=5)
+        purge_old_checkpoints(model_name, save_dir, keep=5)
         
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
             # Also maintain a 'best' symlink or file if desired, but user just asked for last 5
-            torch.save(model.state_dict(), os.path.join(SAVE_DIR, f"{model_name}_absolute_best.pt"))
+            torch.save(model.state_dict(), os.path.join(save_dir, f"{model_name}_absolute_best.pt"))
 
     if not args.no_wandb:
         wandb.finish()

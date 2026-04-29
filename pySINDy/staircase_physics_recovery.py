@@ -5,38 +5,32 @@ import numpy as np
 import pandas as pd
 import pysindy as ps
 import sys
-import scipy.ndimage as ndimage
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# =============================================================================
-# PROJECT SETUP
-# =============================================================================
-# We need to make sure the project root is in the system path so we can import
-# our custom modules like FloatConverter and the Transformer model.
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+from pysindy_config import (
+    configure_project_imports,
+    documentation_path,
+    load_config_from_args,
+    make_parser,
+    resolve_path,
+    select_device,
+)
 
-from TransformLatent import FloatConverter
-from transformer.transformer_model_v1 import OrderedTransformerV1
 
-def load_models():
+def load_models(config):
     """
     Loads the pre-trained Transformer and Autoencoder models.
     The Transformer predicts future latent states, and the Autoencoder's decoder
     converts those latents back into physical velocity fields.
     """
-    TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
+    project_root = configure_project_imports(config)
+    from transformer.transformer_model_v1 import OrderedTransformerV1
+    transformer_checkpoint = resolve_path(config, ("models", "transformer_checkpoint"), required=True)
+    encoder_checkpoint = resolve_path(config, ("models", "encoder_checkpoint"), required=True)
     
     # Detect and use the best available device (MPS, CUDA, or CPU)
-    if torch.backends.mps.is_available():
-        DEVICE = "mps"
-    elif torch.cuda.is_available():
-        DEVICE = "cuda"
-    else:
-        DEVICE = "cpu"
+    DEVICE = select_device(torch, config["runtime"].get("device", "auto"))
     print(f"--- Loading models onto device: {DEVICE} ---")
     
     # This is a technical patch to handle some internal PyTorch compatibility issues
@@ -50,7 +44,7 @@ def load_models():
         pass
 
     # Ensure the transformer directory is available for imports
-    TRANS_DIR = os.path.join(PROJECT_ROOT, "transformer")
+    TRANS_DIR = os.path.join(project_root, "transformer")
     if TRANS_DIR not in sys.path:
         sys.path.insert(0, TRANS_DIR)
     
@@ -62,8 +56,8 @@ def load_models():
     __main__.Config = Config
 
     # Load the Transformer
-    print(f"Loading Transformer from: {TRANSFORMER_CHECKPOINT}")
-    checkpoint = torch.load(TRANSFORMER_CHECKPOINT, map_location=DEVICE, weights_only=False)
+    print(f"Loading Transformer from: {transformer_checkpoint}")
+    checkpoint = torch.load(transformer_checkpoint, map_location=DEVICE, weights_only=False)
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         transformer = checkpoint['model']
         if hasattr(transformer, '_orig_mod'): 
@@ -77,8 +71,8 @@ def load_models():
     transformer.to(DEVICE)
 
     # Load the Autoencoder (TorchScript format)
-    print(f"Loading Autoencoder from: {ENCODER_CHECKPOINT}")
-    ae = torch.jit.load(ENCODER_CHECKPOINT, map_location=DEVICE)
+    print(f"Loading Autoencoder from: {encoder_checkpoint}")
+    ae = torch.jit.load(encoder_checkpoint, map_location=DEVICE)
     ae.eval()
     ae.to(DEVICE)
     
@@ -165,20 +159,28 @@ def run_sindy_enstrophy(wx, wy, wz, enstrophy):
 # MAIN EVALUATION LOOP
 # =============================================================================
 def main():
+    parser = make_parser("Run the staircase physics recovery evaluation.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    configure_project_imports(config)
+    from helpers.TransformLatent import FloatConverter
+
     print("--- Starting Staircase Physics Evaluation ---")
-    h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
     
     # 1. Load models and setup helper objects
-    transformer, ae, device = load_models()
+    transformer, ae, device = load_models(config)
     converter = FloatConverter()
-    TRIPLET_IDX = 62  # Index of the center velocity vector in the reconstructed 5x5x5 cube
+    TRIPLET_IDX = config["runtime"]["triplet_idx"]
     
     # Parameters for the evaluation
-    REYNOLDS_NUMBERS = [3.6, 4.6, 5.2, 6.4, 6.6, 7.2, 7.8, 8.4, 10.4, 11.4]
-    TEMPORAL_CONTEXTS = [7, 6, 5, 4, 3, 2, 1] # Providing T1 through T_ctx as ground truth history
+    REYNOLDS_NUMBERS = config["runtime"]["reynolds_numbers"]
+    TEMPORAL_CONTEXTS = config["runtime"]["temporal_contexts"]
+    grid_sample_limit = config["runtime"]["grid_sample_limit"]
+    grid_point_limit = config["runtime"]["grid_point_limit"]
+    random_seed = config["runtime"]["random_seed"]
     
-    CSV_PATH = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_results.csv')
-    os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
+    CSV_PATH = documentation_path(config, "staircase_results")
     all_results = []
     
     # 2. Handle Restarts: Load existing results from CSV if it exists
@@ -214,20 +216,20 @@ def main():
             # Filter the dataset for samples matching this Reynolds number
             mask = np.abs(full_params - reynolds) < 0.05
             indices = np.where(mask)[0]
-            print(f"Found {len(indices)} samples for Re={reynolds}. Selecting 1000 for grid identification...")
+            print(f"Found {len(indices)} samples for Re={reynolds}. Selecting {grid_sample_limit} for grid identification...")
             
-            if len(indices) > 1000:
-                np.random.seed(42)
-                indices = np.random.choice(indices, 1000, replace=False)
+            if len(indices) > grid_sample_limit:
+                np.random.seed(random_seed)
+                indices = np.random.choice(indices, grid_sample_limit, replace=False)
             indices = np.sort(indices) 
             
             # 5. Identify the spatial grid (Y, Z coordinates) within the selected samples
             coords = data_ds[indices, 0, 0, 48:50] # Y, Z are at indices 48, 49
             unique_yz, u_idx = np.unique(coords, axis=0, return_index=True)
             
-            # We limit the grid size to 30 unique points for processing speed
-            if len(u_idx) > 30:
-                u_idx = u_idx[:30]
+            # Limit the grid size for processing speed.
+            if len(u_idx) > grid_point_limit:
+                u_idx = u_idx[:grid_point_limit]
             
             grid_indices = indices[u_idx]
             grid_coords = coords[u_idx]
@@ -336,9 +338,9 @@ def main():
     print(f"\n--- Evaluation Finished! ---")
     print(f"Final results table: {CSV_PATH}")
     
-    plot_results(df)
+    plot_results(df, config)
 
-def plot_results(df):
+def plot_results(df, config):
     """
     Generates summary plots showing how SINDy MSE and Prediction RMSE change 
     with Reynolds number and temporal context.
@@ -364,8 +366,8 @@ def plot_results(df):
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
         ax.grid(True, which='both', linestyle='--', alpha=0.5)
 
-    PLOT_PATH = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_trends.png')
-    PLOT_PATH_PDF = os.path.join(PROJECT_ROOT, 'Documentation/staircase_physics_trends.pdf')
+    PLOT_PATH = documentation_path(config, "staircase_plot")
+    PLOT_PATH_PDF = documentation_path(config, "staircase_plot_pdf")
     plt.tight_layout()
     plt.savefig(PLOT_PATH, dpi=600, bbox_inches='tight')
     plt.savefig(PLOT_PATH_PDF, dpi=600, bbox_inches='tight')

@@ -39,6 +39,8 @@ import argparse
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+from pipeline_config import add_config_argument, resolve_path
+
 # Globals for workers to avoid re-loading/serializing large data for every file
 G_MAP_DF = None
 G_NEIGHBOR_PREFIXES = None
@@ -117,14 +119,17 @@ def process_file_task(input_file, output_file):
 
 def main():
     parser = argparse.ArgumentParser(description="Create cubes per line by gathering neighbor velocities.")
+    add_config_argument(parser)
+    parser.add_argument("--input_root", help="Directory of time-separated filtered files.")
+    parser.add_argument("--map_path", help="Centroid-neighbor mapping CSV.")
+    parser.add_argument("--output_root", help="Directory to write final cubed files.")
     parser.add_argument("--first_only", action="store_true", help="Only process the first file and exit cleanly.")
     parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers (default: 8).")
     args = parser.parse_args()
     
-    # Paths as per issue context
-    input_root = "/Users/kkreth/PycharmProjects/data/Cubed_OG_Data"
-    map_path = "/Users/kkreth/PycharmProjects/cgan/cube_centroid_mapping/df_all_possible_combinations_with_neighbors.csv"
-    output_root = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data"
+    input_root = resolve_path(args.config, "cubed_data_dir", args.input_root)
+    map_path = resolve_path(args.config, "cube_mapping_csv", args.map_path)
+    output_root = resolve_path(args.config, "final_cubed_data_dir", args.output_root)
     
     if not os.path.exists(map_path):
         print(f"Mapping file not found at {map_path}")

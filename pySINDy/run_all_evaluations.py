@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
 import os
 
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
 def recover_enstrophy(wx, wy, wz, enstrophy, label):
     """
     Given vorticity components and enstrophy, recover the algebraic relation using SINDy.
@@ -42,12 +45,14 @@ def recover_enstrophy(wx, wy, wz, enstrophy, label):
         
     return results
 
-def run_evaluation_suite():
+def run_evaluation_suite(config, raw_path=None, encoded_path=None, predicted_path=None, output_csv=None, figure_path=None):
     data_files = {
-        'Raw': 'pySINDy/raw_data_grad.npz',
-        'Encoded': 'pySINDy/encoded_data_grad.npz',
-        'Predicted': 'pySINDy/predicted_data_grad.npz'
+        'Raw': raw_path or output_path(config, "raw_grad", create_parent=False),
+        'Encoded': encoded_path or output_path(config, "encoded_grad", create_parent=False),
+        'Predicted': predicted_path or output_path(config, "predicted_grad", create_parent=False)
     }
+    output_csv = output_csv or output_path(config, "evaluation_results")
+    figure_path = figure_path or output_path(config, "evaluation_summary")
     
     all_results = []
     
@@ -101,16 +106,16 @@ def run_evaluation_suite():
     df = df[cols]
     
     # Save table
-    df.to_csv('pySINDy/evaluation_results.csv', index=False)
+    df.to_csv(output_csv, index=False)
     print("\nSummary Table:")
     print(df.to_string(index=False))
     
     # Create Figure
-    plot_coefficients(df)
+    plot_coefficients(df, figure_path)
     
     return df
 
-def plot_coefficients(df):
+def plot_coefficients(df, figure_path):
     plt.figure(figsize=(12, 8))
     
     # We'll plot coefficients for wx^2, wy^2, wz^2
@@ -131,8 +136,23 @@ def plot_coefficients(df):
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('pySINDy/evaluation_summary.png')
-    print("\nFigure saved to: pySINDy/evaluation_summary.png")
+    plt.savefig(figure_path)
+    print(f"\nFigure saved to: {figure_path}")
 
 if __name__ == "__main__":
-    run_evaluation_suite()
+    parser = make_parser("Run SINDy enstrophy evaluations over raw, encoded, and predicted NPZ files.", runtime=False)
+    parser.add_argument("--raw-input", help="Raw input NPZ. Defaults to outputs.raw_grad in the config.")
+    parser.add_argument("--encoded-input", help="Encoded input NPZ. Defaults to outputs.encoded_grad in the config.")
+    parser.add_argument("--predicted-input", help="Predicted input NPZ. Defaults to outputs.predicted_grad in the config.")
+    parser.add_argument("--output", help="Output CSV. Defaults to outputs.evaluation_results in the config.")
+    parser.add_argument("--figure", help="Output PNG. Defaults to outputs.evaluation_summary in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    run_evaluation_suite(
+        config,
+        raw_path=args.raw_input,
+        encoded_path=args.encoded_input,
+        predicted_path=args.predicted_input,
+        output_csv=args.output,
+        figure_path=args.figure,
+    )

@@ -4,6 +4,9 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error
 import os
 
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
 def recover_relation(X, y, feature_names, label, target_name):
     """
     Recover algebraic relation y = f(X) using SINDy.
@@ -41,12 +44,16 @@ def recover_relation(X, y, feature_names, label, target_name):
         'PolyNames': poly_names
     }
 
-def main():
-    scenarios = ['raw', 'encoded', 'predicted']
+def main(config, raw_input=None, encoded_input=None, predicted_input=None, output_csv=None):
+    scenarios = [
+        ('raw', raw_input or output_path(config, "raw_extended", create_parent=False)),
+        ('encoded', encoded_input or output_path(config, "encoded_extended", create_parent=False)),
+        ('predicted', predicted_input or output_path(config, "predicted_extended", create_parent=False)),
+    ]
+    output_csv = output_csv or output_path(config, "extended_physics_results")
     results = []
     
-    for s in scenarios:
-        path = f"pySINDy/{s}_extended.npz"
+    for s, path in scenarios:
         data = np.load(path)
         
         V = data['V']
@@ -90,8 +97,15 @@ def main():
         flat_results.append(row)
     
     df = pd.DataFrame(flat_results)
-    df.to_csv("pySINDy/extended_physics_results.csv", index=False)
-    print("\nResults saved to pySINDy/extended_physics_results.csv")
+    df.to_csv(output_csv, index=False)
+    print(f"\nResults saved to {output_csv}")
 
 if __name__ == "__main__":
-    main()
+    parser = make_parser("Recover KE, helicity, and enstrophy formulas from extended physics NPZ files.", runtime=False)
+    parser.add_argument("--raw-input", help="Raw extended NPZ. Defaults to outputs.raw_extended in the config.")
+    parser.add_argument("--encoded-input", help="Encoded extended NPZ. Defaults to outputs.encoded_extended in the config.")
+    parser.add_argument("--predicted-input", help="Predicted extended NPZ. Defaults to outputs.predicted_extended in the config.")
+    parser.add_argument("--output", help="Output CSV. Defaults to outputs.extended_physics_results in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    main(config, args.raw_input, args.encoded_input, args.predicted_input, args.output)

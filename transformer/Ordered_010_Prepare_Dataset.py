@@ -45,6 +45,7 @@ import argparse
 from tqdm import tqdm
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from transformer_config import add_config_arg, load_config, resolve_path
 
 # Constants from issue description
 X_COORDS = [ -49, -45, -41, -37, -33, -29, -26, -22, -18, -14, -10, -6, -2, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49]
@@ -56,8 +57,8 @@ NUM_TIME = 80
 # Features: 47 (latent) + 3 (x,y,z) + 1 (rel_time) + 1 (param_val) = 52
 NUM_FEATURES = 47 + 3 + 1 + 1 
 
-INPUT_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
-OUTPUT_DIR = "/Users/kkreth/PycharmProjects/data/transformer_input"
+INPUT_ROOT = None
+OUTPUT_DIR = None
 
 def parse_param(p_str):
     """Convert directory name like '7p8' to float 7.8."""
@@ -224,15 +225,30 @@ def process_and_save(samples, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare Transformer dataset from latent space cubes.")
-    parser.add_argument("--num_samples", type=int, default=250000, help="Number of samples per file.")
-    parser.add_argument("--test_run", action="store_true", help="Run with very few samples for testing.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    add_config_arg(parser)
+    parser.add_argument("--input_root", "--input-root", dest="input_root", default=None, help="Directory containing parameter-set subdirectories of .pkl.gz latent cubes.")
+    parser.add_argument("--output_dir", "--output-dir", dest="output_dir", default=None, help="Directory where training_data.h5 and validation_data.h5 are written.")
+    parser.add_argument("--num_samples", "--num-samples", dest="num_samples", type=int, default=None, help="Number of samples per file.")
+    parser.add_argument("--test_run", "--test-run", dest="test_run", action="store_true", help="Run with very few samples for testing.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility.")
+    parser.add_argument("--num_time", "--num-time", dest="num_time", type=int, default=None, help="Number of consecutive time steps per sample.")
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    cfg = load_config(args.config)
+    data_cfg = cfg["data"]
+    path_cfg = cfg["paths"]
 
-    num_samples = 1000 if args.test_run else args.num_samples
+    global INPUT_ROOT, OUTPUT_DIR, NUM_TIME
+    INPUT_ROOT = resolve_path(args.input_root or path_cfg["latent_input_root"])
+    OUTPUT_DIR = resolve_path(args.output_dir or path_cfg["transformer_input_dir"])
+    NUM_TIME = args.num_time if args.num_time is not None else data_cfg.get("num_time", NUM_TIME)
+
+    seed = args.seed if args.seed is not None else data_cfg["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+
+    configured_samples = args.num_samples if args.num_samples is not None else data_cfg["num_samples"]
+    num_samples = data_cfg["test_num_samples"] if args.test_run else configured_samples
     
     param_sets = sorted([d for d in os.listdir(INPUT_ROOT) if os.path.isdir(os.path.join(INPUT_ROOT, d))])
     if not param_sets:

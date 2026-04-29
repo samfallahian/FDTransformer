@@ -7,12 +7,12 @@ DOCUMENTATION OF DEVIATIONS FROM model.py:
 
 1. Spatio-Temporal Flattening: 
    In model.py, the transformer processed temporal sequences for individual spatial points.
-   In transformer_model_v1.py, we flatten the 8x26 (Time x Space) grid into a single 208-token sequence.
+   In transformer_model_v1.py, we flatten the configured Time x Space grid into a single token sequence.
    This allows the model to attend to both previous time steps and neighboring spatial points within the same time step.
 
 2. Structured Embeddings:
-   Instead of a single positional embedding, we use two separate embedding layers for Time (0-7) and Space (0-25).
-   These are added to each token's representation based on its position in the 8x26 grid.
+   Instead of a single positional embedding, we use two separate embedding layers for Time and Space.
+   These are added to each token's representation based on its position in the configured grid.
 
 3. Input Feature Dimension:
    The input projection layer is expanded to 52 features (47 latents + 3 xyz + 1 rel_time + 1 param) 
@@ -69,7 +69,7 @@ class OrderedTransformerV1(nn.Module):
         self.output_head = nn.Linear(config.EMBED_SIZE, config.LATENT_DIM, bias=config.BIAS)
     
         # Pre-calculate and register time/space indices for the flattened sequence
-        # (8, 26) grid -> 208 sequence
+        # (NUM_TIME, NUM_X) grid -> flattened sequence
         time_ids = torch.arange(config.NUM_TIME).repeat_interleave(config.NUM_X)
         space_ids = torch.arange(config.NUM_X).repeat(config.NUM_TIME)
         self.register_buffer("time_ids", time_ids)
@@ -104,7 +104,7 @@ class OrderedTransformerV1(nn.Module):
         return self.forward(x) # Placeholder for now, real optimization is in eval script
 
     def forward(self, x):
-        # x shape: (B, T, InputDim) where T <= 208
+        # x shape: (B, T, InputDim) where T <= NUM_TIME * NUM_X
         B, T, C = x.shape
         
         # 1. Project to embedding space
@@ -129,7 +129,7 @@ class OrderedTransformerV1(nn.Module):
     def predict_autoregressive(self, initial_sequence, num_to_predict):
         """
         Autoregressively predict the next 'num_to_predict' latents in the sequence.
-        initial_sequence: (1, seq_len, 52) where seq_len is typically 208
+        initial_sequence: (1, seq_len, 52)
         """
         self.eval()
         seq = initial_sequence.clone()

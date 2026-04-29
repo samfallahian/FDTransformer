@@ -5,6 +5,8 @@ import h5py
 import torch
 import random
 from terminaltables import AsciiTable
+import argparse
+from transformer_config import add_config_arg, load_config, resolve_path
 
 # Add root to sys.path if needed
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -71,14 +73,15 @@ def validate_sample(sample, sample_idx):
     
     # Check X coordinates consistency across time slices
     x_slices_consistent = True
-    for i in range(1, 8):
+    num_time = sample.shape[0]
+    for i in range(1, num_time):
         if not np.all(x_data[i] == x_data[0]):
             x_slices_consistent = False
             break
             
     # Check relative time incrementing
     t_consistent = True
-    for i in range(8):
+    for i in range(num_time):
         if not np.all(t_data[i] == i):
             t_consistent = False
             break
@@ -107,7 +110,7 @@ def print_validation_report(report, sample_idx):
         ["Y Coordinate", f"{int(report['y'])}", GREEN + "OK" if report['y_consistent'] else RED + "FAIL"],
         ["Z Coordinate", f"{int(report['z'])}", GREEN + "OK" if report['z_consistent'] else RED + "FAIL"],
         ["X Consistency", "Across Time Slices", GREEN + "OK" if report['x_consistent'] else RED + "FAIL"],
-        ["Time Sequences", "0 to 7", GREEN + "OK" if report['t_consistent'] else RED + "FAIL"],
+        ["Time Sequences", "Relative index", GREEN + "OK" if report['t_consistent'] else RED + "FAIL"],
     ]
     table = AsciiTable(meta_data)
     print(table.table)
@@ -120,11 +123,7 @@ def print_validation_report(report, sample_idx):
     print(f"{BLUE}X-Axis Coordinates (26 points):{RESET}")
     print(f"[{x_str}]")
 
-def main():
-    h5_files = [
-        os.path.join(project_root, "transformer/training_data.h5"),
-        os.path.join(project_root, "transformer/validation_data.h5")
-    ]
+def main(h5_files):
     
     section_header("Transformer Dataset Validation")
     
@@ -171,5 +170,17 @@ def main():
 
     print("\n" + rainbow("Validation Complete!") + "\n")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Validate transformer HDF5 datasets.")
+    add_config_arg(parser)
+    parser.add_argument("--h5", action="append", default=None, help="HDF5 file to validate. Can be passed multiple times.")
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    cfg = load_config(args.config)
+    h5_files = args.h5 or [
+        resolve_path(cfg["paths"]["training_h5"]),
+        resolve_path(cfg["paths"]["validation_h5"]),
+    ]
+    main(h5_files)

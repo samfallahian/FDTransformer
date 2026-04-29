@@ -4,6 +4,9 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error
 import os
 
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
 def stress_test_sindy(data_path, label):
     print(f"\n--- Stress Testing: {label} ---")
     data = np.load(data_path)
@@ -69,7 +72,15 @@ def stress_test_sindy(data_path, label):
     return results
 
 if __name__ == "__main__":
-    raw_results = stress_test_sindy("pySINDy/raw_data_grad.npz", "Raw Data")
+    parser = make_parser("Stress test SINDy recovery under noise.", common_paths=False, runtime=False)
+    parser.add_argument("--input", help="Input NPZ. Defaults to outputs.raw_grad in the config.")
+    parser.add_argument("--label", default="Raw Data", help="Label to print for the input data.")
+    parser.add_argument("--figure", help="Output PNG. Defaults to outputs.noise_robustness in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    input_path = args.input or output_path(config, "raw_grad", create_parent=False)
+    figure_path = args.figure or output_path(config, "noise_robustness")
+    raw_results = stress_test_sindy(input_path, args.label)
     
     # Plotting
     plt.figure(figsize=(10, 6))
@@ -88,5 +99,5 @@ if __name__ == "__main__":
     plt.title('SINDy Robustness to Noise in Vorticity Components')
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.5)
-    plt.savefig('pySINDy/noise_robustness.png')
-    print("\nSaved: pySINDy/noise_robustness.png")
+    plt.savefig(figure_path)
+    print(f"\nSaved: {figure_path}")

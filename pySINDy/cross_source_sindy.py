@@ -4,13 +4,17 @@ import pandas as pd
 from sklearn.metrics import mean_squared_error
 import os
 
-def cross_source_sindy():
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
+def cross_source_sindy(config, raw_path=None, encoded_path=None, predicted_path=None, output_csv=None):
     print("\n--- Cross-Source Recovery Testing ---")
     
     # Load data
-    raw = np.load("pySINDy/raw_data_grad.npz")
-    encoded = np.load("pySINDy/encoded_data_grad.npz")
-    predicted = np.load("pySINDy/predicted_data_grad.npz")
+    raw = np.load(raw_path or output_path(config, "raw_grad", create_parent=False))
+    encoded = np.load(encoded_path or output_path(config, "encoded_grad", create_parent=False))
+    predicted = np.load(predicted_path or output_path(config, "predicted_grad", create_parent=False))
+    output_csv = output_csv or output_path(config, "cross_source_results")
     
     scenarios = [
         ("Raw", raw),
@@ -51,9 +55,16 @@ def cross_source_sindy():
             print(f"Input: {input_label:9} | Target: {target_label:9} | MSE: {mse:.4e} | wx^2: {coefs[4]:.4f}")
 
     df = pd.DataFrame(results)
-    df.to_csv("pySINDy/cross_source_results.csv", index=False)
-    print("\nSaved: pySINDy/cross_source_results.csv")
+    df.to_csv(output_csv, index=False)
+    print(f"\nSaved: {output_csv}")
     print(df.to_string(index=False))
 
 if __name__ == "__main__":
-    cross_source_sindy()
+    parser = make_parser("Test cross-source SINDy recovery across raw, encoded, and predicted data.", runtime=False)
+    parser.add_argument("--raw-input", help="Raw input NPZ. Defaults to outputs.raw_grad in the config.")
+    parser.add_argument("--encoded-input", help="Encoded input NPZ. Defaults to outputs.encoded_grad in the config.")
+    parser.add_argument("--predicted-input", help="Predicted input NPZ. Defaults to outputs.predicted_grad in the config.")
+    parser.add_argument("--output", help="Output CSV. Defaults to outputs.cross_source_results in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    cross_source_sindy(config, args.raw_input, args.encoded_input, args.predicted_input, args.output)

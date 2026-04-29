@@ -26,19 +26,34 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from encoder.autoencoderGEN3.models import get_model_by_index
-from TransformLatent import FloatConverter
+
+try:
+    from .config import add_config_argument, choose_path, config_get, load_config
+except ImportError:
+    from config import add_config_argument, choose_path, config_get, load_config
 
 def compute_rmse(a, b):
     return np.sqrt(np.mean((a - b) ** 2))
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default='/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent')
-    parser.add_argument('--n_files', type=int, default=5)
-    parser.add_argument('--model_path', type=str, default=os.path.join(
-        PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models_production', 'Model_GEN3_05_AttentionSE_absolute_best.pt'
-    ))
+    add_config_argument(parser)
+    parser.add_argument('--data_dir', type=str, default=None)
+    parser.add_argument('--n_files', type=int, default=None)
+    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--output_dir', type=str, default=None, help='Directory for ablation plot')
     args = parser.parse_args()
+
+    config = load_config(args.config)
+    args.data_dir = choose_path(args.data_dir, config, "data.validation_data_dir", os.path.join("data", "Final_Cubed_OG_Data_wLatent"))
+    args.model_path = choose_path(
+        args.model_path,
+        config,
+        "paths.production_model_path",
+        os.path.join(PROJECT_ROOT, "encoder", "autoencoderGEN3", "saved_models_production", "Model_GEN3_05_AttentionSE_absolute_best.pt"),
+    )
+    args.n_files = args.n_files if args.n_files is not None else int(config_get(config, "validation.n_files", 5))
+    output_dir = choose_path(args.output_dir, config, "paths.results_dir", "Documentation")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     
@@ -96,7 +111,7 @@ def main():
     plt.legend()
     plt.grid(True, which="both", ls="-", alpha=0.3)
 
-    out_path = os.path.join(PROJECT_ROOT, 'Documentation', 'ablation_study.png')
+    out_path = os.path.join(output_dir, 'ablation_study.png')
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     plt.savefig(out_path, dpi=300)
     print(f"Saved ablation plot to {out_path}")

@@ -1,13 +1,16 @@
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
+import argparse
+import os
+from transformer_config import add_config_arg, load_config, resolve_path
 
 # Coordinates from Ordered_010_Prepare_Dataset.py
 X_COORDS = [-50, -46, -42, -38, -34, -30, -26, -22, -18, -14, -10, -6, -2, 2, 6, 10, 14, 18, 22, 25, 29, 33, 37, 41, 45, 49]
 Z_COORDS = [-33, -29, -25, -21, -17, -13, -9, -5, -1, 3, 7, 11, 14, 18, 22, 26, 30, 34]
 Y_COORDS = [-83, -80, -76, -72, -68, -64, -60, -56, -52, -48, -44, -40, -36, -32, -28, -24, -20, -16, -12, -8, -4, 0, 4, 8, 12, 16, 20, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71, 75, 79, 83, 87]
 
-def create_visualization():
+def create_visualization(output_path):
     fig = plt.figure(figsize=(16, 10))
     
     # --- 1. SPATIAL SEARCH SPACE (X, Y, Z) ---
@@ -152,8 +155,14 @@ def create_visualization():
              bbox=dict(boxstyle="round,pad=0.5", facecolor="whitesmoke", edgecolor="gray"))
 
     plt.tight_layout()
-    plt.savefig('transformer/training_process_viz.png', dpi=150)
-    print("Updated visualization saved to transformer/training_process_viz.png")
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    plt.savefig(output_path, dpi=150)
+    print(f"Updated visualization saved to {output_path}")
 
 if __name__ == "__main__":
-    create_visualization()
+    parser = argparse.ArgumentParser(description="Visualize the transformer data strategy.")
+    add_config_arg(parser)
+    parser.add_argument("--output", default=None, help="Output image path.")
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+    create_visualization(resolve_path(args.output or cfg["paths"]["training_process_viz"]))

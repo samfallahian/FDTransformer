@@ -16,14 +16,16 @@ import sys
 import pandas as pd
 import numpy as np
 import time
+import argparse
 from tqdm import tqdm
 
+from pipeline_config import add_config_argument, resolve_path
+
 class RowFilterTimeSeperate:
-    def __init__(self):
-        # Paths as specified in the issue description
-        self.input_dir = "/Users/kkreth/PycharmProjects/data/Scaled_OG_Data"
-        self.output_parent_dir = "/Users/kkreth/PycharmProjects/data/Cubed_OG_Data"
-        self.filter_csv_path = "/Users/kkreth/PycharmProjects/cgan/cube_centroid_mapping/df_all_possible_combinations_with_neighbors.csv"
+    def __init__(self, input_dir: str, output_parent_dir: str, filter_csv_path: str):
+        self.input_dir = input_dir
+        self.output_parent_dir = output_parent_dir
+        self.filter_csv_path = filter_csv_path
         self.centroids = None
 
     def load_filter(self):
@@ -147,5 +149,16 @@ class RowFilterTimeSeperate:
         print("\nAll files processed successfully.")
 
 if __name__ == "__main__":
-    processor = RowFilterTimeSeperate()
+    parser = argparse.ArgumentParser(description="Filter scaled data and split each file into per-time-step files.")
+    add_config_argument(parser)
+    parser.add_argument("--input_dir", help="Directory containing scaled .pkl.gz files.")
+    parser.add_argument("--output_dir", help="Directory to write cubed, time-separated files.")
+    parser.add_argument("--filter_csv", help="Centroid-neighbor mapping CSV.")
+    args = parser.parse_args()
+
+    processor = RowFilterTimeSeperate(
+        input_dir=resolve_path(args.config, "scaled_data_dir", args.input_dir),
+        output_parent_dir=resolve_path(args.config, "cubed_data_dir", args.output_dir),
+        filter_csv_path=resolve_path(args.config, "cube_mapping_csv", args.filter_csv),
+    )
     processor.run()

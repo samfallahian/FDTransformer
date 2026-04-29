@@ -1,0 +1,43 @@
+{
+  "project_root": "..",
+  "data": {
+    "evaluation_h5": "/data/transformer_evaluation/evaluation_data.h5"
+  },
+  "models": {
+    "transformer_checkpoint": "../transformer/best_ordered_transformer_v1.pt",
+    "encoder_checkpoint": "../encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
+  },
+  "outputs": {
+    "output_dir": ".",
+    "documentation_dir": "../Documentation",
+    "raw_grad": "raw_data_grad.npz",
+    "encoded_grad": "encoded_data_grad.npz",
+    "predicted_grad": "predicted_data_grad.npz",
+    "raw_extended": "raw_extended.npz",
+    "encoded_extended": "encoded_extended.npz",
+    "predicted_extended": "predicted_extended.npz",
+    "evaluation_results": "evaluation_results.csv",
+    "evaluation_summary": "evaluation_summary.png",
+    "cross_source_results": "cross_source_results.csv",
+    "extended_physics_results": "extended_physics_results.csv",
+    "noise_robustness": "noise_robustness.png",
+    "all_params_recovery_results": "all_params_recovery_results.csv",
+    "all_params_coefficient_trends": "all_params_coefficient_trends.png",
+    "staircase_results": "staircase_physics_results.csv",
+    "staircase_plot": "staircase_physics_trends.png",
+    "staircase_plot_pdf": "staircase_physics_trends.pdf",
+    "interpolation_results": "interpolation_physics_results.csv"
+  },
+  "runtime": {
+    "device": "cpu",
+    "n_search": 100000,
+    "p_target": 5.2,
+    "triplet_idx": 62,
+    "batch_size": 64,
+    "reynolds_numbers": [3.6, 4.6, 5.2, 6.4, 6.6, 7.2, 7.8, 8.4, 10.4, 11.4],
+    "temporal_contexts": [7, 6, 5, 4, 3, 2, 1],
+    "grid_sample_limit": 1000,
+    "grid_point_limit": 30,
+    "random_seed": 42
+  }
+}

@@ -19,13 +19,12 @@ import os
 import sys
 import argparse
 import glob
-import math
 import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from typing import List, Tuple, Dict
+from typing import List
 
 # Resolve project root for imports
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,7 +32,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from encoder.autoencoderGEN3.models import get_model_by_index
-from TransformLatent import FloatConverter
+from helpers.TransformLatent import FloatConverter
+try:
+    from .config import add_config_argument, choose_path, config_get, load_config
+except ImportError:
+    from config import add_config_argument, choose_path, config_get, load_config
 
 # === Colors and Helpers ===
 CSI = "\033["
@@ -71,14 +74,27 @@ def compute_rmse(a, b):
 
 def main():
     parser = argparse.ArgumentParser(description="Compare AttentionSE AE vs PCA (POD)")
-    parser.add_argument('--data_dir', type=str, default='/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent')
-    parser.add_argument('--n_files', type=int, default=20, help='Files to sample for PCA training and validation')
+    add_config_argument(parser)
+    parser.add_argument('--data_dir', type=str, default=None)
+    parser.add_argument('--n_files', type=int, default=None, help='Files to sample for PCA training and validation')
     parser.add_argument('--latent_dim', type=int, default=47, help='Dimensions for both AE and PCA')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--model_path', type=str, default=os.path.join(
-        PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models_production', 'Model_GEN3_05_AttentionSE_absolute_best.pt'
-    ))
+    parser.add_argument('--seed', type=int, default=None)
+    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--output_dir', type=str, default=None, help='Directory for ROM comparison outputs')
     args = parser.parse_args()
+
+    config = load_config(args.config)
+    args.data_dir = choose_path(args.data_dir, config, "data.validation_data_dir", os.path.join("data", "Final_Cubed_OG_Data_wLatent"))
+    args.model_path = choose_path(
+        args.model_path,
+        config,
+        "paths.production_model_path",
+        os.path.join(PROJECT_ROOT, "encoder", "autoencoderGEN3", "saved_models_production", "Model_GEN3_05_AttentionSE_absolute_best.pt"),
+    )
+    args.n_files = args.n_files if args.n_files is not None else int(config_get(config, "validation.n_files", 20))
+    args.seed = args.seed if args.seed is not None else int(config_get(config, "validation.seed", 42))
+    output_dir = choose_path(args.output_dir, config, "paths.results_dir", "Documentation")
+    os.makedirs(output_dir, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
     print(rainbow(f"Active Device: {device}"))
@@ -184,7 +200,7 @@ def main():
         yval = bar.get_height()
         plt.text(bar.get_x() + bar.get_width()/2, yval, f'{yval:.6f}', va='bottom', ha='center', fontweight='bold')
 
-    out_plot = "ROM_Comparison_AE_vs_PCA.png"
+    out_plot = os.path.join(output_dir, "ROM_Comparison_AE_vs_PCA.png")
     plt.savefig(out_plot, dpi=300)
     print(rainbow(f"Comparison plot saved to {out_plot}"))
 
@@ -198,8 +214,9 @@ def main():
         'rmse_ae_raw': rmse_ae_raw,
         'improvement_pct': improvement
     }])
-    results_df.to_csv("ROM_Comparison_AE_vs_PCA.csv", index=False)
-    print(rainbow("Detailed metrics saved to ROM_Comparison_AE_vs_PCA.csv"))
+    out_csv = os.path.join(output_dir, "ROM_Comparison_AE_vs_PCA.csv")
+    results_df.to_csv(out_csv, index=False)
+    print(rainbow(f"Detailed metrics saved to {out_csv}"))
 
 if __name__ == "__main__":
     main()

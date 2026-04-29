@@ -1,18 +1,11 @@
 import os
-import sys
 import pandas as pd
 import numpy as np
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, List, Any
 
-# Add parent directory to sys.path to import HostPreferences
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-try:
-    from Ordered_001_Initialize import HostPreferences
-except ImportError:
-    HostPreferences = None
+from pipeline_config import add_config_argument, resolve_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -102,38 +95,16 @@ def format_size(size_bytes):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Correct dtypes and rename columns in .pkl.gz files.")
+    add_config_argument(parser)
     parser.add_argument("--dir", help="Directory to search for .pkl.gz files")
     parser.add_argument("--output_dir", help="Directory to save corrected files")
     args = parser.parse_args()
 
-    # Determine input directory
-    search_dir = args.dir
-    if not search_dir and HostPreferences:
-        try:
-            prefs = HostPreferences()
-            possible_dirs = [
-                os.path.join(prefs.root_path, "Unmodified_OG_Data"),
-                prefs.raw_input,
-                prefs.root_path
-            ]
-            for d in possible_dirs:
-                if d and os.path.exists(d):
-                    search_dir = d
-                    break
-        except Exception as e:
-            logger.warning(f"Could not load preferences: {e}")
-
-    if not search_dir or not os.path.exists(search_dir):
-        search_dir = "/Users/kkreth/PycharmProjects/data/Unmodified_OG_Data"
-        if not os.path.exists(search_dir):
-            search_dir = "."
-
-    # Determine output directory
-    output_dir = args.output_dir
-    if not output_dir:
-        # Default to a "Corrected_OG_Data" next to the input
-        parent = os.path.dirname(search_dir.rstrip('/'))
-        output_dir = os.path.join(parent, "Corrected_OG_Data")
+    search_dir = resolve_path(args.config, "unmodified_data_dir", args.dir)
+    output_dir = resolve_path(args.config, "corrected_data_dir", args.output_dir)
+    if not os.path.exists(search_dir):
+        print(f"Input directory not found: {search_dir}")
+        return
 
     print(f"Input directory: {search_dir}")
     print(f"Output directory: {output_dir}")

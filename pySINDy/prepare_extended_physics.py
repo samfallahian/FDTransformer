@@ -3,19 +3,23 @@ import torch
 import h5py
 import numpy as np
 import sys
-import scipy.ndimage as ndimage
 
-# Add project root to sys.path to allow imports from other modules
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-sys.path.insert(0, PROJECT_ROOT)
+from pysindy_config import (
+    configure_project_imports,
+    load_config_from_args,
+    make_parser,
+    output_path,
+    resolve_path,
+)
 
-from transformer.transformer_model_v1 import OrderedTransformerV1
-from TransformLatent import FloatConverter
 
-def load_models():
-    TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
-    DEVICE = "cpu"
+def load_models(config):
+    project_root = configure_project_imports(config)
+    from transformer.transformer_model_v1 import OrderedTransformerV1
+
+    transformer_checkpoint = resolve_path(config, ("models", "transformer_checkpoint"), required=True)
+    encoder_checkpoint = resolve_path(config, ("models", "encoder_checkpoint"), required=True)
+    device = config["runtime"]["device"]
     
     # Patch for torch._dynamo compatibility
     try:
@@ -26,7 +30,7 @@ def load_models():
     except: pass
 
     # Add transformer directory to sys.path
-    TRANS_DIR = os.path.join(PROJECT_ROOT, "transformer")
+    TRANS_DIR = os.path.join(project_root, "transformer")
     if TRANS_DIR not in sys.path:
         sys.path.insert(0, TRANS_DIR)
     
@@ -36,7 +40,7 @@ def load_models():
     import __main__
     __main__.Config = Config
 
-    checkpoint = torch.load(TRANSFORMER_CHECKPOINT, map_location=DEVICE, weights_only=False)
+    checkpoint = torch.load(transformer_checkpoint, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         transformer = checkpoint['model']
         if hasattr(transformer, '_orig_mod'): transformer = transformer._orig_mod
@@ -47,7 +51,7 @@ def load_models():
         transformer.load_state_dict(checkpoint['model_state_dict'])
     transformer.eval()
 
-    ae = torch.jit.load(ENCODER_CHECKPOINT, map_location=DEVICE)
+    ae = torch.jit.load(encoder_checkpoint, map_location=device)
     ae.eval()
     
     return transformer, ae
@@ -64,17 +68,20 @@ def calculate_vorticity(V, x, y, z):
     wz = grad_v[0] - grad_u[1]
     return wx, wy, wz
 
-def prepare_extended_physics():
-    h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-    transformer, ae = load_models()
+def prepare_extended_physics(config):
+    configure_project_imports(config)
+    from helpers.TransformLatent import FloatConverter
+
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
+    transformer, ae = load_models(config)
     converter = FloatConverter()
-    TRIPLET_IDX = 62
+    triplet_idx = config["runtime"]["triplet_idx"]
+    n_search = config["runtime"]["n_search"]
+    p_target = config["runtime"]["p_target"]
     
     with h5py.File(h5_path, 'r') as f:
         data = f['data']
         originals = f['originals']
-        n_search = 100000
-        p_target = 5.2
         
         params = data[:n_search, 0, 0, 51]
         mask = np.abs(params - p_target) < 0.01
@@ -114,7 +121,7 @@ def prepare_extended_physics():
             with torch.no_grad():
                 decoded_ae = ae.decode(t8_input_latents) # (26, 375)
                 v_full_ae = decoded_ae.reshape(26, 125, 3)
-                v_63_ae = v_full_ae[:, TRIPLET_IDX, :].numpy()
+                v_63_ae = v_full_ae[:, triplet_idx, :].numpy()
                 V_encoded[:, iy, iz, :] = converter.unconvert(v_63_ae)
                 
                 # Predict 8th timestep
@@ -133,7 +140,7 @@ def prepare_extended_physics():
                 t8_latents_pred = torch.cat(t8_preds, dim=0) # (26, 47)
                 decoded_pred = ae.decode(t8_latents_pred) # (26, 375)
                 v_full_pred = decoded_pred.reshape(26, 125, 3)
-                v_63_pred = v_full_pred[:, TRIPLET_IDX, :].numpy()
+                v_63_pred = v_full_pred[:, triplet_idx, :].numpy()
                 V_pred[:, iy, iz, :] = converter.unconvert(v_63_pred)
 
         x, y, z = data[0, 0, :, 47], unique_y, unique_z
@@ -146,10 +153,13 @@ def prepare_extended_physics():
             helicity = u*wx + v*wy + w*wz
             enstrophy = 0.5 * (wx**2 + wy**2 + wz**2)
             
-            np.savez(f"pySINDy/{name}_extended.npz", 
+            out_path = output_path(config, f"{name}_extended")
+            np.savez(out_path,
                      V=V, wx=wx, wy=wy, wz=wz, 
                      ke=ke, helicity=helicity, enstrophy=enstrophy)
-            print(f"Saved pySINDy/{name}_extended.npz")
+            print(f"Saved {out_path}")
 
 if __name__ == "__main__":
-    prepare_extended_physics()
+    parser = make_parser("Prepare raw, encoded, and predicted extended physics arrays.")
+    args = parser.parse_args()
+    prepare_extended_physics(load_config_from_args(args))

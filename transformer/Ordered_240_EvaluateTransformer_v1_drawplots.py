@@ -5,13 +5,19 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import argparse
+from transformer_config import add_config_arg, load_config, resolve_path
 
 # --- Configuration ---
 RESULTS_JSON = "evaluation_results.json"
-DOC_DIR = "/Users/kkreth/PycharmProjects/cgan/Documentation"
+DOC_DIR = "plots"
 
-if not os.path.exists(DOC_DIR):
-    os.makedirs(DOC_DIR)
+def configure(args):
+    cfg = load_config(args.config)
+    global RESULTS_JSON, DOC_DIR
+    RESULTS_JSON = resolve_path(args.results_json or cfg["paths"]["evaluation_results_json"])
+    DOC_DIR = resolve_path(args.output_dir or cfg["paths"]["plots_dir"])
+    os.makedirs(DOC_DIR, exist_ok=True)
 
 def main():
     if not os.path.exists(RESULTS_JSON):
@@ -127,5 +133,13 @@ def main():
 
     print("All requested figures generated successfully.")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate evaluation plots from evaluation_results.json.")
+    add_config_arg(parser)
+    parser.add_argument("--results_json", "--results-json", dest="results_json", default=None)
+    parser.add_argument("--output_dir", "--output-dir", dest="output_dir", default=None)
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    configure(parse_args())
     main()

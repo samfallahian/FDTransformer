@@ -4,13 +4,12 @@
 Builds two large non-IO-bound datasets for rapid auto-encoder training and validation.
 
 It samples rows uniformly at random across the existing training files using
-`EfficientDataLoader`, then writes two pickle files to the configured `root_path`:
+`EfficientDataLoader`, then writes two pickle files to the configured dataset directory:
 
 - training_auto_encoder.pkl
 - validation_auto_encoder.pkl
 
-Defaults to 1,000,000 rows for each split. Paths are sourced from `experiment.preferences`.
-Data source is `training_data_path`; outputs are written under `root_path`.
+Paths come from `pipeline_config.json` unless overridden with CLI arguments.
 """
 
 import os
@@ -28,8 +27,8 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from Ordered_001_Initialize import HostPreferences  # noqa: E402
-from EfficientDataLoader import EfficientDataLoader  # noqa: E402
+from helpers.EfficientDataLoader import EfficientDataLoader  # noqa: E402
+from pipeline_config import add_config_argument, resolve_path  # noqa: E402
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -41,11 +40,10 @@ class AutoEncoderDatasetBuilder:
     Build fixed training/validation datasets for rapid, non-IO-bound AE training.
     """
     def __init__(self,
-                 preferences_path: str = None,
                  train_rows: int = 2_000_000,
                  val_rows: int = 2_000_000,
-                 source_root: str = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data",
-                 dest_root: str = "/Users/kkreth/PycharmProjects/data",
+                 source_root: str = None,
+                 dest_root: str = None,
                  seed: int | None = 42,
                  num_workers: int = 10,
                  cache_size: int = 50,
@@ -56,12 +54,6 @@ class AutoEncoderDatasetBuilder:
                  min_file_age_seconds: int = 900,
                  allowed_extensions: list[str] = ('.pkl.gz',)):
         self.project_root = PROJECT_ROOT
-        
-        # Resolve preferences path: use provided path, or look in script's directory
-        if preferences_path is None:
-            self.preferences_path = os.path.join(SCRIPT_DIR, "../experiment.preferences")
-        else:
-            self.preferences_path = preferences_path
             
         self.train_rows = int(train_rows)
         self.val_rows = int(val_rows)
@@ -75,16 +67,10 @@ class AutoEncoderDatasetBuilder:
         self.min_file_age_seconds = min_file_age_seconds
         self.allowed_extensions = list(allowed_extensions)
 
-        self.preferences = HostPreferences(filename=self.preferences_path)
         # Source directory for sampling
         self.source_root = source_root
         # Destination directory for the new datasets
         self.dest_root = dest_root
-
-        # Adopt logging level from preferences when available
-        lvl = getattr(logging, str(self.preferences.logging_level).upper(), None) if hasattr(self.preferences, 'logging_level') else None
-        if isinstance(lvl, int):
-            logger.setLevel(lvl)
 
         logger.info(f"AutoEncoderDatasetBuilder initialized: source_root={self.source_root} dest_root={self.dest_root}")
 
@@ -155,18 +141,15 @@ class AutoEncoderDatasetBuilder:
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Create non-IO-bound train/validation datasets for AE training.")
-    parser.add_argument('--preferences', type=str, default=None,
-                        help='Path to experiment.preferences (defaults to script directory).')
+    add_config_argument(parser)
     parser.add_argument('--train_rows', type=int, default=2_000_000,
                         help='Number of rows for training split.')
     parser.add_argument('--val_rows', type=int, default=2_000_000,
                         help='Number of rows for validation split.')
     parser.add_argument('--source_root', type=str,
-                        default="/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data",
-                        help='Source directory for sampling (overrides preferences).')
+                        help='Source directory for sampling.')
     parser.add_argument('--dest_root', type=str,
-                        default="/Users/kkreth/PycharmProjects/data",
-                        help='Destination directory for datasets (overrides preferences).')
+                        help='Destination directory for datasets.')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility (pass to EfficientDataLoader).')
     parser.add_argument('--workers', type=int, default=10,
@@ -191,11 +174,10 @@ def main(argv=None):
         extensions.append('.pkl')
 
     builder = AutoEncoderDatasetBuilder(
-        preferences_path=args.preferences,
         train_rows=args.train_rows,
         val_rows=args.val_rows,
-        source_root=args.source_root,
-        dest_root=args.dest_root,
+        source_root=resolve_path(args.config, "final_cubed_data_dir", args.source_root),
+        dest_root=resolve_path(args.config, "autoencoder_dataset_dir", args.dest_root),
         seed=args.seed,
         num_workers=args.workers,
         cache_size=args.cache_size,

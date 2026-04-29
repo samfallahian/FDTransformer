@@ -9,16 +9,13 @@ the existing one that used the old metadata grid.
 '''
 import os
 import sys
+import argparse
 import logging
 import pandas as pd
 from itertools import product
 from typing import Dict, List, Tuple, Any
 
-# Ensure we can import from the project root
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from Ordered_001_Initialize import HostPreferences
-from CoordinateSpace import CoordinateSpace
+from pipeline_config import add_config_argument, resolve_path
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -38,10 +35,27 @@ def trim_edges(values: List[int], trim_each_side: int = 3) -> List[int]:
 def neighbors_for_point(x: int, y: int, z: int,
                         x_enum: List[int], y_enum: List[int], z_enum: List[int]) -> List[Tuple[int, int, int]]:
     """
-    Use CoordinateSpace to generate the 5x5x5 neighbors (125 triplets) around a centroid.
+    Generate the 5x5x5 neighbors (125 triplets) around a centroid.
     """
-    cube = CoordinateSpace.create_from_point(x, y, z, x_enum, y_enum, z_enum)
-    combos = cube.combinations
+    try:
+        x_idx = x_enum.index(x)
+        y_idx = y_enum.index(y)
+        z_idx = z_enum.index(z)
+    except ValueError:
+        logger.warning(f"Centroid ({x},{y},{z}) was not found in the coordinate grid.")
+        return []
+
+    offsets = [-2, -1, 0, 1, 2]
+    combos = []
+    for dx in offsets:
+        for dy in offsets:
+            for dz in offsets:
+                xi = x_idx + dx
+                yi = y_idx + dy
+                zi = z_idx + dz
+                if 0 <= xi < len(x_enum) and 0 <= yi < len(y_enum) and 0 <= zi < len(z_enum):
+                    combos.append((x_enum[xi], y_enum[yi], z_enum[zi]))
+
     if len(combos) != 125:
         logger.warning(f"Neighbors returned {len(combos)} instead of 125 for centroid ({x},{y},{z}).")
     # Ensure deterministic ordering: x, then y, then z ascending
@@ -134,8 +148,14 @@ def get_grid_from_sim_data(input_dir: str) -> Tuple[List[int], List[int], List[i
     return x_enum, y_enum, z_enum
 
 def main():
-    input_dir = "/Users/kkreth/PycharmProjects/data/Scaled_OG_Data"
-    output_csv = "/Users/kkreth/PycharmProjects/cgan/cube_centroid_mapping/df_all_possible_combinations_with_neighbors.csv"
+    parser = argparse.ArgumentParser(description="Build the centroid-to-neighbor mapping CSV.")
+    add_config_argument(parser)
+    parser.add_argument("--input_dir", help="Directory containing scaled .pkl.gz files.")
+    parser.add_argument("--output_csv", help="Path to write the centroid-neighbor mapping CSV.")
+    args = parser.parse_args()
+
+    input_dir = resolve_path(args.config, "scaled_data_dir", args.input_dir)
+    output_csv = resolve_path(args.config, "cube_mapping_csv", args.output_csv)
     
     try:
         x_enum, y_enum, z_enum = get_grid_from_sim_data(input_dir)

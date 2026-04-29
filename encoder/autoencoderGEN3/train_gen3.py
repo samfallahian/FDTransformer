@@ -48,15 +48,32 @@ if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
 from encoder.autoencoderGEN3.models import get_model_by_index, ORIGINAL_DIM, LATENT_DIM
-from Ordered_001_Initialize import HostPreferences
+try:
+    from .config import (
+        add_config_argument,
+        choose_path,
+        config_get,
+        configured_path,
+        load_config,
+        optional_path,
+    )
+except ImportError:
+    from config import (
+        add_config_argument,
+        choose_path,
+        config_get,
+        configured_path,
+        load_config,
+        optional_path,
+    )
 
 # Configuration
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_LR = 1e-4
 DEFAULT_EPOCHS = 100
 DATA_PERCENTAGE = 10
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_models')
-BASE_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models_production', 'Model_GEN3_05_AttentionSE_absolute_best.pt')
+DEFAULT_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_models')
+DEFAULT_BASE_WEIGHTS_PATH = os.path.join(PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models_production', 'Model_GEN3_05_AttentionSE_absolute_best.pt')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -95,14 +112,29 @@ def accelerator_report():
     logger.info(f"Selected device: {device}")
     return device
 
-def load_data(sample_percentage=10):
-    preferences_path = os.path.join(PROJECT_ROOT, "experiment.preferences")
-    prefs = HostPreferences(filename=preferences_path)
-    root_dir = getattr(prefs, 'root_path', os.getcwd())
-    
-    train_path = os.path.join(root_dir, 'training_auto_encoder.pkl')
-    val_path = os.path.join(root_dir, 'validation_auto_encoder.pkl')
-    
+def resolve_training_paths(args, config):
+    train_path = optional_path(args.train_path, base_dir=os.getcwd()) or configured_path(config, "data.train_path")
+    val_path = optional_path(args.val_path, base_dir=os.getcwd()) or configured_path(config, "data.val_path")
+    if train_path and val_path:
+        return train_path, val_path
+
+    data_root = optional_path(args.data_root, base_dir=os.getcwd()) or configured_path(config, "data.data_root")
+    train_filename = config_get(config, "data.train_filename", "training_auto_encoder.pkl")
+    val_filename = config_get(config, "data.val_filename", "validation_auto_encoder.pkl")
+    if data_root:
+        return (
+            train_path or os.path.join(data_root, train_filename),
+            val_path or os.path.join(data_root, val_filename),
+        )
+
+    raise ValueError(
+        "Training and validation data paths are required. Set data.train_path and "
+        "data.val_path in autoencoderGEN3/config.json, set data.data_root, or pass "
+        "--train_path/--val_path on the command line."
+    )
+
+
+def load_data(train_path, val_path, sample_percentage=10):
     def load_file(path):
         with open(path, 'rb') as f:
             arr = pickle.load(f).astype(np.float32)
@@ -111,21 +143,35 @@ def load_data(sample_percentage=10):
         return arr
 
     logger.info(f"Loading {sample_percentage}% of data...")
+    logger.info(f"Training data: {train_path}")
+    logger.info(f"Validation data: {val_path}")
     train_np = load_file(train_path)
     val_np = load_file(val_path)
     return train_np, val_np
 
-def train_one_model(model_idx, train_loader, val_loader, device, num_epochs=100, use_wandb=True):
+def train_one_model(
+    model_idx,
+    train_loader,
+    val_loader,
+    device,
+    num_epochs=100,
+    batch_size=DEFAULT_BATCH_SIZE,
+    lr=DEFAULT_LR,
+    data_percentage=DATA_PERCENTAGE,
+    save_dir=DEFAULT_SAVE_DIR,
+    base_weights_path=DEFAULT_BASE_WEIGHTS_PATH,
+    use_wandb=True,
+):
     model = get_model_by_index(model_idx).to(device)
     model_name = type(model).__name__
     logger.info(f"Training model {model_idx+1}/10: {model_name}")
 
     # Load base weights if available
-    if os.path.exists(BASE_WEIGHTS_PATH):
+    if os.path.exists(base_weights_path):
         print_rainbow(f"*** LOADING BASE WEIGHTS FROM MODEL 09 INTO {model_name} ***")
         try:
             # Using weights_only=False because the checkpoint contains custom classes/numpy types
-            checkpoint = torch.load(BASE_WEIGHTS_PATH, map_location=device, weights_only=False)
+            checkpoint = torch.load(base_weights_path, map_location=device, weights_only=False)
             state_dict = checkpoint.get('model_state_dict', checkpoint)
             
             # Filter out incompatible keys if necessary, though strict=False handles most cases
@@ -139,18 +185,18 @@ def train_one_model(model_idx, train_loader, val_loader, device, num_epochs=100,
         except Exception as e:
             logger.error(f"Failed to load base weights: {e}")
     else:
-        logger.warning(f"Base weights NOT found at {BASE_WEIGHTS_PATH}")
+        logger.warning(f"Base weights NOT found at {base_weights_path}")
     
-    optimizer = optim.Adam(model.parameters(), lr=DEFAULT_LR)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
     
     if use_wandb:
         wandb.init(project="autoencoder-GEN3-comparison", name=model_name, config={
             "model_idx": model_idx,
             "model_name": model_name,
             "epochs": num_epochs,
-            "batch_size": DEFAULT_BATCH_SIZE,
-            "lr": DEFAULT_LR,
-            "data_percentage": DATA_PERCENTAGE
+            "batch_size": batch_size,
+            "lr": lr,
+            "data_percentage": data_percentage
         })
 
     best_val_rmse = float('inf')
@@ -192,7 +238,7 @@ def train_one_model(model_idx, train_loader, val_loader, device, num_epochs=100,
         if val_rmse < best_val_rmse:
             best_val_rmse = val_rmse
             # Save best model with all info embedded
-            save_path = os.path.join(SAVE_DIR, f"{model_name}_best.pt")
+            save_path = os.path.join(save_dir, f"{model_name}_best.pt")
             
             # Get model source code
             try:
@@ -219,7 +265,7 @@ def train_one_model(model_idx, train_loader, val_loader, device, num_epochs=100,
                 # Some models like the Skip connection one might need careful scripting
                 # We'll try to script a wrapper that doesn't rely on internal state if possible
                 scripted_model = torch.jit.script(model)
-                torch.jit.save(scripted_model, os.path.join(SAVE_DIR, f"{model_name}_scripted.pt"))
+                torch.jit.save(scripted_model, os.path.join(save_dir, f"{model_name}_scripted.pt"))
             except Exception as e:
                 # logger.warning(f"Could not save {model_name} as TorchScript: {e}")
                 pass
@@ -231,20 +277,36 @@ def train_one_model(model_idx, train_loader, val_loader, device, num_epochs=100,
 
 def main():
     parser = argparse.ArgumentParser(description="GEN3 Autoencoder Comparison")
-    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
-    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument('--data_percentage', type=int, default=DATA_PERCENTAGE)
+    add_config_argument(parser)
+    parser.add_argument('--epochs', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--data_percentage', type=int, default=None)
     parser.add_argument('--model_idx', type=int, default=None, help="Index of model to train (0-9). If None, trains all.")
+    parser.add_argument('--train_path', type=str, default=None, help="Path to training_auto_encoder.pkl")
+    parser.add_argument('--val_path', type=str, default=None, help="Path to validation_auto_encoder.pkl")
+    parser.add_argument('--data_root', type=str, default=None, help="Directory containing training and validation pickle files")
+    parser.add_argument('--save_dir', type=str, default=None, help="Directory for comparison checkpoints")
+    parser.add_argument('--base_weights_path', type=str, default=None, help="Optional checkpoint used to seed comparison models")
     parser.add_argument('--no_wandb', action='store_true')
     args = parser.parse_args()
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
+    config = load_config(args.config)
+    epochs = args.epochs if args.epochs is not None else int(config_get(config, "training.epochs", DEFAULT_EPOCHS))
+    batch_size = args.batch_size if args.batch_size is not None else int(config_get(config, "training.batch_size", DEFAULT_BATCH_SIZE))
+    lr = args.lr if args.lr is not None else float(config_get(config, "training.learning_rate", DEFAULT_LR))
+    data_percentage = args.data_percentage if args.data_percentage is not None else int(config_get(config, "training.data_percentage", DATA_PERCENTAGE))
+    save_dir = choose_path(args.save_dir, config, "paths.comparison_save_dir", DEFAULT_SAVE_DIR)
+    base_weights_path = choose_path(args.base_weights_path, config, "paths.comparison_base_weights_path", DEFAULT_BASE_WEIGHTS_PATH)
+    train_path, val_path = resolve_training_paths(args, config)
+
+    os.makedirs(save_dir, exist_ok=True)
     device = accelerator_report()
     
-    train_np, val_np = load_data(sample_percentage=args.data_percentage)
+    train_np, val_np = load_data(train_path, val_path, sample_percentage=data_percentage)
     
-    train_loader = DataLoader(TensorDataset(torch.from_numpy(train_np)), batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_np)), batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(train_np)), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(val_np)), batch_size=batch_size, shuffle=False)
     
     results = {}
     model_indices = [args.model_idx] if args.model_idx is not None else range(10)
@@ -252,7 +314,13 @@ def main():
     for i in model_indices:
         try:
             best_rmse = train_one_model(i, train_loader, val_loader, device, 
-                                      num_epochs=args.epochs, use_wandb=not args.no_wandb)
+                                      num_epochs=epochs,
+                                      batch_size=batch_size,
+                                      lr=lr,
+                                      data_percentage=data_percentage,
+                                      save_dir=save_dir,
+                                      base_weights_path=base_weights_path,
+                                      use_wandb=not args.no_wandb)
             results[f"Model_{i+1}"] = best_rmse
         except Exception as e:
             logger.error(f"Failed to train model {i+1}: {e}")

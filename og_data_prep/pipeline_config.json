@@ -1,0 +1,17 @@
+{
+  "root_path": "/data",
+  "metadata_location": "../configs/Experiment_MetaData.json",
+  "unmodified_data_dir": "/data/Unmodified_OG_Data",
+  "corrected_data_dir": "/data/Corrected_OG_Data",
+  "scaled_data_dir": "/data/Scaled_OG_Data",
+  "cubed_data_dir": "/data/Cubed_OG_Data",
+  "final_cubed_data_dir": "/data/Final_Cubed_OG_Data",
+  "final_latent_data_dir": "/data/Final_Cubed_OG_Data_wLatent",
+  "autoencoder_dataset_dir": "/data",
+  "cube_mapping_csv": "../cube_centroid_mapping/df_all_possible_combinations_with_neighbors.csv",
+  "autoencoder_model_path": "../encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt",
+  "validation_input_file": "/data/Final_Cubed_OG_Data_wLatent/8p4/0160.pkl.gz",
+  "extremes_report_path": "extremes_report.png",
+  "validation_results_csv": "validation_results_0160.csv",
+  "output_directory": "/data/output"
+}

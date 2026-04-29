@@ -6,19 +6,24 @@ import sys
 import pandas as pd
 import pysindy as ps
 from sklearn.metrics import mean_squared_error
-from tqdm import tqdm
 
-# Add project root to sys.path
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-sys.path.insert(0, PROJECT_ROOT)
+from pysindy_config import (
+    configure_project_imports,
+    load_config_from_args,
+    make_parser,
+    output_path,
+    resolve_path,
+    select_device,
+)
 
-from transformer.transformer_model_v1 import OrderedTransformerV1
-from TransformLatent import FloatConverter
 
-def load_models():
-    TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
-    DEVICE = "cpu"
+def load_models(config):
+    project_root = configure_project_imports(config)
+    from transformer.transformer_model_v1 import OrderedTransformerV1
+
+    transformer_checkpoint = resolve_path(config, ("models", "transformer_checkpoint"), required=True)
+    encoder_checkpoint = resolve_path(config, ("models", "encoder_checkpoint"), required=True)
+    device = select_device(torch, config["runtime"].get("device"))
     
     # Patch for torch._dynamo compatibility
     try:
@@ -29,7 +34,7 @@ def load_models():
     except: pass
 
     # Add transformer directory to sys.path
-    TRANS_DIR = os.path.join(PROJECT_ROOT, "transformer")
+    TRANS_DIR = os.path.join(project_root, "transformer")
     if TRANS_DIR not in sys.path:
         sys.path.insert(0, TRANS_DIR)
     
@@ -39,7 +44,7 @@ def load_models():
     import __main__
     __main__.Config = Config
 
-    checkpoint = torch.load(TRANSFORMER_CHECKPOINT, map_location=DEVICE, weights_only=False)
+    checkpoint = torch.load(transformer_checkpoint, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         transformer = checkpoint['model']
         if hasattr(transformer, '_orig_mod'): transformer = transformer._orig_mod
@@ -50,7 +55,7 @@ def load_models():
         transformer.load_state_dict(checkpoint['model_state_dict'])
     transformer.eval()
 
-    ae = torch.jit.load(ENCODER_CHECKPOINT, map_location=DEVICE)
+    ae = torch.jit.load(encoder_checkpoint, map_location=device)
     ae.eval()
     
     return transformer, ae
@@ -92,18 +97,25 @@ def run_sindy_recovery(wx, wy, wz, enstrophy):
         results[name] = coefs[i]
     return results
 
-def main():
-    h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-    transformer, ae = load_models()
+def main(config):
+    configure_project_imports(config)
+    from helpers.TransformLatent import FloatConverter
+
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
+    output_csv = output_path(config, "all_params_recovery_results")
+    trend_figure = output_path(config, "all_params_coefficient_trends")
+    transformer, ae = load_models(config)
     converter = FloatConverter()
-    TRIPLET_IDX = 62
+    triplet_idx = config["runtime"]["triplet_idx"]
+    batch_size = config["runtime"]["batch_size"]
+    n_search = config["runtime"]["n_search"]
     
     with h5py.File(h5_path, 'r') as f:
         data = f['data']
         originals = f['originals']
         
         # Get unique params from first 100k samples for speed
-        params_sample = data[:100000, 0, 0, 51]
+        params_sample = data[:n_search, 0, 0, 51]
         unique_params = np.unique(params_sample)
         print(f"Unique Reynolds Numbers to evaluate: {unique_params}")
         
@@ -137,16 +149,15 @@ def main():
             
             # Batched prediction for Predicted, Raw, and Encoded sources
             print(f"Running batched reconstruction for {p_target:.2f}...")
-            device = "mps" if torch.backends.mps.is_available() else "cpu"
+            device = select_device(torch, config["runtime"].get("device"))
             transformer.to(device)
             ae.to(device)
             
-            B_SIZE = 64
             # We must use sorted indices for HDF5 access
             sorted_indices = np.sort(indices_for_grid)
             
-            for i in range(0, len(sorted_indices), B_SIZE):
-                batch_idx = sorted_indices[i:i+B_SIZE]
+            for i in range(0, len(sorted_indices), batch_size):
+                batch_idx = sorted_indices[i:i+batch_size]
                 curr_B = len(batch_idx)
                 
                 # Get samples (Increasing order required)
@@ -168,7 +179,7 @@ def main():
                 t8_latents_gt = torch.from_numpy(samples[:, -1, :, :47]).float().to(device)
                 with torch.no_grad():
                     decoded_gt = ae.decode(t8_latents_gt.reshape(-1, 47))
-                    v_63_gt = decoded_gt.reshape(curr_B, 26, 125, 3)[:, :, TRIPLET_IDX, :].cpu().numpy()
+                    v_63_gt = decoded_gt.reshape(curr_B, 26, 125, 3)[:, :, triplet_idx, :].cpu().numpy()
                     for b_i in range(curr_B):
                         y_val = samples[b_i, 0, 0, 48]
                         z_val = samples[b_i, 0, 0, 49]
@@ -193,7 +204,7 @@ def main():
                     all_t8_latents = torch.cat(t8_preds, dim=1) # (B, 26, 47)
                     all_t8_latents_flat = all_t8_latents.reshape(-1, 47)
                     decoded = ae.decode(all_t8_latents_flat) # (B*26, 375)
-                    v_63 = decoded.reshape(curr_B, 26, 125, 3)[:, :, TRIPLET_IDX, :].cpu().numpy()
+                    v_63 = decoded.reshape(curr_B, 26, 125, 3)[:, :, triplet_idx, :].cpu().numpy()
                     
                     for b_i in range(curr_B):
                         y_val = samples[b_i, 0, 0, 48]
@@ -219,7 +230,7 @@ def main():
         df = pd.DataFrame(all_results)
         cols = ['Reynolds_Number', 'Source', 'MSE', 'wx^2', 'wy^2', 'wz^2', 'wx', 'wy', 'wz', '1']
         df = df[[c for c in cols if c in df.columns]]
-        df.to_csv('pySINDy/all_params_recovery_results.csv', index=False)
+        df.to_csv(output_csv, index=False)
         print("\nSummary Results Table:")
         print(df.to_string(index=False))
 
@@ -239,8 +250,10 @@ def main():
             plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('pySINDy/all_params_coefficient_trends.png')
-        print("\nTrend figure saved to: pySINDy/all_params_coefficient_trends.png")
+        plt.savefig(trend_figure)
+        print(f"\nTrend figure saved to: {trend_figure}")
 
 if __name__ == "__main__":
-    main()
+    parser = make_parser("Reproduce SINDy recovery over every Reynolds parameter in the HDF5 data.")
+    args = parser.parse_args()
+    main(load_config_from_args(args))

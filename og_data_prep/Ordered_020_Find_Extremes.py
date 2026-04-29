@@ -1,5 +1,4 @@
 import os
-import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,13 +6,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
-# Add parent directory to sys.path to import HostPreferences if needed
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-try:
-    from Ordered_001_Initialize import HostPreferences
-except ImportError:
-    HostPreferences = None
+from pipeline_config import add_config_argument, resolve_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,33 +50,17 @@ def analyze_file_extremes(file_path, sample_frac=0.01):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Find extremes and distribution of vx, vy, vz.")
+    add_config_argument(parser)
     parser.add_argument("--dir", help="Directory to search for .pkl.gz files")
     parser.add_argument("--sample_frac", type=float, default=0.01, help="Fraction of data to sample (default 0.01)")
-    parser.add_argument("--output", default="og_data_prep/extremes_report.png", help="Output path for the figure")
+    parser.add_argument("--output", help="Output path for the figure")
     args = parser.parse_args()
 
-    # Try to get path from HostPreferences or use a default
-    search_dir = args.dir
-    if not search_dir and HostPreferences:
-        try:
-            prefs = HostPreferences()
-            possible_dirs = [
-                os.path.join(prefs.root_path, "Unmodified_OG_Data"),
-                prefs.raw_input,
-                prefs.root_path
-            ]
-            for d in possible_dirs:
-                if d and os.path.exists(d):
-                    search_dir = d
-                    break
-        except Exception as e:
-            logger.warning(f"Could not load preferences: {e}")
-
-    if not search_dir or not os.path.exists(search_dir):
-        # Fallback
-        search_dir = "/Users/kkreth/PycharmProjects/data/Unmodified_OG_Data"
-        if not os.path.exists(search_dir):
-            search_dir = "."
+    search_dir = resolve_path(args.config, "unmodified_data_dir", args.dir)
+    output_path = resolve_path(args.config, "extremes_report_path", args.output)
+    if not os.path.exists(search_dir):
+        print(f"Input directory not found: {search_dir}")
+        return
 
     print(f"Analyzing files in: {search_dir}")
     
@@ -208,12 +185,12 @@ def main():
     plt.tight_layout()
     
     # Ensure output directory exists
-    output_dir = os.path.dirname(args.output)
+    output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
         
-    plt.savefig(args.output)
-    print(f"\nFigure saved to: {args.output}")
+    plt.savefig(output_path)
+    print(f"\nFigure saved to: {output_path}")
 
 if __name__ == "__main__":
     main()

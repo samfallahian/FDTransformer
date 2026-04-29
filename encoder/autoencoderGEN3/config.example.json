@@ -1,0 +1,30 @@
+{
+  "data": {
+    "train_path": "/path/to/training_auto_encoder.pkl",
+    "val_path": "/path/to/validation_auto_encoder.pkl",
+    "data_root": "/path/to/directory/containing/train/and/validation/pickles",
+    "train_filename": "training_auto_encoder.pkl",
+    "val_filename": "validation_auto_encoder.pkl",
+    "validation_data_dir": "/path/to/Final_Cubed_OG_Data_wLatent"
+  },
+  "paths": {
+    "comparison_save_dir": "encoder/autoencoderGEN3/saved_models",
+    "production_save_dir": "encoder/autoencoderGEN3/saved_models_production",
+    "comparison_base_weights_path": "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt",
+    "gen3_checkpoint_path": "encoder/autoencoderGEN3/saved_models/Model_GEN3_05_AttentionSE_best.pt",
+    "legacy_base_weights_path": "encoder/saved_models/Model_09_Residual_AE_epoch_500.pt",
+    "production_model_path": "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt",
+    "results_dir": "Documentation",
+    "wandb_dir": "wandb"
+  },
+  "training": {
+    "batch_size": 4096,
+    "epochs": 1000,
+    "learning_rate": 0.0001,
+    "data_percentage": 100
+  },
+  "validation": {
+    "n_files": 20,
+    "seed": 42
+  }
+}

@@ -1,32 +1,39 @@
-import os
 import torch
 import h5py
 import numpy as np
-import sys
 
-# Add project root to sys.path to allow imports from other modules
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-sys.path.insert(0, PROJECT_ROOT)
+from pysindy_config import (
+    configure_project_imports,
+    load_config_from_args,
+    make_parser,
+    output_path,
+    resolve_path,
+)
 
-from TransformLatent import FloatConverter
 
-def load_ae():
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
-    DEVICE = "cpu" # Using CPU for data preparation
-    ae = torch.jit.load(ENCODER_CHECKPOINT, map_location=DEVICE)
+def load_ae(config):
+    configure_project_imports(config)
+    encoder_checkpoint = resolve_path(config, ("models", "encoder_checkpoint"), required=True)
+    device = config["runtime"]["device"]
+    ae = torch.jit.load(encoder_checkpoint, map_location=device)
     ae.eval()
     return ae
 
-def prepare_encoded_enstrophy():
-    h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-    ae = load_ae()
+
+def prepare_encoded_enstrophy(config):
+    configure_project_imports(config)
+    from helpers.TransformLatent import FloatConverter
+
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
+    out_path = output_path(config, "encoded_grad")
+    ae = load_ae(config)
     converter = FloatConverter()
-    TRIPLET_IDX = 62
+    triplet_idx = config["runtime"]["triplet_idx"]
+    n_search = config["runtime"]["n_search"]
+    p_target = config["runtime"]["p_target"]
     
     with h5py.File(h5_path, 'r') as f:
         data = f['data']
-        n_search = 100000
-        p_target = 5.2
         
         params = data[:n_search, 0, 0, 51]
         mask = np.abs(params - p_target) < 0.01
@@ -59,7 +66,7 @@ def prepare_encoded_enstrophy():
                 decoded = ae.decode(latents_torch) # (26, 375)
                 # Reshape to (26, 125, 3) and extract 63rd triplet (TRIPLET_IDX=62)
                 v_full = decoded.reshape(26, 125, 3)
-                v_63 = v_full[:, TRIPLET_IDX, :].numpy()
+                v_63 = v_full[:, triplet_idx, :].numpy()
                 
                 # Denormalize
                 v_denorm = converter.unconvert(v_63)
@@ -80,8 +87,10 @@ def prepare_encoded_enstrophy():
         
         enstrophy = 0.5 * (wx**2 + wy**2 + wz**2)
         
-        np.savez("pySINDy/encoded_data_grad.npz", V=V_encoded, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
-        print("Saved pySINDy/encoded_data_grad.npz")
+        np.savez(out_path, V=V_encoded, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
+        print(f"Saved {out_path}")
 
 if __name__ == "__main__":
-    prepare_encoded_enstrophy()
+    parser = make_parser("Prepare encoded/decoded velocity gradients and enstrophy for SINDy.")
+    args = parser.parse_args()
+    prepare_encoded_enstrophy(load_config_from_args(args))

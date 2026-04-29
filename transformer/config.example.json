@@ -1,0 +1,52 @@
+{
+  "paths": {
+    "latent_input_root": "/path/to/Final_Cubed_OG_Data_wLatent",
+    "transformer_input_dir": "/path/to/transformer_input",
+    "training_h5": "/path/to/transformer_input/training_data.h5",
+    "validation_h5": "/path/to/transformer_input/validation_data.h5",
+    "evaluation_input_root": "/path/to/orig-data",
+    "evaluation_h5": "/path/to/transformer_evaluation/evaluation_data.h5",
+    "transformer_checkpoint": "./best_ordered_transformer_v1.pt",
+    "encoder_checkpoint": "./Model_GEN3_05_AttentionSE_absolute_best_scripted.pt",
+    "checkpoint_dir": "./checkpoints",
+    "evaluation_results_json": "./evaluation_results.json",
+    "pred_gt_pickle": "./evaluation_pred_gt.pkl",
+    "plots_dir": "./plots",
+    "corruption_csv": "./corruption_deterioration_metrics.csv",
+    "corruption_plot": "./corruption_deterioration_plot.png",
+    "training_process_viz": "./training_process_viz.png"
+  },
+  "data": {
+    "num_samples": 250000,
+    "test_num_samples": 1000,
+    "seed": 42,
+    "num_time": 80,
+    "workers": 8,
+    "evaluation_start_t": 100
+  },
+  "training": {
+    "batch_size": 32,
+    "learning_rate": 0.0001,
+    "epochs": 100,
+    "limit_samples": null,
+    "num_workers": 2,
+    "device": "auto",
+    "wandb_mode": "online"
+  },
+  "evaluation": {
+    "batch_size": 8,
+    "micro_batch_size": 4,
+    "limit_samples": null,
+    "num_workers": 2,
+    "device": "auto",
+    "enable_metrics": true,
+    "enable_staircase": false,
+    "enable_interleave": false
+  },
+  "corruption": {
+    "batch_size": 8,
+    "limit_samples": 100,
+    "levels": 101,
+    "device": "auto"
+  }
+}

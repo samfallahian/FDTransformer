@@ -3,6 +3,9 @@ import pysindy as ps
 import scipy.ndimage as ndimage
 from sklearn.metrics import mean_squared_error
 
+from pysindy_config import load_config_from_args, make_parser, output_path
+
+
 def test_smoothing(data_path, label):
     data = np.load(data_path)
     V = data['V'] # (nx, ny, nz, 3)
@@ -47,6 +50,12 @@ def test_smoothing(data_path, label):
     print(equation)
 
 if __name__ == "__main__":
-    test_smoothing("pySINDy/raw_data_grad.npz", "Raw")
-    test_smoothing("pySINDy/encoded_data_grad.npz", "Encoded")
-    test_smoothing("pySINDy/predicted_data_grad.npz", "Predicted")
+    parser = make_parser("Recover enstrophy after smoothing prepared velocity fields.", runtime=False)
+    parser.add_argument("--raw-input", help="Raw input NPZ. Defaults to outputs.raw_grad in the config.")
+    parser.add_argument("--encoded-input", help="Encoded input NPZ. Defaults to outputs.encoded_grad in the config.")
+    parser.add_argument("--predicted-input", help="Predicted input NPZ. Defaults to outputs.predicted_grad in the config.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    test_smoothing(args.raw_input or output_path(config, "raw_grad", create_parent=False), "Raw")
+    test_smoothing(args.encoded_input or output_path(config, "encoded_grad", create_parent=False), "Encoded")
+    test_smoothing(args.predicted_input or output_path(config, "predicted_grad", create_parent=False), "Predicted")

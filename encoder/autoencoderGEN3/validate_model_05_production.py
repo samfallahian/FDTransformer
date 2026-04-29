@@ -16,7 +16,7 @@ This script:
 
 Usage example:
 python -m encoder.autoencoderGEN3.validate_model_05_production \
-  --data_dir /Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent \
+  --data_dir Final_Cubed_OG_Data_wLatent \
   --n_files 10 \
   --seed 42
 
@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 # Resolve project root for imports
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,7 +39,11 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from encoder.autoencoderGEN3.models import get_model_by_index
-from TransformLatent import FloatConverter
+from helpers.TransformLatent import FloatConverter
+try:
+    from .config import add_config_argument, choose_path, config_get, load_config, optional_path
+except ImportError:
+    from config import add_config_argument, choose_path, config_get, load_config, optional_path
 
 # === Accelerator detection & colorful report (consistent with project style) ===
 CSI = "\033["
@@ -248,17 +252,34 @@ def save_summary_figure(summary_df: pd.DataFrame, out_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Validate Model GEN3 05 on random sample of files")
-    parser.add_argument('--data_dir', type=str, default=os.path.join(
-        '/Users', 'kkreth', 'PycharmProjects', 'data', 'Final_Cubed_OG_Data_wLatent'
-    ))
-    parser.add_argument('--n_files', type=int, default=100, help='Number of files to sample randomly')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for file sampling')
-    parser.add_argument('--model_path', type=str, default=os.path.join(
-        PROJECT_ROOT, 'encoder', 'autoencoderGEN3', 'saved_models_production',
-        'Model_GEN3_05_AttentionSE_absolute_best.pt'
-    ))
-    parser.add_argument('--summary_csv', type=str, default='validate_model_05_production_summary.csv')
+    add_config_argument(parser)
+    parser.add_argument('--data_dir', type=str, default=None)
+    parser.add_argument('--n_files', type=int, default=None, help='Number of files to sample randomly')
+    parser.add_argument('--seed', type=int, default=None, help='Random seed for file sampling')
+    parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--output_dir', type=str, default=None, help='Directory for validation CSV/PNG outputs')
+    parser.add_argument('--summary_csv', type=str, default=None, help='Path for per-file summary CSV')
+    parser.add_argument('--detailed_csv_dir', type=str, default=None, help='Directory for the first-file detailed CSV')
     args = parser.parse_args()
+
+    config = load_config(args.config)
+    args.data_dir = choose_path(args.data_dir, config, "data.validation_data_dir", os.path.join("data", "Final_Cubed_OG_Data_wLatent"))
+    args.model_path = choose_path(
+        args.model_path,
+        config,
+        "paths.production_model_path",
+        os.path.join(PROJECT_ROOT, "encoder", "autoencoderGEN3", "saved_models_production", "Model_GEN3_05_AttentionSE_absolute_best.pt"),
+    )
+    args.n_files = args.n_files if args.n_files is not None else int(config_get(config, "validation.n_files", 100))
+    args.seed = args.seed if args.seed is not None else int(config_get(config, "validation.seed", 42))
+    output_dir = choose_path(args.output_dir, config, "paths.results_dir", "Documentation")
+    os.makedirs(output_dir, exist_ok=True)
+    detailed_csv_dir = optional_path(args.detailed_csv_dir, base_dir=os.getcwd()) or output_dir
+    os.makedirs(detailed_csv_dir, exist_ok=True)
+    args.summary_csv = optional_path(args.summary_csv, base_dir=os.getcwd()) or os.path.join(
+        output_dir,
+        "validate_model_05_production_summary.csv",
+    )
 
     device = accelerator_report()
 
@@ -321,7 +342,7 @@ def main():
 
             # For the first file, save a detailed CSV
             if idx == 0:
-                out_csv = f"validation_detailed_{os.path.splitext(base)[0]}.csv"
+                out_csv = os.path.join(detailed_csv_dir, f"validation_detailed_{os.path.splitext(base)[0]}.csv")
                 print(rainbow(f"Saving detailed validation CSV for first file to {out_csv}"))
                 save_detailed_csv(df, decoded_np, velocity_cols, out_csv)
 

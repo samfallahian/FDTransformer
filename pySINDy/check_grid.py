@@ -1,22 +1,29 @@
 import h5py
 import numpy as np
 
-h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-with h5py.File(h5_path, 'r') as f:
-    # Let's find some samples with different Y, same Param, same X.
-    # We saw Sample 0: Param=5.2, Y=51, Z=-21
-    # Sample 4: Param=5.2, Y=19, Z=-9
-    # Let's see if we can find more for Param=5.2
-    data = f['data']
-    n = 10000
-    params = data[:n, 0, 0, 51]
-    idx_52 = np.where(np.abs(params - 5.2) < 0.01)[0]
-    print(f"Found {len(idx_52)} samples with Param 5.2 in first {n}")
-    
-    yz_52 = data[idx_52, 0, 0, 48:50]
-    unique_yz = np.unique(yz_52, axis=0)
-    print(f"Unique (Y, Z) for Param 5.2: {len(unique_yz)}")
-    
-    # Are Y, Z on a grid?
-    print(f"Sample unique Y: {np.unique(unique_yz[:, 0])}")
-    print(f"Sample unique Z: {np.unique(unique_yz[:, 1])}")
+from pysindy_config import load_config_from_args, make_parser, resolve_path
+
+
+def main():
+    parser = make_parser("Check Y/Z grid coverage for one Reynolds parameter.", runtime=False)
+    parser.add_argument("--n", type=int, default=10000, help="Number of samples to inspect.")
+    parser.add_argument("--p-val", type=float, default=5.2, help="Parameter/Reynolds value to filter.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
+
+    with h5py.File(h5_path, 'r') as f:
+        data = f['data']
+        params = data[:args.n, 0, 0, 51]
+        idx_param = np.where(np.abs(params - args.p_val) < 0.01)[0]
+        print(f"Found {len(idx_param)} samples with Param {args.p_val} in first {args.n}")
+
+        yz_param = data[idx_param, 0, 0, 48:50]
+        unique_yz = np.unique(yz_param, axis=0)
+        print(f"Unique (Y, Z) for Param {args.p_val}: {len(unique_yz)}")
+        print(f"Sample unique Y: {np.unique(unique_yz[:, 0])}")
+        print(f"Sample unique Z: {np.unique(unique_yz[:, 1])}")
+
+
+if __name__ == "__main__":
+    main()

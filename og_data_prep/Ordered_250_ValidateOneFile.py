@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import torch
 import time
+import argparse
 
 # Add the root directory to the path for import resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +14,7 @@ if project_root not in sys.path:
 
 # Import the model from GEN3
 from encoder.autoencoderGEN3.models import get_model_by_index
+from pipeline_config import add_config_argument, resolve_path
 
 # === Accelerator detection & colorful report ===
 CSI = "\033["
@@ -30,19 +32,34 @@ def rainbow(msg: str) -> str:
             out.append(ch)
     return ''.join(out)
 
-def accelerator_report():
-    """Detect CUDA/MPS/CPU and print a colorful diagnostic. Returns device."""
+def resolve_device(device_name: str = "auto") -> torch.device:
+    """Resolve the requested compute device."""
     has_cuda = torch.cuda.is_available()
     mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
 
-    if has_cuda:
-        device = torch.device('cuda')
-    elif mps_avail:
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
+    if device_name == "auto":
+        if has_cuda:
+            return torch.device('cuda')
+        if mps_avail:
+            return torch.device('mps')
+        return torch.device('cpu')
+
+    if device_name == "cuda" and not has_cuda:
+        raise RuntimeError("CUDA was requested with --device cuda, but torch.cuda.is_available() is False.")
+    if device_name == "mps" and not mps_avail:
+        raise RuntimeError("MPS was requested with --device mps, but it is not available.")
+
+    return torch.device(device_name)
+
+
+def accelerator_report(device_name: str = "auto"):
+    """Detect CUDA/MPS/CPU and print a colorful diagnostic. Returns device."""
+    has_cuda = torch.cuda.is_available()
+    mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
+    device = resolve_device(device_name)
 
     lines = [
+        f"Requested device: {device_name}",
         f"Selected device: {device}",
         f"CUDA available: {has_cuda}",
         f"MPS available: {mps_avail}",
@@ -56,12 +73,25 @@ def accelerator_report():
     return device
 
 def main():
-    device = accelerator_report()
+    parser = argparse.ArgumentParser(description="Validate one latent-enriched file by decoding latent vectors.")
+    add_config_argument(parser)
+    parser.add_argument("--input_file", help="Latent-enriched .pkl.gz file to validate.")
+    parser.add_argument("--model_path", help="Autoencoder checkpoint path.")
+    parser.add_argument("--output_csv", help="CSV path for validation results.")
+    parser.add_argument("--model_index", type=int, default=4, help="Model architecture index.")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto",
+                        help="Compute device for model inference. Defaults to auto.")
+    args = parser.parse_args()
 
-    # Paths
-    input_file = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent/8p4/0160.pkl.gz"
-    model_path = os.path.join(project_root, "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt")
-    output_csv = "validation_results_0160.csv"
+    try:
+        device = accelerator_report(args.device)
+    except RuntimeError as exc:
+        print(f"Device error: {exc}")
+        return
+
+    input_file = resolve_path(args.config, "validation_input_file", args.input_file)
+    model_path = resolve_path(args.config, "autoencoder_model_path", args.model_path)
+    output_csv = resolve_path(args.config, "validation_results_csv", args.output_csv)
 
     if not os.path.exists(input_file):
         print(f"Input file not found: {input_file}")
@@ -72,8 +102,8 @@ def main():
         return
 
     # 1. Load the model (Model GEN3 05 AttentionSE)
-    print(f"Loading model architecture (Model GEN3 05)...")
-    model = get_model_by_index(4) # 4 is Model_GEN3_05_AttentionSE
+    print(f"Loading model architecture (index {args.model_index})...")
+    model = get_model_by_index(args.model_index)
     
     print(f"Loading weights from {model_path}...")
     try:

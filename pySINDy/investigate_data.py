@@ -3,6 +3,9 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+from pysindy_config import load_config_from_args, make_parser, resolve_path
+
+
 def investigate_one_experiment(param_val, h5_path):
     with h5py.File(h5_path, 'r') as f:
         data = f['data']
@@ -26,5 +29,9 @@ def investigate_one_experiment(param_val, h5_path):
             print(f"Sample {i}: Param={data[i,0,0,51]:.1f}, Y={data[i,0,0,48]}, Z={data[i,0,0,49]}")
 
 if __name__ == "__main__":
-    h5_path = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-    investigate_one_experiment(5.2, h5_path)
+    parser = make_parser("Inspect one evaluation experiment in the HDF5 data.", runtime=False)
+    parser.add_argument("--param-val", type=float, default=5.2, help="Parameter/Reynolds value to inspect.")
+    args = parser.parse_args()
+    config = load_config_from_args(args)
+    h5_path = resolve_path(config, ("data", "evaluation_h5"), required=True)
+    investigate_one_experiment(args.param_val, h5_path)

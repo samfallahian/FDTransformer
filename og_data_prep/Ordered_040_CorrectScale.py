@@ -4,18 +4,15 @@ import pandas as pd
 import numpy as np
 import logging
 from concurrent.futures import ProcessPoolExecutor
-from typing import Dict, List, Any
+from typing import Dict, Any
 
-# Add project root to sys.path to import TransformLatent and HostPreferences
+# Add project root to sys.path to import TransformLatent
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from TransformLatent import FloatConverter
-try:
-    from Ordered_001_Initialize import HostPreferences
-except ImportError:
-    HostPreferences = None
+from helpers.TransformLatent import FloatConverter
+from pipeline_config import add_config_argument, resolve_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -73,41 +70,16 @@ def process_single_file(file_info: Dict[str, Any]):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Scale velocity columns between 0 and 1.")
+    add_config_argument(parser)
     parser.add_argument("--dir", help="Directory to search for .pkl.gz files (e.g. Corrected_OG_Data)")
     parser.add_argument("--output_dir", help="Directory to save scaled files")
     args = parser.parse_args()
 
-    # Determine input directory
-    search_dir = args.dir
-    if not search_dir and HostPreferences:
-        try:
-            prefs = HostPreferences()
-            # Try to find Corrected_OG_Data relative to root_path or raw_input
-            possible_dirs = [
-                os.path.join(prefs.root_path, "Corrected_OG_Data"),
-                os.path.join(os.path.dirname(prefs.raw_input.rstrip('/')), "Corrected_OG_Data"),
-                "/Users/kkreth/PycharmProjects/data/Corrected_OG_Data"
-            ]
-            for d in possible_dirs:
-                if d and os.path.exists(d):
-                    search_dir = d
-                    break
-        except Exception as e:
-            logger.warning(f"Could not load preferences: {e}")
-
-    if not search_dir or not os.path.exists(search_dir):
-        # Last resort fallback
-        search_dir = "/Users/kkreth/PycharmProjects/data/Corrected_OG_Data"
-        if not os.path.exists(search_dir):
-            print(f"Error: Input directory {search_dir} not found.")
-            return
-
-    # Determine output directory
-    output_dir = args.output_dir
-    if not output_dir:
-        # Default to a "Scaled_OG_Data" next to the input
-        parent = os.path.dirname(search_dir.rstrip('/'))
-        output_dir = os.path.join(parent, "Scaled_OG_Data")
+    search_dir = resolve_path(args.config, "corrected_data_dir", args.dir)
+    output_dir = resolve_path(args.config, "scaled_data_dir", args.output_dir)
+    if not os.path.exists(search_dir):
+        print(f"Error: Input directory {search_dir} not found.")
+        return
 
     print(f"Input directory: {search_dir}")
     print(f"Output directory: {output_dir}")

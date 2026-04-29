@@ -6,14 +6,25 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import argparse
 
-# Add project root to sys.path to allow imports from other modules
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-sys.path.insert(0, PROJECT_ROOT)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Import model definitions
-from transformer.transformer_model_v1 import OrderedTransformerV1
-from TransformLatent import FloatConverter
+try:
+    from transformer_model_v1 import OrderedTransformerV1
+except ImportError:
+    from transformer.transformer_model_v1 import OrderedTransformerV1
+
+try:
+    from helpers.TransformLatent import FloatConverter
+except ImportError:
+    from helpers.TransformLatent import FloatConverter
+
+from transformer_config import add_config_arg, load_config, optional_int, resolve_path
 
 # ANSI Colors for Rainbow effect and highlighting
 class Colors:
@@ -44,12 +55,12 @@ class Colors:
 # --- Configuration ---
 class Config:
     # Model checkpoints
-    TRANSFORMER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/transformer/best_ordered_transformer_v1.pt"
-    ENCODER_CHECKPOINT = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
+    TRANSFORMER_CHECKPOINT = "best_ordered_transformer_v1.pt"
+    ENCODER_CHECKPOINT = "Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
     
     # Data path
-    EVAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_evaluation/evaluation_data.h5"
-    VAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5"
+    EVAL_H5 = None
+    VAL_H5 = None
     
     @staticmethod
     def get_data_path():
@@ -58,13 +69,13 @@ class Config:
         return Config.VAL_H5
     
     # Device
-    DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+    DEVICE = "auto"
     
     # Dimensions
     LATENT_DIM = 47
     NUM_X = 26
-    NUM_TIME = 8
-    SEQ_LEN = NUM_X * NUM_TIME # 208
+    NUM_TIME = 80
+    SEQ_LEN = NUM_X * NUM_TIME # 2080
     INPUT_DIM = 52
     
     # For reporting
@@ -72,6 +83,54 @@ class Config:
     
     # Fast evaluation for corruption test
     LIMIT_SAMPLES = 100 # Test at least 100 files to get good metrics
+    BATCH_SIZE = 8
+    CORRUPTION_LEVELS = 101
+    CSV_PATH = "corruption_deterioration_metrics.csv"
+    PLOT_PATH = "corruption_deterioration_plot.png"
+
+def select_device(requested="auto"):
+    requested = (requested or "auto").lower()
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if mps_available:
+            return "mps"
+        return "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        print(f"{Colors.YELLOW}CUDA was requested but is not available. Falling back to MPS/CPU.{Colors.RESET}")
+        return "mps" if mps_available else "cpu"
+    if requested == "mps" and not mps_available:
+        print(f"{Colors.YELLOW}MPS was requested but is not available. Falling back to CPU.{Colors.RESET}")
+        return "cpu"
+    return requested
+
+def refresh_derived_config():
+    Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
+
+def configure(args):
+    cfg = load_config(args.config)
+    paths = cfg["paths"]
+    data = cfg["data"]
+    corruption = cfg["corruption"]
+
+    Config.TRANSFORMER_CHECKPOINT = resolve_path(args.transformer_checkpoint or paths["transformer_checkpoint"])
+    Config.ENCODER_CHECKPOINT = resolve_path(args.encoder_checkpoint or paths["encoder_checkpoint"])
+    Config.EVAL_H5 = resolve_path(args.eval_h5 or paths["evaluation_h5"])
+    Config.VAL_H5 = resolve_path(args.val_h5 or paths["validation_h5"])
+    Config.CSV_PATH = resolve_path(args.csv_path or paths["corruption_csv"])
+    Config.PLOT_PATH = resolve_path(args.plot_path or paths["corruption_plot"])
+
+    Config.LATENT_DIM = data.get("latent_dim", Config.LATENT_DIM)
+    Config.NUM_X = data.get("num_x", Config.NUM_X)
+    Config.NUM_TIME = args.num_time if args.num_time is not None else data.get("num_time", Config.NUM_TIME)
+    Config.INPUT_DIM = data.get("input_dim", Config.INPUT_DIM)
+    Config.TRIPLET_IDX = args.triplet_idx if args.triplet_idx is not None else corruption["triplet_idx"]
+    Config.LIMIT_SAMPLES = optional_int(args.limit_samples) if args.limit_samples is not None else optional_int(corruption.get("limit_samples"))
+    Config.BATCH_SIZE = args.batch_size if args.batch_size is not None else corruption["batch_size"]
+    Config.CORRUPTION_LEVELS = args.levels if args.levels is not None else corruption["levels"]
+    Config.DEVICE = select_device(args.device or corruption.get("device", "auto"))
+    refresh_derived_config()
 
 # --- Dataset ---
 class EvalDataset(torch.utils.data.Dataset):
@@ -81,8 +140,16 @@ class EvalDataset(torch.utils.data.Dataset):
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
         with h5py.File(self.h5_path, 'r') as f:
-            total_available = f['data'].shape[0]
+            data_ds = f['data']
+            total_available = data_ds.shape[0]
             self.has_originals = 'originals' in f
+            sample_shape = data_ds.shape[1:]
+            if len(sample_shape) == 3:
+                self.seq_len = sample_shape[0] * sample_shape[1]
+            elif len(sample_shape) == 2:
+                self.seq_len = sample_shape[0]
+            else:
+                raise ValueError(f"Unsupported sample layout: {sample_shape}")
             
             if max_samples is not None:
                 self.length = min(max_samples, total_available)
@@ -104,9 +171,8 @@ class EvalDataset(torch.utils.data.Dataset):
         # Map the requested idx to our sampled indices
         real_idx = self.indices[idx]
         
-        data = self._file['data'][real_idx] # (8, 26, 52)
-        # Flatten time and space: (208, 52)
-        data = data.reshape(Config.SEQ_LEN, Config.INPUT_DIM)
+        data = self._file['data'][real_idx]
+        data = data.reshape(self.seq_len, Config.INPUT_DIM)
         
         if self.has_originals:
             orig = self._file['originals'][real_idx] # (26, 3)
@@ -195,7 +261,7 @@ def corrupt_data(data, corruption_fraction):
     if num_elements_to_corrupt > 0:
         # Generate random indices for corruption within the latent space
         # We'll flatten the B, T, LATENT_DIM indices
-        flat_indices = torch.randperm(B * T * Config.LATENT_DIM)[:num_elements_to_corrupt]
+        flat_indices = torch.randperm(B * T * Config.LATENT_DIM, device=data.device)[:num_elements_to_corrupt]
         
         # Random values between -1 and 1
         # torch.rand gives [0, 1), so 2*torch.rand-1 gives [-1, 1)
@@ -230,9 +296,10 @@ def evaluate_at_corruption(transformer, ae, converter, loader, corruption_level)
             inputs = corrupted_batch[:, :-1, :]
             outputs = transformer(inputs) # (B, 207, Config.LATENT_DIM)
             
-            # 2. Extract 8th time step predictions (positions 182-207)
+            # 2. Extract final time-step predictions.
             # The prediction for index i is at output index i-1
-            t8_target_indices = range(182, 208)
+            seq_len = batch.shape[1]
+            t8_target_indices = range(seq_len - Config.NUM_X, seq_len)
             t8_output_indices = [i-1 for i in t8_target_indices]
             
             pred_latents_t8 = outputs[:, t8_output_indices, :] # (B, 26, 47)
@@ -265,6 +332,13 @@ def main():
     print("\n" + "="*80)
     print(Colors.rainbow(f"  {msg}  "))
     print("="*80 + "\n")
+
+    if Config.DEVICE == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        print(f"{Colors.GREEN}CUDA detected and enabled for corruption evaluation.{Colors.RESET}")
     
     # Load models
     try:
@@ -285,14 +359,19 @@ def main():
         # or a fixed number for reproducibility.
         dataset = EvalDataset(data_path, max_samples=Config.LIMIT_SAMPLES, random_seed=None)
         
-        loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+        loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=True,
+            pin_memory=Config.DEVICE == "cuda",
+        )
     except Exception as e:
         print(f"{Colors.RED}Error loading dataset: {e}{Colors.RESET}")
         return
 
     print(f"Number of files (samples) being tested: {len(dataset)}")
     
-    corruption_levels = np.linspace(0, 1.0, 101) # 0% to 100% in 1% increments
+    corruption_levels = np.linspace(0, 1.0, Config.CORRUPTION_LEVELS) # 0% to 100%
     results = []
 
     print(f"\nStarting evaluation across {len(corruption_levels)} corruption levels...")
@@ -306,7 +385,8 @@ def main():
     df_results = pd.DataFrame(results)
     
     # Save results to CSV
-    csv_path = "/Users/kkreth/PycharmProjects/cgan/transformer/corruption_deterioration_metrics.csv"
+    csv_path = Config.CSV_PATH
+    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
     df_results.to_csv(csv_path, index=False)
     print(f"\nResults saved to: {Colors.CYAN}{csv_path}{Colors.RESET}")
 
@@ -325,7 +405,8 @@ def main():
                  xytext=(10, baseline_rmse + (df_results['rmse'].max() - baseline_rmse)*0.1),
                  arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=5))
 
-    plot_path = "/Users/kkreth/PycharmProjects/cgan/transformer/corruption_deterioration_plot.png"
+    plot_path = Config.PLOT_PATH
+    os.makedirs(os.path.dirname(plot_path) or ".", exist_ok=True)
     plt.savefig(plot_path)
     print(f"Plot saved to: {Colors.CYAN}{plot_path}{Colors.RESET}")
     
@@ -333,10 +414,29 @@ def main():
     print(f"\n{Colors.BOLD}DETERIORATION SUMMARY{Colors.RESET}")
     print("-" * 40)
     print(f"0% Corruption (Baseline) RMSE: {Colors.GREEN}{baseline_rmse:.6f}{Colors.RESET}")
-    print(f"50% Corruption RMSE:          {Colors.YELLOW}{df_results.iloc[50]['rmse']:.6f}{Colors.RESET}")
-    print(f"100% Corruption RMSE:         {Colors.RED}{df_results.iloc[100]['rmse']:.6f}{Colors.RESET}")
+    mid_idx = len(df_results) // 2
+    print(f"50% Corruption RMSE:          {Colors.YELLOW}{df_results.iloc[mid_idx]['rmse']:.6f}{Colors.RESET}")
+    print(f"100% Corruption RMSE:         {Colors.RED}{df_results.iloc[-1]['rmse']:.6f}{Colors.RESET}")
     print("-" * 40)
     print(f"{Colors.GREEN}Evaluation complete!{Colors.RESET}")
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate transformer robustness under latent input corruption.")
+    add_config_arg(parser)
+    parser.add_argument("--transformer_checkpoint", "--transformer-checkpoint", dest="transformer_checkpoint", default=None)
+    parser.add_argument("--encoder_checkpoint", "--encoder-checkpoint", dest="encoder_checkpoint", default=None)
+    parser.add_argument("--eval_h5", "--eval-h5", dest="eval_h5", default=None)
+    parser.add_argument("--val_h5", "--val-h5", dest="val_h5", default=None)
+    parser.add_argument("--csv_path", "--csv-path", dest="csv_path", default=None)
+    parser.add_argument("--plot_path", "--plot-path", dest="plot_path", default=None)
+    parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=None)
+    parser.add_argument("--limit_samples", "--limit-samples", dest="limit_samples", default=None, help="Limit samples. Use none/all/0 for full dataset.")
+    parser.add_argument("--levels", type=int, default=None, help="Number of corruption levels between 0 and 1 inclusive.")
+    parser.add_argument("--triplet_idx", "--triplet-idx", dest="triplet_idx", type=int, default=None)
+    parser.add_argument("--num_time", "--num-time", dest="num_time", type=int, default=None)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    configure(parse_args())
     main()

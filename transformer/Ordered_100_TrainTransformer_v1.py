@@ -10,10 +10,12 @@ import sys
 import wandb
 import shutil
 import glob
+import argparse
 
 # Add current directory to path to import the model
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from transformer_model_v1 import OrderedTransformerV1
+from transformer_config import add_config_arg, load_config, optional_int, resolve_path
 
 # --- Configuration ---
 def print_rainbow(text):
@@ -30,18 +32,35 @@ def print_rainbow(text):
     colored_text = "".join(colors[i % len(colors)] + char for i, char in enumerate(text))
     print(colored_text + reset)
 
+def select_device(requested="auto"):
+    requested = (requested or "auto").lower()
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if mps_available:
+            return "mps"
+        return "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        print("CUDA was requested but is not available. Falling back to MPS/CPU.")
+        return "mps" if mps_available else "cpu"
+    if requested == "mps" and not mps_available:
+        print("MPS was requested but is not available. Falling back to CPU.")
+        return "cpu"
+    return requested
+
 class Config:
     # Data paths
-    TRAIN_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/training_data.h5"
-    VAL_H5 = "/Users/kkreth/PycharmProjects/data/transformer_input/validation_data.h5"
+    TRAIN_H5 = None
+    VAL_H5 = None
     CHECKPOINT_DIR = os.path.dirname(os.path.abspath(__file__))
     CHECKPOINT_BASE_NAME = "best_ordered_transformer_v1"
     
     # Model architecture
     LATENT_DIM = 47
     NUM_X = 26
-    NUM_TIME = 8
-    SEQ_LEN = NUM_X * NUM_TIME # 208
+    NUM_TIME = 80
+    SEQ_LEN = NUM_X * NUM_TIME # 2080
     
     INPUT_DIM = 52 # 47 latents + 3 xyz + 1 rel_time + 1 param
     EMBED_SIZE = 256
@@ -51,20 +70,68 @@ class Config:
     BIAS = True
     
     # Training
-    BATCH_SIZE = 512
+    BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
     EPOCHS = 100
     MAX_CHECKPOINTS = 5
-    STAIRCASE_EVAL_FREQ = 10 # How often to run staircase eval (0 to disable) - This is a VERY expensive computation.
-    DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    STAIRCASE_EVAL_FREQ = 0 # How often to run staircase eval (0 to disable) - This is a VERY expensive computation.
+    DEVICE = select_device("auto")
+    NUM_WORKERS = 2
+    WANDB_PROJECT = "transformer_OG_prepared_cubes"
+    WANDB_MODE = "online"
     
     # Fast experimentation
-    LIMIT_SAMPLES = 2000 # Set to an integer (e.g. 10000) to shrink the dataset Current OG dataset (Feb 20 or after) has 2MM rows!
+    LIMIT_SAMPLES = None # Set to an integer to shrink the dataset for experiments.
     
     # Target positions for focused evaluation (Last 4, 8, 16 positions in the last time period)
     TARGET_POSITIONS = list(range(SEQ_LEN - 4, SEQ_LEN)) 
     TARGET_POSITIONS_2 = list(range(SEQ_LEN - 8, SEQ_LEN))
     TARGET_POSITIONS_3 = list(range(SEQ_LEN - 16, SEQ_LEN))
+
+def refresh_derived_config():
+    Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
+    Config.TARGET_POSITIONS = list(range(Config.SEQ_LEN - 4, Config.SEQ_LEN))
+    Config.TARGET_POSITIONS_2 = list(range(Config.SEQ_LEN - 8, Config.SEQ_LEN))
+    Config.TARGET_POSITIONS_3 = list(range(Config.SEQ_LEN - 16, Config.SEQ_LEN))
+
+def configure(args):
+    cfg = load_config(args.config)
+    paths = cfg["paths"]
+    data = cfg["data"]
+    model_cfg = cfg["model"]
+    training = cfg["training"]
+
+    Config.TRAIN_H5 = resolve_path(args.train_h5 or paths["training_h5"])
+    Config.VAL_H5 = resolve_path(args.val_h5 or paths["validation_h5"])
+    Config.CHECKPOINT_DIR = resolve_path(args.checkpoint_dir or paths["checkpoint_dir"])
+    Config.CHECKPOINT_BASE_NAME = args.checkpoint_base_name or training["checkpoint_base_name"]
+
+    Config.LATENT_DIM = data.get("latent_dim", Config.LATENT_DIM)
+    Config.NUM_X = data.get("num_x", Config.NUM_X)
+    Config.NUM_TIME = args.num_time if args.num_time is not None else data.get("num_time", Config.NUM_TIME)
+    Config.INPUT_DIM = data.get("input_dim", Config.INPUT_DIM)
+
+    Config.EMBED_SIZE = model_cfg.get("embed_size", Config.EMBED_SIZE)
+    Config.N_HEADS = model_cfg.get("n_heads", Config.N_HEADS)
+    Config.N_LAYERS = model_cfg.get("n_layers", Config.N_LAYERS)
+    Config.DROPOUT = model_cfg.get("dropout", Config.DROPOUT)
+    Config.BIAS = model_cfg.get("bias", Config.BIAS)
+
+    Config.BATCH_SIZE = args.batch_size if args.batch_size is not None else training["batch_size"]
+    Config.LEARNING_RATE = args.learning_rate if args.learning_rate is not None else training["learning_rate"]
+    Config.EPOCHS = args.epochs if args.epochs is not None else training["epochs"]
+    Config.MAX_CHECKPOINTS = args.max_checkpoints if args.max_checkpoints is not None else training["max_checkpoints"]
+    Config.STAIRCASE_EVAL_FREQ = (
+        args.staircase_eval_freq
+        if args.staircase_eval_freq is not None
+        else training["staircase_eval_freq"]
+    )
+    Config.NUM_WORKERS = args.num_workers if args.num_workers is not None else training["num_workers"]
+    Config.LIMIT_SAMPLES = optional_int(args.limit_samples) if args.limit_samples is not None else optional_int(training.get("limit_samples"))
+    Config.DEVICE = select_device(args.device or training.get("device", "auto"))
+    Config.WANDB_PROJECT = args.wandb_project or training["wandb_project"]
+    Config.WANDB_MODE = args.wandb_mode or training.get("wandb_mode", "online")
+    refresh_derived_config()
 
 # --- Dataset ---
 class TransformerDataset(Dataset):
@@ -74,7 +141,20 @@ class TransformerDataset(Dataset):
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
         with h5py.File(self.h5_path, 'r') as f:
-            total_available = f['data'].shape[0]
+            data_shape = f['data'].shape
+            total_available = data_shape[0]
+            sample_shape = data_shape[1:]
+            if len(sample_shape) == 3:
+                seq_len = sample_shape[0] * sample_shape[1]
+            elif len(sample_shape) == 2:
+                seq_len = sample_shape[0]
+            else:
+                raise ValueError(f"Unsupported sample layout {sample_shape}.")
+            if seq_len != Config.SEQ_LEN:
+                raise ValueError(
+                    f"HDF5 sequence length is {seq_len}, but config expects {Config.SEQ_LEN}. "
+                    f"Set --num-time {seq_len // Config.NUM_X} or update data.num_time in the config."
+                )
             if max_samples is not None:
                 self.length = min(max_samples, total_available)
                 # Randomly pick indices from the available data if we are limiting samples
@@ -97,8 +177,8 @@ class TransformerDataset(Dataset):
         
         # If we have a subset of random indices, pick the actual index from that list
         fetch_idx = self.indices[idx] if self.indices is not None else idx
-        data = self._file['data'][fetch_idx] # (8, 26, 52)
-        # Flatten time and space: (208, 52)
+        data = self._file['data'][fetch_idx] # (NUM_TIME, NUM_X, INPUT_DIM)
+        # Flatten time and space: (Config.SEQ_LEN, 52)
         data = data.reshape(Config.SEQ_LEN, Config.INPUT_DIM)
         return torch.from_numpy(data).float()
 
@@ -109,7 +189,7 @@ def train():
     
     LOSS EXPLANATION:
     The "latent loss" (MSE) measures the model's ability to predict the next 47 latent features 
-    in the sequence. Because we have flattened the 8x26 grid into a 208-token sequence,
+    in the sequence. Because we have flattened the configured time-by-space grid into one sequence,
     the model is effectively learning to:
     1. Predict the next spatial point within the same time step.
     2. Predict the first spatial point of the next time step (when at the end of a time row).
@@ -121,7 +201,8 @@ def train():
     """
     # Initialize wandb
     wandb.init(
-        project="transformer_OG_prepared_cubes",
+        project=Config.WANDB_PROJECT,
+        mode=Config.WANDB_MODE,
         config={
             "learning_rate": Config.LEARNING_RATE,
             "epochs": Config.EPOCHS,
@@ -144,19 +225,33 @@ def train():
             wandb.config.update({"model_definition_code": f.read()})
     
     print(f"Using device: {Config.DEVICE}")
+    if Config.DEVICE == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        print("CUDA detected and enabled for training.")
     print(f"Loading training data from: {Config.TRAIN_H5}")
     print(f"Loading validation data from: {Config.VAL_H5}")
     
     # Datasets and Loaders
     try:
         train_dataset = TransformerDataset(Config.TRAIN_H5, max_samples=Config.LIMIT_SAMPLES)
-        val_dataset = TransformerDataset(Config.VAL_H5, max_samples=Config.LIMIT_SAMPLES // 10 if Config.LIMIT_SAMPLES else None)
+        val_limit = max(1, Config.LIMIT_SAMPLES // 10) if Config.LIMIT_SAMPLES else None
+        val_dataset = TransformerDataset(Config.VAL_H5, max_samples=val_limit)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
     
-    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=0)
+    loader_kwargs = {
+        "batch_size": Config.BATCH_SIZE,
+        "num_workers": Config.NUM_WORKERS,
+        "pin_memory": Config.DEVICE == "cuda",
+    }
+    if Config.NUM_WORKERS > 0:
+        loader_kwargs["persistent_workers"] = True
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
     
     model = OrderedTransformerV1(Config).to(Config.DEVICE)
     
@@ -311,8 +406,8 @@ def train():
         target_pos2_loss = 0
         target_pos3_loss = 0
         
-        # Track loss per time step (1 to 8)
-        # Note: predicting time t requires information from at least the start of time t or end of t-1
+        # Track loss per time step.
+        # Note: predicting time t requires information from at least the start of time t or end of t-1.
         time_step_losses = np.zeros(Config.NUM_TIME)
         
         # Track autoregressive losses for the 8th time step starting from different context lengths
@@ -357,7 +452,7 @@ def train():
                 # Eval per time step
                 # Each time step has NUM_X (26) positions.
                 # output[i] predicts target[i+1].
-                # Time step t (0-7) corresponds to positions [t*26, (t+1)*26)
+                # Time step t corresponds to positions [t*NUM_X, (t+1)*NUM_X)
                 for t in range(Config.NUM_TIME):
                     t_start = t * Config.NUM_X
                     t_end = (t + 1) * Config.NUM_X
@@ -403,8 +498,10 @@ def train():
             "target_pos3_loss": avg_target3_loss,
             # Scenario 1: Even steps (2, 4, 6, 8)
             "val_loss_even_steps": np.mean(avg_time_step_losses[1::2]),
-            # Scenario 2: 8th step only
-            "val_loss_8th_step": avg_time_step_losses[7]
+            # Scenario 2: final step only
+            "val_loss_last_step": avg_time_step_losses[-1],
+            # Legacy metric name kept for older dashboards.
+            "val_loss_8th_step": avg_time_step_losses[min(7, Config.NUM_TIME - 1)]
         }
         if do_staircase:
             for k, loss_val in avg_ar_losses.items():
@@ -419,7 +516,7 @@ def train():
         print(f"  Target Losses -> Last4: {get_colored_str(avg_target_loss, prev_target_loss)}, "
               f"Last8: {get_colored_str(avg_target2_loss, prev_target2_loss)}, "
               f"Last16: {get_colored_str(avg_target3_loss, prev_target3_loss)}")
-        print(f"  Queries -> Even Steps (2,4,6,8): {log_dict['val_loss_even_steps']:.4e}, 8th Step: {log_dict['val_loss_8th_step']:.4e}")
+        print(f"  Queries -> Even Steps: {log_dict['val_loss_even_steps']:.4e}, Last Step: {log_dict['val_loss_last_step']:.4e}")
         
         # --- Creative Autoregressive Results Display ---
         if do_staircase:
@@ -502,5 +599,26 @@ def train():
 
     wandb.finish()
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train the ordered transformer.")
+    add_config_arg(parser)
+    parser.add_argument("--train_h5", "--train-h5", dest="train_h5", default=None, help="Training HDF5 path.")
+    parser.add_argument("--val_h5", "--val-h5", dest="val_h5", default=None, help="Validation HDF5 path.")
+    parser.add_argument("--checkpoint_dir", "--checkpoint-dir", dest="checkpoint_dir", default=None, help="Directory for checkpoints.")
+    parser.add_argument("--checkpoint_base_name", "--checkpoint-base-name", dest="checkpoint_base_name", default=None, help="Checkpoint filename stem.")
+    parser.add_argument("--batch_size", "--batch-size", dest="batch_size", type=int, default=None)
+    parser.add_argument("--learning_rate", "--learning-rate", dest="learning_rate", type=float, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--max_checkpoints", "--max-checkpoints", dest="max_checkpoints", type=int, default=None)
+    parser.add_argument("--staircase_eval_freq", "--staircase-eval-freq", dest="staircase_eval_freq", type=int, default=None)
+    parser.add_argument("--limit_samples", "--limit-samples", dest="limit_samples", default=None, help="Limit samples for quick runs. Use none/all/0 for full dataset.")
+    parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=None)
+    parser.add_argument("--num_time", "--num-time", dest="num_time", type=int, default=None, help="Number of time steps per sample.")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
+    parser.add_argument("--wandb_project", "--wandb-project", dest="wandb_project", default=None)
+    parser.add_argument("--wandb_mode", "--wandb-mode", dest="wandb_mode", default=None, help="wandb mode, e.g. online, offline, disabled.")
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    configure(parse_args())
     train()

@@ -36,6 +36,7 @@ import argparse
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
+from pipeline_config import add_config_argument, resolve_path
 
 # Add the root directory to the path for import resolution
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,19 +63,34 @@ def rainbow(msg: str) -> str:
             out.append(ch)
     return ''.join(out)
 
-def accelerator_report():
-    """Detect CUDA/MPS/CPU and print a colorful diagnostic. Returns device."""
+def resolve_device(device_name: str = "auto") -> torch.device:
+    """Resolve the requested compute device."""
     has_cuda = torch.cuda.is_available()
     mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
 
-    if has_cuda:
-        device = torch.device('cuda')
-    elif mps_avail:
-        device = torch.device('mps')
-    else:
-        device = torch.device('cpu')
+    if device_name == "auto":
+        if has_cuda:
+            return torch.device('cuda')
+        if mps_avail:
+            return torch.device('mps')
+        return torch.device('cpu')
+
+    if device_name == "cuda" and not has_cuda:
+        raise RuntimeError("CUDA was requested with --device cuda, but torch.cuda.is_available() is False.")
+    if device_name == "mps" and not mps_avail:
+        raise RuntimeError("MPS was requested with --device mps, but it is not available.")
+
+    return torch.device(device_name)
+
+
+def accelerator_report(device_name: str = "auto"):
+    """Detect CUDA/MPS/CPU and print a colorful diagnostic. Returns device."""
+    has_cuda = torch.cuda.is_available()
+    mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
+    device = resolve_device(device_name)
 
     lines = [
+        f"Requested device: {device_name}",
         f"Selected device: {device}",
         f"CUDA available: {has_cuda}",
         f"MPS available: {mps_avail}",
@@ -91,20 +107,10 @@ def accelerator_report():
 _worker_model = None
 _worker_device = None
 
-def worker_init(model_index, model_path):
+def worker_init(model_index, model_path, device_name):
     """Initialize the model in the worker process once."""
     global _worker_model, _worker_device
-    
-    # Detect device
-    has_cuda = torch.cuda.is_available()
-    mps_avail = hasattr(torch.backends, 'mps') and torch.backends.mps.is_built() and torch.backends.mps.is_available()
-
-    if has_cuda:
-        _worker_device = torch.device('cuda')
-    elif mps_avail:
-        _worker_device = torch.device('mps')
-    else:
-        _worker_device = torch.device('cpu')
+    _worker_device = resolve_device(device_name)
 
     # Load the Model GEN3 05 (AttentionSE)
     _worker_model = get_model_by_index(model_index)
@@ -199,29 +205,40 @@ def process_file(input_path, output_path, batch_size=4096):
 
 def main():
     parser = argparse.ArgumentParser(description="Precompute latent space for cubed OG data.")
+    add_config_argument(parser)
+    parser.add_argument("--input_root", type=str, help="Directory containing final cubed data.")
+    parser.add_argument("--output_root", type=str, help="Directory to write latent-enriched data.")
+    parser.add_argument("--model_path", type=str, help="Autoencoder checkpoint path.")
+    parser.add_argument("--model_index", type=int, default=4, help="Model architecture index.")
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto",
+                        help="Compute device for model inference. Defaults to auto.")
     parser.add_argument("--first_only", action="store_true", help="Only process the first file and exit.")
     parser.add_argument("--batch_size", type=int, default=40000, help="Number of rows to process at once in the model.")
     parser.add_argument("--input_file", type=str, help="Process a specific input file.")
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers.")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of parallel workers. Defaults to 1 on GPU/MPS and 8 on CPU.")
     args = parser.parse_args()
 
     # Hardware acceleration check with colorful banner (Main process only)
-    device = accelerator_report()
+    try:
+        device = accelerator_report(args.device)
+    except RuntimeError as exc:
+        print(f"Device error: {exc}")
+        return
 
-    # Paths
-    input_root = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data"
-    output_root = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
-    
-    # Construct model path
-    model_path = os.path.join(project_root, "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt")
+    workers = args.workers
+    if workers is None:
+        workers = 1 if device.type in {"cuda", "mps"} else 8
+    elif device.type in {"cuda", "mps"} and workers > 1:
+        print(f"Warning: {workers} workers on {device.type} will load {workers} model copies onto the accelerator.")
+
+    input_root = resolve_path(args.config, "final_cubed_data_dir", args.input_root)
+    output_root = resolve_path(args.config, "final_latent_data_dir", args.output_root)
+    model_path = resolve_path(args.config, "autoencoder_model_path", args.model_path)
 
     if not os.path.exists(model_path):
         print(f"Model not found at {model_path}")
-        # Try relative path if absolute fails (though project_root should be correct)
-        model_path = "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt"
-        if not os.path.exists(model_path):
-            print(f"Model still not found at {model_path}")
-            return
+        return
 
     # Prepare list of files
     if args.input_file:
@@ -261,7 +278,7 @@ def main():
         output_file = os.path.join(output_root, rel_path)
         jobs.append((input_file, output_file, args.batch_size))
 
-    print(f"Starting processing of {len(files_to_process)} file(s) with {args.workers} workers...")
+    print(f"Starting processing of {len(files_to_process)} file(s) with {workers} workers on {device}...")
     
     start_time = time.time()
     results_count = 0
@@ -269,10 +286,10 @@ def main():
     
     # Process files in parallel
     with ProcessPoolExecutor(
-        max_workers=args.workers, 
+        max_workers=workers,
         mp_context=mp.get_context('spawn'),
         initializer=worker_init,
-        initargs=(4, model_path) # 4 is Model_GEN3_05_AttentionSE
+        initargs=(args.model_index, model_path, device.type)
     ) as executor:
         
         futures = {executor.submit(process_file, *job): job for job in jobs}

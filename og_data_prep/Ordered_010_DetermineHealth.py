@@ -1,16 +1,9 @@
 import os
-import sys
 import pandas as pd
 import logging
 from concurrent.futures import ProcessPoolExecutor
 
-# Add parent directory to sys.path to import HostPreferences if needed
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-try:
-    from Ordered_001_Initialize import HostPreferences
-except ImportError:
-    HostPreferences = None
+from pipeline_config import add_config_argument, resolve_path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -79,32 +72,14 @@ def analyze_file(file_path):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Analyze health of .pkl.gz files.")
+    add_config_argument(parser)
     parser.add_argument("--dir", help="Directory to search for .pkl.gz files")
     args = parser.parse_args()
 
-    # Try to get path from HostPreferences or use a default
-    search_dir = args.dir
-    if not search_dir and HostPreferences:
-        try:
-            prefs = HostPreferences()
-            # Try a few common locations based on preferences
-            possible_dirs = [
-                os.path.join(prefs.root_path, "Unmodified_OG_Data"),
-                prefs.raw_input,
-                prefs.root_path
-            ]
-            for d in possible_dirs:
-                if d and os.path.exists(d):
-                    search_dir = d
-                    break
-        except Exception as e:
-            logger.warning(f"Could not load preferences: {e}")
-
-    if not search_dir or not os.path.exists(search_dir):
-        # Fallback to current directory or a hardcoded path if needed
-        search_dir = "/Users/kkreth/PycharmProjects/data/Unmodified_OG_Data"
-        if not os.path.exists(search_dir):
-            search_dir = "."
+    search_dir = resolve_path(args.config, "unmodified_data_dir", args.dir)
+    if not os.path.exists(search_dir):
+        print(f"Input directory not found: {search_dir}")
+        return
 
     print(f"Walking directory: {search_dir}")
     

@@ -4,7 +4,7 @@
     "transformer_input_dir": "/path/to/transformer_input",
     "training_h5": "/path/to/transformer_input/training_data.h5",
     "validation_h5": "/path/to/transformer_input/validation_data.h5",
-    "evaluation_input_root": "/path/to/orig-data",
+    "evaluation_input_root": "/path/to/original-data",
     "evaluation_h5": "/path/to/transformer_evaluation/evaluation_data.h5",
     "transformer_checkpoint": "./best_ordered_transformer_v1.pt",
     "encoder_checkpoint": "./Model_GEN3_05_AttentionSE_absolute_best_scripted.pt",

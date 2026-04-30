@@ -1,9 +1,9 @@
 # FDTransformer
 
 FDTransformer is a physics-modeling pipeline for turning original flow simulation
-data into cube features, compressing those cubes with a GEN3 autoencoder, learning
-latent spatio-temporal dynamics with a transformer, and recovering/interpreting
-physics with SINDy.
+data into cube features, compressing those cubes with an autoencoder, learning
+latent spatio-temporal dynamics with a transformer, and recovering/interpreting/predicting
+physics.
 
 The repository is organized as restartable stages. Each major folder has its own
 README with detailed command-line options; this file is the clean project map.

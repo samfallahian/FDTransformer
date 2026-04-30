@@ -49,6 +49,21 @@ Each pipeline area uses a local JSON config:
 Host-specific paths should be kept in those JSON files or passed with CLI
 overrides. The old host-keyed preferences file has been removed.
 
+## Downloadable Data
+
+Ready-made transformer datasets are available on Google Drive:
+
+| File | Use | Suggested config key |
+| --- | --- | --- |
+| [`training_data.h5`](https://drive.google.com/file/d/1nuAZe1xmJlEuOhsyndXeJd0yfXgywk86/view?usp=sharing) | Transformer training HDF5. | `paths.training_h5` |
+| [`validation_data.h5`](https://drive.google.com/file/d/1B83c5xqKNasf7AOFzVnRcOKw7k4p75Iz/view?usp=sharing) | Transformer validation HDF5. | `paths.validation_h5` |
+| [`evaluation_data.h5`](https://drive.google.com/file/d/1y43GoK163g40pno2RcxUf2lmgGq7-hNd/view?usp=sharing) | Prepared transformer evaluation HDF5 with original velocity metadata. | `paths.evaluation_h5` |
+| [`Original-data.zip`](https://drive.google.com/file/d/1dqxsz8WsUXxrOwYqQ4xLbP8lift1R_ts/view?usp=sharing) | Original evaluation source data. Includes one `7.452e-02` m/s flow-speed case for evaluation. | `paths.evaluation_input_root` after extraction |
+
+After downloading, place the HDF5 files wherever your local
+`transformer/transformer_config.json` points, or update the matching `paths.*`
+entries. Extract `Original-data.zip` before using it as `evaluation_input_root`.
+
 ## Typical Workflow
 
 1. Run `og_data_prep/` stages to produce corrected/scaled cube files and

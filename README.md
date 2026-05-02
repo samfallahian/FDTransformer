@@ -55,10 +55,10 @@ Ready-made transformer datasets are available on Google Drive:
 
 | File | Use | Suggested config key |
 | --- | --- | --- |
-| [`training_data.h5`](https://drive.google.com/file/d/1nuAZe1xmJlEuOhsyndXeJd0yfXgywk86/view?usp=sharing) | Transformer training HDF5. | `paths.training_h5` |
-| [`validation_data.h5`](https://drive.google.com/file/d/1B83c5xqKNasf7AOFzVnRcOKw7k4p75Iz/view?usp=sharing) | Transformer validation HDF5. | `paths.validation_h5` |
-| [`evaluation_data.h5`](https://drive.google.com/file/d/1y43GoK163g40pno2RcxUf2lmgGq7-hNd/view?usp=sharing) | Prepared transformer evaluation HDF5 with original velocity metadata. | `paths.evaluation_h5` |
-| [`Original-data.zip`](https://drive.google.com/file/d/1dqxsz8WsUXxrOwYqQ4xLbP8lift1R_ts/view?usp=sharing) | Original evaluation source data. Includes one `7.452e-02` m/s flow-speed case for evaluation. | `paths.evaluation_input_root` after extraction |
+| [`training_data.h5`](https://www.kaggle.com/datasets/lfmpaper/training-dataset-training-data-h5) | Transformer training HDF5. | `paths.training_h5` |
+| [`validation_data.h5`](https://www.kaggle.com/datasets/lfmpaper/validation-data-validation-data-h5) | Transformer validation HDF5. | `paths.validation_h5` |
+| [`evaluation_data.h5`](https://www.kaggle.com/datasets/lfmpaper/evaluation-dataset-evaluation-data-h5) | Prepared transformer evaluation HDF5 with original velocity metadata. | `paths.evaluation_h5` |
+| [`Original-data.zip`](https://www.kaggle.com/datasets/lfmpaper/original-data-for-evaluation) | Original evaluation source data. Includes one `7.452e-02` m/s flow-speed case for evaluation. | `paths.evaluation_input_root` after extraction |
 
 After downloading, place the HDF5 files wherever your local
 `transformer/transformer_config.json` points, or update the matching `paths.*`

@@ -88,6 +88,7 @@ with h5py.File(h5_path, 'r') as f:
         print(f"Enstrophy mean: {np.mean(enstrophy)}")
         
         # Save some data for SINDy
-        np.savez("pySINDy/raw_data_grad.npz", V=V, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
-        print("Saved pySINDy/raw_data_grad.npz")
+        output_path = "/Users/kkreth/PycharmProjects/cgan/pySINDy/raw_data_grad.npz"
+        np.savez(output_path, V=V, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
+        print(f"Saved {output_path}")
 

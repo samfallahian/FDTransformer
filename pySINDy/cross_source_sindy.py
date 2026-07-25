@@ -8,9 +8,9 @@ def cross_source_sindy():
     print("\n--- Cross-Source Recovery Testing ---")
     
     # Load data
-    raw = np.load("pySINDy/raw_data_grad.npz")
-    encoded = np.load("pySINDy/encoded_data_grad.npz")
-    predicted = np.load("pySINDy/predicted_data_grad.npz")
+    raw = np.load("/Users/kkreth/PycharmProjects/cgan/pySINDy/raw_data_grad.npz")
+    encoded = np.load("/Users/kkreth/PycharmProjects/cgan/pySINDy/encoded_data_grad.npz")
+    predicted = np.load("/Users/kkreth/PycharmProjects/cgan/pySINDy/predicted_data_grad.npz")
     
     scenarios = [
         ("Raw", raw),
@@ -39,20 +39,25 @@ def cross_source_sindy():
             mse = mean_squared_error(y, y_pred)
             
             # expected coeffs at indices 4, 7, 9 are 0.5
+            is_artifact = (input_label == target_label)
+            status = "Self-Consistency (Artifact)" if is_artifact else "Physical Validation (Real)"
+            
             res = {
                 'Input': input_label,
                 'Target': target_label,
+                'Status': status,
                 'MSE': mse,
                 'wx2': coefs[4],
                 'wy2': coefs[7],
                 'wz2': coefs[9]
             }
             results.append(res)
-            print(f"Input: {input_label:9} | Target: {target_label:9} | MSE: {mse:.4e} | wx^2: {coefs[4]:.4f}")
+            print(f"Input: {input_label:9} | Target: {target_label:9} | Status: {status:25} | MSE: {mse:.4e}")
 
     df = pd.DataFrame(results)
-    df.to_csv("pySINDy/cross_source_results.csv", index=False)
-    print("\nSaved: pySINDy/cross_source_results.csv")
+    output_path = "/Users/kkreth/PycharmProjects/cgan/pySINDy/cross_source_results.csv"
+    df.to_csv(output_path, index=False)
+    print(f"\nSaved: {output_path}")
     print(df.to_string(index=False))
 
 if __name__ == "__main__":

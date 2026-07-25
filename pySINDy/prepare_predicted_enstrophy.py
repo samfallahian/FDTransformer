@@ -121,8 +121,9 @@ def prepare_predicted_enstrophy():
         wx, wy, wz = grad_w[1]-grad_v[2], grad_u[2]-grad_w[0], grad_v[0]-grad_u[1]
         enstrophy = 0.5 * (wx**2 + wy**2 + wz**2)
         
-        np.savez("pySINDy/predicted_data_grad.npz", V=V_pred, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
-        print("Saved pySINDy/predicted_data_grad.npz")
+        output_path = "/Users/kkreth/PycharmProjects/cgan/pySINDy/predicted_data_grad.npz"
+        np.savez(output_path, V=V_pred, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
+        print(f"Saved {output_path}")
 
 if __name__ == "__main__":
     prepare_predicted_enstrophy()

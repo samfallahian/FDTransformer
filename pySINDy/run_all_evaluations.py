@@ -43,10 +43,11 @@ def recover_enstrophy(wx, wy, wz, enstrophy, label):
     return results
 
 def run_evaluation_suite():
+    PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
     data_files = {
-        'Raw': 'pySINDy/raw_data_grad.npz',
-        'Encoded': 'pySINDy/encoded_data_grad.npz',
-        'Predicted': 'pySINDy/predicted_data_grad.npz'
+        'Raw': os.path.join(PROJECT_ROOT, 'pySINDy/raw_data_grad.npz'),
+        'Encoded': os.path.join(PROJECT_ROOT, 'pySINDy/encoded_data_grad.npz'),
+        'Predicted': os.path.join(PROJECT_ROOT, 'pySINDy/predicted_data_grad.npz')
     }
     
     all_results = []
@@ -101,8 +102,9 @@ def run_evaluation_suite():
     df = df[cols]
     
     # Save table
-    df.to_csv('pySINDy/evaluation_results.csv', index=False)
-    print("\nSummary Table:")
+    output_csv = os.path.join(PROJECT_ROOT, 'pySINDy/evaluation_results.csv')
+    df.to_csv(output_csv, index=False)
+    print(f"\nSummary Table saved to: {output_csv}")
     print(df.to_string(index=False))
     
     # Create Figure
@@ -131,8 +133,10 @@ def plot_coefficients(df):
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('pySINDy/evaluation_summary.png')
-    print("\nFigure saved to: pySINDy/evaluation_summary.png")
+    PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
+    output_fig = os.path.join(PROJECT_ROOT, 'pySINDy/evaluation_summary.png')
+    plt.savefig(output_fig)
+    print(f"\nFigure saved to: {output_fig}")
 
 if __name__ == "__main__":
     run_evaluation_suite()

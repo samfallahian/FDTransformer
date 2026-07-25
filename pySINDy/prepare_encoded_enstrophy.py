@@ -80,8 +80,9 @@ def prepare_encoded_enstrophy():
         
         enstrophy = 0.5 * (wx**2 + wy**2 + wz**2)
         
-        np.savez("pySINDy/encoded_data_grad.npz", V=V_encoded, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
-        print("Saved pySINDy/encoded_data_grad.npz")
+        output_path = "/Users/kkreth/PycharmProjects/cgan/pySINDy/encoded_data_grad.npz"
+        np.savez(output_path, V=V_encoded, wx=wx, wy=wy, wz=wz, enstrophy=enstrophy)
+        print(f"Saved {output_path}")
 
 if __name__ == "__main__":
     prepare_encoded_enstrophy()

@@ -84,6 +84,9 @@ def run_sindy_recovery(wx, wy, wz, enstrophy):
     optimizer.fit(X_poly, y)
     coefs = np.asarray(optimizer.coef_[0])
     
+    # Debug print for enstrophy coefficients
+    # print(f"DEBUG: Enstrophy coefficients: {coefs}")
+    
     y_pred = np.asarray(X_poly) @ coefs.T
     mse = mean_squared_error(y, y_pred)
     
@@ -219,8 +222,9 @@ def main():
         df = pd.DataFrame(all_results)
         cols = ['Reynolds_Number', 'Source', 'MSE', 'wx^2', 'wy^2', 'wz^2', 'wx', 'wy', 'wz', '1']
         df = df[[c for c in cols if c in df.columns]]
-        df.to_csv('pySINDy/all_params_recovery_results.csv', index=False)
-        print("\nSummary Results Table:")
+        output_csv = "/Users/kkreth/PycharmProjects/cgan/pySINDy/all_params_recovery_results.csv"
+        df.to_csv(output_csv, index=False)
+        print(f"\nSummary Results Table saved to: {output_csv}")
         print(df.to_string(index=False))
 
         # Visualizations
@@ -239,8 +243,9 @@ def main():
             plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('pySINDy/all_params_coefficient_trends.png')
-        print("\nTrend figure saved to: pySINDy/all_params_coefficient_trends.png")
+        output_fig = "/Users/kkreth/PycharmProjects/cgan/pySINDy/all_params_coefficient_trends.png"
+        plt.savefig(output_fig)
+        print(f"\nTrend figure saved to: {output_fig}")
 
 if __name__ == "__main__":
     main()

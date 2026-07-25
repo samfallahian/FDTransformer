@@ -96,10 +96,6 @@ While the **predicted (red)** and **ground truth (black)** lines correctly share
 2.  **Event Prediction vs. Magnitude Matching:** The primary goal of the transformer is **state prediction** (detecting the reversal and subsequent rotation direction). "Recovery" is defined by the model correctly identifying the new physical regime, even if it under-predicts the peak magnitude.
 3.  **Phase Accuracy:** The model captures the *timing* of the reversal (the phase) with high precision, which is more critical for high-speed fluid control than numerical magnitude matching.
 
-### Visual Documentation
-A high-resolution comparison plot has been generated:
-[PDF] [Vortex Reversal Evaluation (1200 DPI)](vortex_reversal_evaluation.pdf)
-
 ### CFD-Standard Visualizations (State Accuracy)
 
 To address magnitude discrepancies inherent in decoding gradients, the following CFD-standard representations highlight the model's success in state and phase prediction:

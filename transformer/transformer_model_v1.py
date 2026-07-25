@@ -126,19 +126,20 @@ class OrderedTransformerV1(nn.Module):
         return self.output_head(x)
 
     @torch.no_grad()
-    def predict_autoregressive(self, initial_sequence, num_to_predict):
+    def predict_autoregressive(self, initial_sequence, num_to_predict, attn_window: int = 1024):
         """
         Autoregressively predict the next 'num_to_predict' latents in the sequence.
-        initial_sequence: (1, seq_len, 52) where seq_len is typically 208
+        initial_sequence: (B, seq_len, 52)
+        attn_window: max context tokens fed to the transformer per step (memory guard).
         """
         self.eval()
         seq = initial_sequence.clone()
         start_pos = seq.shape[1] - num_to_predict
         
         for i in range(start_pos, seq.shape[1]):
-            # Predict using all tokens up to i (exclusive)
-            # The output at index i-1 is the prediction for latent at index i
-            outputs = self(seq[:, :i, :])
+            # Use at most the last attn_window tokens as context
+            ctx = seq[:, max(0, i - attn_window):i, :]
+            outputs = self(ctx)
             next_latent = outputs[:, -1, :]
             
             # Update the latent features (0-46) for the current position

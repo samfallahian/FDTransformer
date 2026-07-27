@@ -10,11 +10,12 @@ import wandb
 from encoder_neurIPS.models import create_model_variant, ORIGINAL_DIM, LATENT_DIM
 
 # Configuration
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = "/Users/kkreth/PycharmProjects/data/encoder_neurIPS"
 OG_MODEL_PATH = "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best.pt"
 NUM_MODELS = 32
 RUN_TIME_PER_MODEL = 5 * 60 # 5 minutes
-SAVE_DIR = "encoder_neurIPS/saved_models"
+SAVE_DIR = os.path.join(SCRIPT_DIR, "saved_models")
 STATE_FILE = os.path.join(SAVE_DIR, "training_state.pkl")
 
 def get_device():
@@ -53,24 +54,48 @@ def train_one_model(model_idx, device, train_loader, val_loader, round_num, og_p
         dry_run: If True, runs for a very short duration for testing.
         
     Returns:
-        best_val_l2: The best L2 validation loss achieved during the run.
+        best_val_l2: The best True L2 Norm validation loss achieved during the run.
     """
     model = create_model_variant(model_idx).to(device)
     model_name = f"NeurIPS_Model_{model_idx:02d}_R{round_num}"
     
     # Path for weights from PREVIOUS round
-    prev_round_path = os.path.join(SAVE_DIR, f"round_{round_num-1}", f"model_{model_idx:02d}.pt")
+    # Prioritize 'best' weight, but allow 'last' if needed
+    prev_round_path = os.path.join(SAVE_DIR, f"round_{round_num-1}", f"model_{model_idx:02d}_best.pt")
+    if round_num > 1 and not os.path.exists(prev_round_path):
+        last_path = os.path.join(SAVE_DIR, f"round_{round_num-1}", f"model_{model_idx:02d}_last.pt")
+        if os.path.exists(last_path):
+            prev_round_path = last_path
     
+    seeded_param_count = 0
+    total_param_count = sum(p.numel() for p in model.parameters())
+
     # Check if we have weights from a previous round of THIS training session
-    if round_num > 1 and os.path.exists(prev_round_path):
-        try:
-            ckpt = torch.load(prev_round_path, map_location=device, weights_only=False)
-            model.load_state_dict(ckpt['model_state_dict'])
-            print(f"[{model_name}] Loading weights from Round {round_num-1}...")
-        except Exception as e:
-            print(f"[{model_name}] Could not load weights from previous round: {e}")
-    # Otherwise, attempt to seed from OG Model (Production)
-    elif os.path.exists(OG_MODEL_PATH):
+    checkpoint_info = "Random Initialization"
+    if round_num > 1:
+        if os.path.exists(prev_round_path):
+            try:
+                ckpt = torch.load(prev_round_path, map_location=device, weights_only=False)
+                model.load_state_dict(ckpt['model_state_dict'])
+                
+                # Get file metadata
+                mtime = os.path.getmtime(prev_round_path)
+                timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
+                file_size = os.path.getsize(prev_round_path) / (1024 * 1024)
+                
+                checkpoint_info = f"Loaded Round {round_num-1} Best: {os.path.basename(prev_round_path)} (Size: {file_size:.2f}MB, Saved: {timestamp})"
+                print(f"[{model_name}] {checkpoint_info}")
+                seeded_param_count = total_param_count 
+            except Exception as e:
+                print(f"[{model_name}] ERROR: Failed to load weights from Round {round_num-1}: {e}")
+                checkpoint_info = f"Error loading Round {round_num-1}: {str(e)}"
+        else:
+            print(f"[{model_name}] CRITICAL WARNING: Round {round_num-1} weights missing at {prev_round_path}!")
+            print(f"[{model_name}] Per instruction, NOT falling back to OG Model. Starting from Random Weights.")
+            checkpoint_info = f"Missing Round {round_num-1} checkpoint (Started Random)"
+            
+    # ONLY if we didn't load from a previous round and it's Round 1, try OG seeding
+    elif round_num == 1 and os.path.exists(OG_MODEL_PATH):
         try:
             og_ckpt = torch.load(OG_MODEL_PATH, map_location=device, weights_only=False)
             state_dict = og_ckpt.get('model_state_dict', og_ckpt)
@@ -82,60 +107,86 @@ def train_one_model(model_idx, device, train_loader, val_loader, round_num, og_p
                 if k in model_dict:
                     if v.shape == model_dict[k].shape:
                         filtered_dict[k] = v
+                        seeded_param_count += v.numel()
             
             model.load_state_dict(filtered_dict, strict=False)
-            print(f"[{model_name}] Seeding weights from OG Model (matched {len(filtered_dict)}/{len(state_dict)} layers)...")
+            mtime = os.path.getmtime(OG_MODEL_PATH)
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
+            checkpoint_info = f"OG Model Seeded (Matched {len(filtered_dict)} layers, {seeded_param_count/total_param_count:.1%} of params, Saved: {timestamp})"
+            print(f"[{model_name}] {checkpoint_info}")
         except Exception as e:
             print(f"[{model_name}] Could not seed weights from OG Model: {e}")
+            checkpoint_info = f"Error seeding OG: {str(e)}"
+
+    seeded_pct = seeded_param_count / total_param_count
 
     # Configuration for optimizer
-    opt_type = getattr(model, 'optimizer_type', 'adamw')
-    if opt_type == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    else:
-        optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    # More aggressive learning rate for early rounds, decaying as pool shrinks
+    # Round 1 & 2: 5e-4, Round 3: 2.5e-4, Round 4+: 1e-4
+    base_lr = 5e-4 if round_num <= 2 else (2.5e-4 if round_num == 3 else 1e-4)
+    
+    # USE AdamW exclusively as requested
+    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
 
-    wandb.init(project="encoder_neurIPS", name=model_name, config={
+    wandb.init(project=f"encoder_neurIPS_v3_R{round_num}", name=model_name, config={
         "model_idx": model_idx, 
         "round": round_num,
-        "arch": getattr(model, 'arch_type', 'unknown'),
-        "optimizer": opt_type,
+        "base_lr": base_lr,
+        "optimizer": "AdamW",
         "h1": getattr(model, 'h1', 'unknown'),
         "h2": getattr(model, 'h2', 'unknown'),
-        "h3": getattr(model, 'h3', 'unknown')
+        "h3": getattr(model, 'h3', 'unknown'),
+        "seeded_pct": seeded_pct,
+        "checkpoint_source": checkpoint_info
     }, reinit=True)
     
     # Define metrics for scientific notation and axis grouping in UI
     wandb.define_metric("val_rmse", summary="min")
     wandb.define_metric("val_rmse_baseline", summary="mean")
-    wandb.define_metric("val_l2", summary="min")
+    wandb.define_metric("val_l2_norm", summary="min")
     
     start_time = time.time()
-    best_val_l2 = float('inf')
+    best_val_l2_norm = float('inf')
     best_val_rmse = float('inf')
     epoch = 0
     
     # Training Loop
-    while time.time() - start_time < (10 if dry_run else RUN_TIME_PER_MODEL):
+    # Set training duration: 7 minutes for Round 2, 10 minutes for all subsequent rounds
+    if round_num == 1:
+        limit_seconds = 5 * 60
+    elif round_num == 2:
+        limit_seconds = 7 * 60
+    else:
+        limit_seconds = 10 * 60
+
+    while time.time() - start_time < (10 if dry_run else limit_seconds):
         model.train()
         train_loss_total = 0.0
-        train_loss_l2 = 0.0
+        train_loss_l2_norm = 0.0
         batch_count = 0
         
         for batch in train_loader:
             # Check time limit within batch loop
-            if time.time() - start_time > (10 if dry_run else RUN_TIME_PER_MODEL): break
+            if time.time() - start_time > (10 if dry_run else limit_seconds): break
             x = batch[0].to(device)
             optimizer.zero_grad()
             recon_x, z = model(x)
             
-            # Loss is MSE-based as requested, while reporting RMSE for reference
-            loss, recon_loss, l2_reg = model.loss_function(recon_x, x, z)
+            # Reconstruction loss is computed as True L2 Norm (Euclidean distance) per sample
+            # True L2 Norm = sqrt(sum((pred - target)^2))
+            diff = recon_x - x.view_as(recon_x)
+            l2_norm_per_sample = torch.norm(diff, p=2, dim=1)
+            recon_loss = torch.mean(l2_norm_per_sample)
+            
+            # Latent regularization (original z^2 logic)
+            l2_reg = torch.mean(z ** 2)
+            loss = recon_loss + 0.00005 * l2_reg
+            
             loss.backward()
             optimizer.step()
             
             train_loss_total += loss.item()
-            train_loss_l2 += recon_loss.item()
+            train_loss_l2_norm += recon_loss.item()
             batch_count += 1
             if dry_run and batch_count > 5: break 
         
@@ -143,57 +194,82 @@ def train_one_model(model_idx, device, train_loader, val_loader, round_num, og_p
 
         # Validation Step
         model.eval()
-        val_sse, val_elements = 0.0, 0
+        total_l2_norm = 0.0
+        total_mse = 0.0
+        sample_count = 0
         with torch.no_grad():
             for batch in val_loader:
                 x = batch[0].to(device)
                 recon_x, z = model(x)
-                # Compute Sum of Squared Errors across all 375 dimensions
-                val_sse += torch.sum((recon_x - x.view_as(recon_x)) ** 2).item()
-                val_elements += x.numel()
+                
+                diff = recon_x - x.view_as(recon_x)
+                # True L2 Norm per sample
+                l2_norms = torch.norm(diff, p=2, dim=1)
+                total_l2_norm += torch.sum(l2_norms).item()
+                
+                # Mean Squared Error for RMSE calculation
+                total_mse += torch.sum(diff**2).item()
+                sample_count += x.size(0)
         
-        val_l2 = val_sse / val_elements
-        val_rmse = np.sqrt(val_l2)
-        best_val_l2 = min(best_val_l2, val_l2)
-        best_val_rmse = min(best_val_rmse, val_rmse)
+        val_l2_norm = total_l2_norm / sample_count
+        val_rmse = np.sqrt(total_mse / (sample_count * ORIGINAL_DIM))
         
+        # Save if this is the best so far
+        if val_l2_norm < best_val_l2_norm:
+            best_val_l2_norm = val_l2_norm
+            best_val_rmse = val_rmse
+            # Save the "best" snapshot
+            round_dir = os.path.join(SAVE_DIR, f"round_{round_num}")
+            os.makedirs(round_dir, exist_ok=True)
+            save_path = os.path.join(round_dir, f"model_{model_idx:02d}_best.pt")
+            torch.save({
+                'model_idx': model_idx,
+                'round_num': round_num,
+                'model_state_dict': model.state_dict(),
+                'best_val_l2_norm': best_val_l2_norm,
+                'best_val_rmse': best_val_rmse,
+                'epoch': epoch
+            }, save_path)
+            # print(f"[{model_name}] New best Val L2 Norm: {best_val_l2_norm:.4e} (Epoch {epoch})")
+
         # Logging to WandB with scientific notation formatting
         log_dict = {
             "epoch": epoch, 
-            "val_l2_scientific": float(f"{val_l2:.4e}"),
-            "val_rmse_scientific": float(f"{val_rmse:.4e}"), 
-            "best_val_l2_scientific": float(f"{best_val_l2:.4e}"),
-            "best_val_rmse_scientific": float(f"{best_val_rmse:.4e}"),
-            "train_loss_total_scientific": float(f"{(train_loss_total / batch_count):.4e}"),
-            "train_loss_l2_scientific": float(f"{(train_loss_l2 / batch_count):.4e}"),
-            # Original keys for plotting consistency
-            "val_l2": val_l2,
+            "val_l2_norm_scientific": f"{val_l2_norm:.4e}",
+            "val_rmse_scientific": f"{val_rmse:.4e}", 
+            "best_val_l2_norm_scientific": f"{best_val_l2_norm:.4e}",
+            "best_val_rmse_scientific": f"{best_val_rmse:.4e}",
+            "train_loss_total_scientific": f"{(train_loss_total / batch_count):.4e}",
+            "train_loss_l2_norm_scientific": f"{(train_loss_l2_norm / batch_count):.4e}",
+            # Standard keys
+            "val_l2_norm": val_l2_norm,
             "val_rmse": val_rmse,
-            "best_val_l2": best_val_l2,
+            "best_val_l2_norm": best_val_l2_norm,
             "best_val_rmse": best_val_rmse,
             "train_loss_total": train_loss_total / batch_count,
-            "train_loss_l2": train_loss_l2 / batch_count
+            "train_loss_l2_norm": train_loss_l2_norm / batch_count
         }
         if og_performance:
             log_dict["val_rmse_baseline"] = og_performance # Combined on same graph as val_rmse
-            log_dict["val_rmse_baseline_scientific"] = float(f"{og_performance:.4e}")
+            log_dict["val_rmse_baseline_scientific"] = f"{og_performance:.4e}"
         wandb.log(log_dict)
         epoch += 1
 
-    # Save model weights for next round or restart
+    # Final save (the "last" state)
     round_dir = os.path.join(SAVE_DIR, f"round_{round_num}")
     os.makedirs(round_dir, exist_ok=True)
-    save_path = os.path.join(round_dir, f"model_{model_idx:02d}.pt")
+    last_path = os.path.join(round_dir, f"model_{model_idx:02d}_last.pt")
     torch.save({
         'model_idx': model_idx,
         'round_num': round_num,
         'model_state_dict': model.state_dict(),
-        'best_val_l2': best_val_l2,
-        'best_val_rmse': best_val_rmse
-    }, save_path)
+        'val_l2_norm': val_l2_norm,
+        'val_rmse': val_rmse,
+        'epoch': epoch
+    }, last_path)
     
     wandb.finish()
-    return best_val_l2
+    return best_val_l2_norm
 
 def main(dry_run=False, force_restart=False):
     """
@@ -264,7 +340,7 @@ def main(dry_run=False, force_restart=False):
                 }, f)
         
         # All models in current round finished, calculate survivors
-        # Sort by score (best is lowest L2)
+        # Sort by score (best is lowest L2 Norm)
         round_results.sort(key=lambda x: x[1])
         # Keep top 50%
         survivors = [r[0] for r in round_results[:max(1, len(current_models)//2)]]

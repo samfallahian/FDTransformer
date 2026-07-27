@@ -131,6 +131,7 @@ def train(variant_idx=None):
     
     best_val_loss = float('inf')
     best_rollout_loss = float('inf')
+    best_improvement = -float('inf')
     
     for epoch in range(Config.EPOCHS):
         model.train()
@@ -196,6 +197,11 @@ def train(variant_idx=None):
         
         train_loss /= len(train_loader)
         
+        if time.time() - start_time > max_runtime:
+            print(f"\nReached {max_runtime}s limit. Moving to next candidate.")
+            wandb.finish()
+            return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
+
         # Validation
         model.eval()
         val_loss = 0
@@ -258,6 +264,7 @@ def train(variant_idx=None):
             persistence_loss /= rollout_count
         
         persistence_improvement = (persistence_loss - rollout_loss) / (persistence_loss + 1e-8) * 100
+        best_improvement = max(best_improvement, persistence_improvement)
 
         wandb.log({
             "train_loss": train_loss, 
@@ -290,22 +297,39 @@ def train(variant_idx=None):
             torch.save(model.state_dict(), save_path)
             
     wandb.finish()
+    return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
 
 if __name__ == "__main__":
+    results = []
     if len(sys.argv) > 1:
         if sys.argv[1] == "search":
             print("Starting architecture search with 60s per candidate...")
             for i in range(len(Config.SEARCH_SPACE)):
                 print(f"\n--- Testing Candidate {i} ---")
-                train(i)
+                res = train(i)
+                results.append((i, res))
         elif sys.argv[1].isdigit():
-            train(int(sys.argv[1]))
+            res = train(int(sys.argv[1]))
+            results.append((int(sys.argv[1]), res))
         else:
             Config.VARIANT = sys.argv[1]
-            train()
+            res = train()
+            results.append((Config.VARIANT, res))
     else:
         # Default to searching through all candidates
         print("Starting architecture search with 60s per candidate...")
         for i in range(len(Config.SEARCH_SPACE)):
             print(f"\n--- Testing Candidate {i} ---")
-            train(i)
+            res = train(i)
+            results.append((i, res))
+
+    if results:
+        print("\n" + "="*50)
+        print("ARCHITECTURE SEARCH LEADERBOARD")
+        print("="*50)
+        print(f"{'ID':<5} | {'Val L2':<10} | {'Rollout':<10} | {'Improv %':<10}")
+        print("-" * 50)
+        for cand_id, res in results:
+            if res:
+                print(f"{str(cand_id):<5} | {res['val_l2']:<10.6f} | {res['rollout_l2']:<10.6f} | {res['improvement']:<10.2f}%")
+        print("="*50)

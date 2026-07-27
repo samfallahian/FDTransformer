@@ -465,9 +465,11 @@ class EfficientDataLoader:
         t_total0 = time.perf_counter() if self.enable_profiling else None
         # Calculate file sampling weights based on row counts
         t0 = time.perf_counter() if self.enable_profiling else None
-        weights = [m['row_count'] for m in self.file_metadata]
-        total_weight = sum(weights)
-        weights = [w / total_weight for w in weights]
+        weights = np.array([m['row_count'] for m in self.file_metadata], dtype=np.float64)
+        total_weight = weights.sum()
+        weights /= total_weight
+        # Force sum to 1 to avoid rounding issues
+        weights /= weights.sum()
         
         # Select files for the current batch
         max_files = NUMBER_OF_ROWS // ROW_FLOOR  # Max number of files to sample from

@@ -171,9 +171,9 @@ def process_set(param_list, out_name, selected_wake_coords):
 def prepare_data():
     t0 = time.time()
     
-    random.seed(42)
-    selected_wake_coords = random.sample(WAKE_COORDS, 12)
-    print(f"Selected 12 wake coordinates for 50% coverage.")
+    # Use all 24 wake coordinates for 100% coverage as requested
+    selected_wake_coords = WAKE_COORDS
+    print(f"Using all {len(selected_wake_coords)} wake coordinates for 100% coverage.")
 
     train_params = ["3p6", "4p4", "4p6", "5p2", "6p6", "7p2", "7p8", "8p4", "10p4", "11p4"]
     val_params = ["6p4"]

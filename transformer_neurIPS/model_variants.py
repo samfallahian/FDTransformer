@@ -146,6 +146,10 @@ class BaseTransformer(nn.Module):
         space_ids = torch.arange(config.NUM_X).repeat(config.NUM_TIME)
         self.register_buffer("time_ids", time_ids)
         self.register_buffer("space_ids", space_ids)
+        
+        # Register causal mask as buffer to help TorchScript and avoid re-generation
+        mask = torch.triu(torch.full((config.SEQ_LEN, config.SEQ_LEN), float('-inf')), diagonal=1)
+        self.register_buffer("causal_mask", mask)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -153,7 +157,7 @@ class BaseTransformer(nn.Module):
         # Standard learnable additive embeddings
         x = x + self.time_embeddings(self.time_ids[:T]) + self.space_embeddings(self.space_ids[:T])
         
-        mask = nn.Transformer.generate_square_subsequent_mask(T, device=x.device)
+        mask = self.causal_mask[:T, :T]
         for blk in self.blocks:
             x = blk(x, mask=mask)
             

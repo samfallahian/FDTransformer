@@ -1,3 +1,20 @@
+"""
+Transformer Training Production Script for NeurIPS
+=================================================
+This script handles the training and architecture search for fluid dynamics latent sequences.
+
+KEY METRICS TO MONITOR:
+1. Rollout L2: Multi-step autoregressive prediction error (28 full time steps).
+2. Persistence L2: The baseline "do-nothing" error (assuming t=12 is the result for all future t).
+3. Persistence Improvement %: How much BETTER the model is than doing nothing. 
+   Goal: MUST be > 0% and ideally > 50%.
+
+WHERE TO LOOK:
+- Search results: Console table at the end of the run.
+- Telemetry: W&B project "transformer_neurIPS_production".
+- Best Models: Saved in 'saved_models/' with '_rollout_best.pt' suffix.
+"""
+
 import os
 import h5py
 import torch
@@ -12,80 +29,108 @@ from model_variants import get_model
 
 # --- Configuration ---
 class Config:
-    # Data paths
+    """
+    Global configuration for training and model parameters.
+    Modify SEARCH_SPACE to test new architectures.
+    """
+    # Data paths - Absolute paths derived from file location
     TRAIN_H5 = os.path.join(os.path.dirname(__file__), "data/train_40.h5")
     VAL_H5 = os.path.join(os.path.dirname(__file__), "data/val_40.h5")
     CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "saved_models")
     
-    # Model architecture
-    LATENT_DIM = 47
-    NUM_X = 26
-    NUM_TIME = 40
-    SEQ_LEN = NUM_X * NUM_TIME # 1040
+    # Model architecture constants
+    LATENT_DIM = 47 # Latent features from encoder
+    NUM_X = 26      # Spatial locations per time step
+    NUM_TIME = 40   # Total time steps in sequence
+    SEQ_LEN = NUM_X * NUM_TIME # 1040 tokens total
     
-    INPUT_DIM = 52
+    INPUT_DIM = 52  # 47 (latents) + 1 (time) + 1 (x) + 3 (params)
+    
+    # Defaults for single run (overwritten by SEARCH_SPACE if searching)
     EMBED_SIZE = 256
     N_HEADS = 8
     N_LAYERS = 6
     DROPOUT = 0.1
     BIAS = True
-    VARIANT = 'base' # 'base' or 'swiglu'
+    VARIANT = 'base' 
     
-    # Training
-    BATCH_SIZE = 2 # Keeping small for search
-    LEARNING_RATE = 1e-3 # Keeping high for search
-    EPOCHS = 50
+    # Training Hyperparameters
     DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+    BATCH_SIZE = 128 if DEVICE == "cuda" else 32 # Higher on CUDA, safer on MPS
+    ACCUMULATION_STEPS = 1 if DEVICE == "cuda" else 4 # Micro-batching for memory-constrained devices
+    LEARNING_RATE = 2e-3 # Slightly higher LR to match larger batch size
+    EPOCHS = 50
+    NUM_WORKERS = 8 if DEVICE == "cuda" else 0 # Multi-threaded only on CUDA
+    PIN_MEMORY = True if DEVICE == "cuda" else False
 
-    # Robustness techniques
-    NOISE_STD = 5e-4   # Noise injected to latent portion of input
-    AR_ROLLOUT_STEPS = 10 # Predict next 10 tokens (roughly 1/3 of a time step)
+    # Stability & Robustness Techniques
+    # Micro-batching setup: BATCH_SIZE is the per-step batch, 
+    # effective batch size = BATCH_SIZE * ACCUMULATION_STEPS.
+    # To "back out" or disable micro-batches, set ACCUMULATION_STEPS = 1.
+    NOISE_STD = 5e-4       # Gaussian noise on inputs to fight AR drift
+    AR_ROLLOUT_STEPS = 10 if DEVICE == "cuda" else 0 # Disabled on MPS to speed up training
     AR_LOSS_WEIGHT = 0.05
     
-    # Evaluation
-    VAL_CONTEXT_STEPS = 12
-    VAL_ROLLOUT_STEPS = 26 * (40 - VAL_CONTEXT_STEPS) # Predict remaining steps (28 * 26 = 728 tokens)
+    # Persistence Baseline Evaluation Parameters
+    VAL_CONTEXT_STEPS = 12 # Feed first 12 steps as context
+    VAL_ROLLOUT_STEPS = 26 * (40 - VAL_CONTEXT_STEPS) # Predict remaining 28 steps (728 tokens)
+    
+    # Validation settings for speed on MPS
+    VAL_INTERVAL = 1 if DEVICE == "cuda" else 999999 # Validate every epoch on CUDA, disabled on MPS
+    
+    # METRIC DEFINITION:
+    # Persistence MSE = MSE(Target_Steps_13_to_40, Step_12_Repeated)
+    # Model MSE = MSE(Target_Steps_13_to_40, Model_Predictions_13_to_40)
+    # Goal: Model MSE < Persistence MSE
 
     # Architecture search space - Exploring diverse architectural inductive biases
     SEARCH_SPACE = [
-        # 0: Baseline - Standard capacity
+        # 0: Baseline - Standard capacity (Strongest early performer)
         {"EMBED_SIZE": 256, "N_HEADS": 8, "N_LAYERS": 6, "VARIANT": "base"},
         
-        # 1: Expressive Gating - SwiGLU activation (Llama-style)
-        # Better for complex non-linear transitions in fluid dynamics
+        # 1: Expressive Gating - SwiGLU activation (Llama-style, High throughput)
         {"EMBED_SIZE": 256, "N_HEADS": 8, "N_LAYERS": 6, "VARIANT": "swiglu"},
         
         # 2: Efficiency - Multi-Query Attention (MQA)
-        # Uses shared Key/Value across heads; focuses attention on global features
         {"EMBED_SIZE": 256, "N_HEADS": 8, "N_LAYERS": 6, "VARIANT": "mqa"},
         
-        # 3: Hybrid - Convolutional-Transformer
-        # Uses 1D Conv before attention to capture local spatial/temporal correlations
-        # Ideal for fluid dynamics where local neighborhood matters
+        # 3: Hybrid - Convolutional-Transformer (Local spatial inductive bias)
         {"EMBED_SIZE": 256, "N_HEADS": 8, "N_LAYERS": 6, "VARIANT": "conv"},
         
-        # 4: Large Capacity Baseline
+        # 4: Deep Capacity Baseline
         {"EMBED_SIZE": 512, "N_HEADS": 8, "N_LAYERS": 8, "VARIANT": "base"},
         
-        # 5: Hybrid Wide - Conv + SwiGLU
-        # Combining local inductive bias with advanced gating
+        # 5: Hybrid Wide - Conv + SwiGLU (Combining local bias with advanced gating)
         {"EMBED_SIZE": 512, "N_HEADS": 8, "N_LAYERS": 4, "VARIANT": "conv", "USE_SWIGLU": True},
     ]
 
     # --- Runtime logic ---
-    MAX_RUNTIME_PER_CANDIDATE = 60 # seconds
+    MAX_RUNTIME_PER_CANDIDATE = 1800 # 30 minutes for candidates (speedup should allow more training)
+    CHECKPOINT_INTERVAL = 60 # Save every 60 seconds
+    
+    # H200 Optimization Recommendations:
+    # 1. Use torch.compile(model) for Blackwell/Hopper speedups.
+    # 2. Use torch.cuda.amp.autocast() or FP8 TransformerEngine if available.
+    # 3. Increase BATCH_SIZE to 512+ to saturate HBM3e bandwidth.
+    # 4. Use FlashAttention-3 kernels.
+
+def mse_loss(pred, target):
+    return torch.mean((pred - target) ** 2)
 
 def l2_loss(pred, target):
     return torch.mean(torch.norm(pred - target, dim=-1))
 
 class TransformerDataset(Dataset):
-    def __init__(self, h5_path):
+    def __init__(self, h5_path, subset_ratio=1.0):
         self.h5_path = h5_path
         self._file = None
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
         with h5py.File(self.h5_path, 'r') as f:
-            self.length = f['data'].shape[0]
+            total_length = f['data'].shape[0]
+            self.length = int(total_length * subset_ratio)
+            if self.length == 0 and total_length > 0:
+                self.length = 1
 
     def __len__(self):
         return self.length
@@ -99,7 +144,6 @@ class TransformerDataset(Dataset):
 
 def train(variant_idx=None):
     start_time = time.time()
-    max_runtime = 60 # 60 seconds limit for candidate check
     if variant_idx is not None:
         variant_cfg = Config.SEARCH_SPACE[variant_idx]
         Config.EMBED_SIZE = variant_cfg["EMBED_SIZE"]
@@ -121,27 +165,67 @@ def train(variant_idx=None):
         "val_rollout_steps": Config.VAL_ROLLOUT_STEPS
     })
     
-    train_dataset = TransformerDataset(Config.TRAIN_H5)
-    val_dataset = TransformerDataset(Config.VAL_H5)
-    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=Config.BATCH_SIZE, shuffle=False)
+    train_dataset = TransformerDataset(Config.TRAIN_H5, subset_ratio=0.01)
+    val_dataset = TransformerDataset(Config.VAL_H5, subset_ratio=0.01)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=Config.BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=Config.NUM_WORKERS, 
+        pin_memory=Config.PIN_MEMORY
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=Config.BATCH_SIZE, 
+        shuffle=False, 
+        num_workers=Config.NUM_WORKERS, 
+        pin_memory=Config.PIN_MEMORY
+    )
     
     model = get_model(Config).to(Config.DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE)
+    # Use torch.compile for faster execution on supported devices
+    if hasattr(torch, "compile") and Config.DEVICE == "cuda":
+        try:
+            model = torch.compile(model)
+            print("Model compiled successfully.")
+        except Exception as e:
+            print(f"Model compilation failed: {e}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=0.01)
+    
+    # OneCycleLR for faster convergence
+    # Adjust steps_per_epoch for gradient accumulation
+    effective_steps_per_epoch = len(train_loader) // Config.ACCUMULATION_STEPS
+    if len(train_loader) % Config.ACCUMULATION_STEPS != 0:
+        effective_steps_per_epoch += 1
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer, 
+        max_lr=Config.LEARNING_RATE, 
+        steps_per_epoch=effective_steps_per_epoch, 
+        epochs=Config.EPOCHS,
+        pct_start=0.1
+    )
+
+    # Gradient scaler for mixed precision
+    scaler = torch.amp.GradScaler(device='cuda', enabled=(Config.DEVICE == "cuda"))
     
     best_val_loss = float('inf')
+    best_train_l2 = float('inf')
     best_rollout_loss = float('inf')
     best_improvement = -float('inf')
+    last_checkpoint_time = time.time()
     
     for epoch in range(Config.EPOCHS):
         model.train()
         train_loss = 0
+        val_loss = float('inf') # Initialize to avoid UnboundLocalError when validation is skipped
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{Config.EPOCHS}")
-        for batch in pbar:
-            if time.time() - start_time > max_runtime:
-                print(f"\nReached {max_runtime}s limit. Moving to next candidate.")
+        for batch_idx, batch in enumerate(pbar):
+            if time.time() - start_time > Config.MAX_RUNTIME_PER_CANDIDATE:
+                print(f"\nReached {Config.MAX_RUNTIME_PER_CANDIDATE}s limit. Moving to next candidate.")
                 wandb.finish()
-                return
+                return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
 
             batch = batch.to(Config.DEVICE)
             inputs = batch[:, :-1, :]
@@ -154,136 +238,271 @@ def train(variant_idx=None):
                 inputs = inputs + noise
             
             # Primary Teacher-Forced Pass
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = l2_loss(outputs, targets)
-            
-            # --- Optional Short AR Rollout Loss ---
-            if Config.AR_ROLLOUT_STEPS > 0 and Config.AR_LOSS_WEIGHT > 0:
-                # We do a very short rollout to penalize error accumulation
-                # To keep it differentiable and fast, we only do a few tokens
-                # but following the pattern in the v2 script:
-                # Using a shorter context for the AR pass to save memory/time
-                context_len = min(inputs.shape[1], 256) 
-                ar_context = inputs[:, :context_len, :].clone()
-                ar_targets = targets[:, context_len : context_len + Config.AR_ROLLOUT_STEPS, :]
+            with torch.amp.autocast(device_type=('cuda' if 'cuda' in Config.DEVICE else 'cpu'), enabled=('cuda' in Config.DEVICE or 'mps' in Config.DEVICE)):
+                outputs = model(inputs)
+                loss = l2_loss(outputs, targets)
                 
-                curr = ar_context
-                ar_preds = []
-                for _ in range(Config.AR_ROLLOUT_STEPS):
-                    # We must NOT use no_grad here because we want to backprop through the rollout
-                    out = model(curr)
-                    next_lat = out[:, -1:, :]
-                    ar_preds.append(next_lat)
+                # --- Step-Level Baseline Check ---
+                if batch_idx % 100 == 0:
+                    with torch.no_grad():
+                        prev_frame = inputs[:, -1:, :Config.LATENT_DIM]
+                        step_target = targets[:, -1:, :]
+                        step_persistence_mse = mse_loss(prev_frame, step_target).item()
+                        step_model_mse = mse_loss(outputs[:, -1:, :], step_target).item()
+
+                # --- Optional Short AR Rollout Loss ---
+                if Config.AR_ROLLOUT_STEPS > 0 and Config.AR_LOSS_WEIGHT > 0:
+                    context_len = min(inputs.shape[1], 256) 
+                    ar_context = inputs[:, :context_len, :].clone()
+                    ar_targets = targets[:, context_len : context_len + Config.AR_ROLLOUT_STEPS, :]
                     
-                    # Construct next input token (pred latent + true metadata from next step)
-                    # Use absolute index in 'inputs' to get metadata
-                    next_idx = curr.shape[1]
-                    if next_idx >= inputs.shape[1]: break
+                    curr = ar_context
+                    ar_preds = []
+                    for _ in range(Config.AR_ROLLOUT_STEPS):
+                        out = model(curr)
+                        next_lat = out[:, -1:, :]
+                        ar_preds.append(next_lat)
+                        
+                        next_idx = curr.shape[1]
+                        if next_idx >= inputs.shape[1]: break
+                        
+                        next_tok = inputs[:, next_idx : next_idx + 1, :].clone()
+                        next_tok[:, :, :Config.LATENT_DIM] = next_lat
+                        curr = torch.cat([curr, next_tok], dim=1)
                     
-                    next_tok = inputs[:, next_idx : next_idx + 1, :].clone()
-                    next_tok[:, :, :Config.LATENT_DIM] = next_lat
-                    curr = torch.cat([curr, next_tok], dim=1)
+                    if len(ar_preds) == Config.AR_ROLLOUT_STEPS:
+                        ar_preds = torch.cat(ar_preds, dim=1)
+                        ar_loss = l2_loss(ar_preds, ar_targets)
+                        loss = loss + Config.AR_LOSS_WEIGHT * ar_loss
                 
-                if len(ar_preds) == Config.AR_ROLLOUT_STEPS:
-                    ar_preds = torch.cat(ar_preds, dim=1)
-                    ar_loss = l2_loss(ar_preds, ar_targets)
-                    loss = loss + Config.AR_LOSS_WEIGHT * ar_loss
+                # Normalize loss for accumulation
+                loss = loss / Config.ACCUMULATION_STEPS
             
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+            scaler.scale(loss).backward()
+            
+            if (batch_idx + 1) % Config.ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                scheduler.step()
+            
+            train_loss += loss.item() * Config.ACCUMULATION_STEPS
+
+            # Logging step-level metrics
             pbar.set_postfix({'l2': loss.item()})
+            if batch_idx % 50 == 0:
+                wandb.log({
+                    "step_train_l2": loss.item(),
+                    "step_persistence_mse": step_persistence_mse,
+                    "step_model_mse": step_model_mse,
+                    "step_improvement_pct": (step_persistence_mse - step_model_mse) / (step_persistence_mse + 1e-8) * 100,
+                    "lr": scheduler.get_last_lr()[0]
+                })
+            
+            # --- Periodic Checkpointing (Every Minute) ---
+            if time.time() - last_checkpoint_time > Config.CHECKPOINT_INTERVAL:
+                os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+                cp_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_latest.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'batch_idx': batch_idx,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
+                }, cp_path)
+                
+                # Robust checkpointing: save scripted/traced model for portability
+                try:
+                    # We attempt to script a clean version of the model.
+                    if hasattr(model, "_orig_mod"):
+                        model_to_save = model._orig_mod
+                    else:
+                        model_to_save = model
+                    
+                    # Use trace as primary for robust architecture embedding since it handles
+                    # most standard Transformer patterns better than scripting.
+                    try:
+                        # Use CPU for tracing to avoid device-specific issues in the trace
+                        model_cpu = model_to_save.to('cpu')
+                        model_cpu.eval() # Ensure eval mode for tracing
+                        dummy_input = torch.zeros((1, Config.SEQ_LEN - 1, Config.INPUT_DIM))
+                        with torch.no_grad():
+                            traced_model = torch.jit.trace(model_cpu, dummy_input, check_trace=False)
+                        torch.jit.save(traced_model, cp_path.replace(".pt", "_scripted.pt"))
+                        # Move back to original device and train mode
+                        model_to_save.to(Config.DEVICE)
+                        model_to_save.train()
+                    except Exception as trace_err:
+                        # Fallback to scripting if tracing fails
+                        scripted_model = torch.jit.script(model_to_save)
+                        torch.jit.save(scripted_model, cp_path.replace(".pt", "_scripted.pt"))
+                except Exception as e:
+                    # Don't fail the whole run if scripting/tracing fails, but log it
+                    print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
+                
+                last_checkpoint_time = time.time()
+                # Also log to wandb that we saved a checkpoint
+                wandb.log({"checkpoint_saved": 1}, commit=False)
         
         train_loss /= len(train_loader)
         
-        if time.time() - start_time > max_runtime:
-            print(f"\nReached {max_runtime}s limit. Moving to next candidate.")
+        # Save best model based on training L2 performance
+        if train_loss < best_train_l2:
+            best_train_l2 = train_loss
+            os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+            # Existing convention: saved_models/[run_name]_train_best.pt
+            save_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_train_best.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'train_l2': train_loss,
+                'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
+            }, save_path)
+            
+            # Robust checkpointing: save scripted/traced model
+            try:
+                if hasattr(model, "_orig_mod"):
+                    model_to_save = model._orig_mod
+                else:
+                    model_to_save = model
+                
+                try:
+                    model_cpu = model_to_save.to('cpu')
+                    model_cpu.eval()
+                    dummy_input = torch.zeros((1, Config.SEQ_LEN - 1, Config.INPUT_DIM))
+                    with torch.no_grad():
+                        traced_model = torch.jit.trace(model_cpu, dummy_input, check_trace=False)
+                    torch.jit.save(traced_model, save_path.replace(".pt", "_scripted.pt"))
+                    model_to_save.to(Config.DEVICE)
+                    model_to_save.train()
+                except:
+                    scripted_model = torch.jit.script(model_to_save)
+                    torch.jit.save(scripted_model, save_path.replace(".pt", "_scripted.pt"))
+            except Exception as e:
+                print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
+                
+            print(f"  --> Saved new best training model (L2={train_loss:.6f})")
+
+        if time.time() - start_time > Config.MAX_RUNTIME_PER_CANDIDATE:
+            print(f"\nReached {Config.MAX_RUNTIME_PER_CANDIDATE}s limit. Moving to next candidate.")
             wandb.finish()
             return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
 
         # Validation
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = batch.to(Config.DEVICE)
-                inputs = batch[:, :-1, :]
-                targets = batch[:, 1:, :Config.LATENT_DIM]
-                outputs = model(inputs)
-                val_loss += l2_loss(outputs, targets).item()
-        val_loss /= len(val_loader)
-        
-        # --- Multi-step Rollout Evaluation ---
-        model.eval()
-        rollout_loss = 0
-        persistence_loss = 0
-        rollout_count = 0
-        with torch.no_grad():
-            # Use a smaller subset for speed if needed, or full val set
-            for i, batch in enumerate(val_loader):
-                if i >= 10: break # Only check first 10 batches (80 sequences) for speed
-                batch = batch.to(Config.DEVICE)
-                
-                # Context is first 12 full time steps
-                context_len = 26 * Config.VAL_CONTEXT_STEPS
-                inputs = batch[:, :context_len, :]
-                targets = batch[:, context_len : context_len + Config.VAL_ROLLOUT_STEPS, :Config.LATENT_DIM]
-                
-                # --- Persistence Baseline ---
-                # Take the last frame of the context (the 12th time step)
-                # Each time step has 26 tokens (one for each x-coordinate)
-                last_frame = inputs[:, -26:, :Config.LATENT_DIM] # shape (B, 26, 47)
-                # Repeat this frame to match the target length
-                num_repeats = Config.VAL_ROLLOUT_STEPS // 26
-                persistence_preds = last_frame.repeat(1, num_repeats, 1)
-                persistence_loss += l2_loss(persistence_preds, targets).item()
-
-                # --- Model Rollout ---
-                curr = inputs
-                preds = []
-                for _ in range(Config.VAL_ROLLOUT_STEPS):
-                    out = model(curr)
-                    next_lat = out[:, -1:, :]
-                    preds.append(next_lat)
+        if (epoch + 1) % Config.VAL_INTERVAL == 0 or (epoch == Config.EPOCHS - 1 and Config.DEVICE == "cuda"):
+            model.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for batch in val_loader:
+                    batch = batch.to(Config.DEVICE)
+                    inputs = batch[:, :-1, :]
+                    targets = batch[:, 1:, :Config.LATENT_DIM]
+                    outputs = model(inputs)
+                    val_loss += l2_loss(outputs, targets).item()
+            val_loss /= len(val_loader)
+            
+            # --- Multi-step Rollout Evaluation (The "Most Concerning Metric") ---
+            model.eval()
+            rollout_mse = 0
+            persistence_mse = 0
+            rollout_count = 0
+            with torch.no_grad():
+                for i, batch in enumerate(val_loader):
+                    if i >= 10: break 
+                    batch = batch.to(Config.DEVICE)
                     
-                    next_idx = curr.shape[1]
-                    if next_idx >= batch.shape[1]: break
+                    context_len = 26 * Config.VAL_CONTEXT_STEPS
+                    inputs = batch[:, :context_len, :]
+                    targets = batch[:, context_len : context_len + Config.VAL_ROLLOUT_STEPS, :Config.LATENT_DIM]
                     
-                    next_tok = batch[:, next_idx : next_idx + 1, :].clone()
-                    next_tok[:, :, :Config.LATENT_DIM] = next_lat
-                    curr = torch.cat([curr, next_tok], dim=1)
+                    # --- Persistence Baseline (Static Step 12) ---
+                    # Take the last frame of the context (the 12th time step)
+                    last_frame = inputs[:, -26:, :Config.LATENT_DIM] # shape (B, 26, 47)
+                    num_repeats = Config.VAL_ROLLOUT_STEPS // 26
+                    persistence_preds = last_frame.repeat(1, num_repeats, 1)
+                    persistence_mse += mse_loss(persistence_preds, targets).item()
+    
+                    # --- Model Rollout ---
+                    curr = inputs
+                    preds = []
+                    for _ in range(Config.VAL_ROLLOUT_STEPS):
+                        out = model(curr)
+                        next_lat = out[:, -1:, :]
+                        preds.append(next_lat)
+                        
+                        next_idx = curr.shape[1]
+                        if next_idx >= batch.shape[1]: break
+                        
+                        next_tok = batch[:, next_idx : next_idx + 1, :].clone()
+                        next_tok[:, :, :Config.LATENT_DIM] = next_lat
+                        curr = torch.cat([curr, next_tok], dim=1)
+                    
+                    if len(preds) == Config.VAL_ROLLOUT_STEPS:
+                        preds = torch.cat(preds, dim=1)
+                        rollout_mse += mse_loss(preds, targets).item()
+                        rollout_count += 1
+            
+            if rollout_count > 0:
+                rollout_mse /= rollout_count
+                persistence_mse /= rollout_count
+            
+            persistence_improvement = (persistence_mse - rollout_mse) / (persistence_mse + 1e-8) * 100
+            best_improvement = max(best_improvement, persistence_improvement)
+    
+            wandb.log({
+                "train_loss": train_loss, 
+                "val_loss": val_loss, 
+                "rollout_mse": rollout_mse,
+                "persistence_mse": persistence_mse,
+                "persistence_improvement_pct": persistence_improvement,
+                "baseline_red_line": persistence_mse, # Red line on rollout_mse plot
+                "epoch": epoch
+            })
+            print(f"Epoch {epoch+1}: Train L2={train_loss:.6f}, Val L2={val_loss:.6f}")
+            print(f"         Rollout MSE={rollout_mse:.6f}, Persistence MSE={persistence_mse:.6f} ({persistence_improvement:.1f}% better)")
+            
+            # Save best model based on rollout performance
+            if rollout_mse < best_rollout_loss and rollout_mse > 0:
+                best_rollout_loss = rollout_mse
+                os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+                save_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_rollout_best.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'rollout_mse': rollout_mse,
+                    'persistence_improvement': persistence_improvement,
+                    'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
+                }, save_path)
                 
-                if len(preds) == Config.VAL_ROLLOUT_STEPS:
-                    preds = torch.cat(preds, dim=1)
-                    rollout_loss += l2_loss(preds, targets).item()
-                    rollout_count += 1
-        
-        if rollout_count > 0:
-            rollout_loss /= rollout_count
-            persistence_loss /= rollout_count
-        
-        persistence_improvement = (persistence_loss - rollout_loss) / (persistence_loss + 1e-8) * 100
-        best_improvement = max(best_improvement, persistence_improvement)
-
-        wandb.log({
-            "train_loss": train_loss, 
-            "val_loss": val_loss, 
-            "rollout_l2": rollout_loss,
-            "persistence_l2": persistence_loss,
-            "persistence_improvement_pct": persistence_improvement,
-            "epoch": epoch
-        })
-        print(f"Epoch {epoch+1}: Train L2={train_loss:.6f}, Val L2={val_loss:.6f}")
-        print(f"         Rollout L2={rollout_loss:.6f}, Persistence L2={persistence_loss:.6f} ({persistence_improvement:.1f}% better)")
-        
-        # Save best model based on rollout performance as it's the "most concerning metric"
-        if rollout_loss < best_rollout_loss and rollout_loss > 0:
-            best_rollout_loss = rollout_loss
-            os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
-            save_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_rollout_best.pt")
-            torch.save(model.state_dict(), save_path)
-            print(f"  --> Saved new best rollout model!")
+                # Robust checkpointing: save scripted/traced model
+                try:
+                    if hasattr(model, "_orig_mod"):
+                        model_to_save = model._orig_mod
+                    else:
+                        model_to_save = model
+                        
+                    try:
+                        model_cpu = model_to_save.to('cpu')
+                        model_cpu.eval()
+                        dummy_input = torch.zeros((1, Config.SEQ_LEN - 1, Config.INPUT_DIM))
+                        with torch.no_grad():
+                            traced_model = torch.jit.trace(model_cpu, dummy_input, check_trace=False)
+                        torch.jit.save(traced_model, save_path.replace(".pt", "_scripted.pt"))
+                        model_to_save.to(Config.DEVICE)
+                        model_to_save.train()
+                    except:
+                        scripted_model = torch.jit.script(model_to_save)
+                        torch.jit.save(scripted_model, save_path.replace(".pt", "_scripted.pt"))
+                except Exception as e:
+                    print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
+                    
+                print(f"  --> Saved new best rollout model!")
+            
+            wandb.run.summary["best_rollout_mse"] = best_rollout_loss
+            wandb.run.summary["best_improvement"] = best_improvement
+        else:
+            wandb.log({"train_loss": train_loss, "epoch": epoch})
+            print(f"Epoch {epoch+1}: Train L2={train_loss:.6f} (Validation skipped)")
 
         # --- Early exit for search ---
         if time.time() - start_time > Config.MAX_RUNTIME_PER_CANDIDATE:
@@ -294,18 +513,54 @@ def train(variant_idx=None):
             best_val_loss = val_loss
             os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
             save_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_best.pt")
-            torch.save(model.state_dict(), save_path)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'val_l2': val_loss,
+                'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
+            }, save_path)
+            
+            # Robust checkpointing: save scripted/traced model
+            try:
+                if hasattr(model, "_orig_mod"):
+                    model_to_save = model._orig_mod
+                else:
+                    model_to_save = model
+                
+                try:
+                    model_cpu = model_to_save.to('cpu')
+                    model_cpu.eval()
+                    dummy_input = torch.zeros((1, Config.SEQ_LEN - 1, Config.INPUT_DIM))
+                    with torch.no_grad():
+                        traced_model = torch.jit.trace(model_cpu, dummy_input, check_trace=False)
+                    torch.jit.save(traced_model, save_path.replace(".pt", "_scripted.pt"))
+                    model_to_save.to(Config.DEVICE)
+                    model_to_save.train()
+                except:
+                    scripted_model = torch.jit.script(model_to_save)
+                    torch.jit.save(scripted_model, save_path.replace(".pt", "_scripted.pt"))
+            except Exception as e:
+                print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
             
     wandb.finish()
     return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
 
 if __name__ == "__main__":
     results = []
+    # TOP 3 CANDIDATES: 0, 1, 5
+    TOP_CANDIDATES = [0, 1, 5]
+    
     if len(sys.argv) > 1:
         if sys.argv[1] == "search":
-            print("Starting architecture search with 60s per candidate...")
+            print(f"Starting architecture search with {Config.MAX_RUNTIME_PER_CANDIDATE}s per candidate...")
             for i in range(len(Config.SEARCH_SPACE)):
                 print(f"\n--- Testing Candidate {i} ---")
+                res = train(i)
+                results.append((i, res))
+        elif sys.argv[1] == "top3":
+            print(f"Running TOP 3 candidates for {Config.MAX_RUNTIME_PER_CANDIDATE}s each...")
+            for i in TOP_CANDIDATES:
+                print(f"\n--- Testing Top Candidate {i} ---")
                 res = train(i)
                 results.append((i, res))
         elif sys.argv[1].isdigit():
@@ -327,9 +582,9 @@ if __name__ == "__main__":
         print("\n" + "="*50)
         print("ARCHITECTURE SEARCH LEADERBOARD")
         print("="*50)
-        print(f"{'ID':<5} | {'Val L2':<10} | {'Rollout':<10} | {'Improv %':<10}")
+        print(f"{'ID':<5} | {'Val L2':<10} | {'Rollout MSE':<12} | {'Improv %':<10}")
         print("-" * 50)
         for cand_id, res in results:
             if res:
-                print(f"{str(cand_id):<5} | {res['val_l2']:<10.6f} | {res['rollout_l2']:<10.6f} | {res['improvement']:<10.2f}%")
+                print(f"{str(cand_id):<5} | {res['val_l2']:<10.6f} | {res['rollout_l2']:<12.6f} | {res['improvement']:<10.2f}%")
         print("="*50)

@@ -50,7 +50,7 @@ class Config:
     EMBED_SIZE = 256
     N_HEADS = 8
     N_LAYERS = 6
-    DROPOUT = 0.1
+    DROPOUT = 0.01
     BIAS = True
     VARIANT = 'base' 
     
@@ -152,8 +152,13 @@ def train(variant_idx=None):
         Config.VARIANT = variant_cfg["VARIANT"]
     
     variant = Config.VARIANT
-    run_name = f"production_{variant}_E{Config.EMBED_SIZE}_L{Config.N_LAYERS}_{int(time.time())}"
-    wandb.init(project="transformer_neurIPS_production", name=run_name, config={
+    # Stable run name for resumption (excludes timestamp if searching or top3)
+    if variant_idx is not None:
+        run_name = f"production_{variant}_E{Config.EMBED_SIZE}_L{Config.N_LAYERS}"
+    else:
+        run_name = f"production_{variant}_E{Config.EMBED_SIZE}_L{Config.N_LAYERS}_{int(time.time())}"
+    
+    wandb.init(project="transformer_neurIPS_production", name=run_name, id=run_name, resume="allow", config={
         "variant": variant,
         "embed_size": Config.EMBED_SIZE,
         "n_layers": Config.N_LAYERS,
@@ -215,8 +220,25 @@ def train(variant_idx=None):
     best_rollout_loss = float('inf')
     best_improvement = -float('inf')
     last_checkpoint_time = time.time()
-    
-    for epoch in range(Config.EPOCHS):
+    start_epoch = 0
+
+    # --- Checkpoint Resumption ---
+    os.makedirs(Config.CHECKPOINT_DIR, exist_ok=True)
+    latest_cp_path = os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_latest.pt")
+    if os.path.exists(latest_cp_path):
+        print(f"Resuming from checkpoint: {latest_cp_path}")
+        try:
+            checkpoint = torch.load(latest_cp_path, map_location=Config.DEVICE)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            # We skip restoring batch_idx for simplicity in the epoch loop, 
+            # but we start from the next epoch to be safe or continue this one.
+            print(f"  -> Resuming from Epoch {start_epoch + 1}")
+        except Exception as e:
+            print(f"  -> Warning: Could not load checkpoint: {e}")
+
+    for epoch in range(start_epoch, Config.EPOCHS):
         model.train()
         train_loss = 0
         val_loss = float('inf') # Initialize to avoid UnboundLocalError when validation is skipped
@@ -382,6 +404,7 @@ def train(variant_idx=None):
                 print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
                 
             print(f"  --> Saved new best training model (L2={train_loss:.6f})")
+            print(f"\033[94m{save_path}\033[0m")
 
         if time.time() - start_time > Config.MAX_RUNTIME_PER_CANDIDATE:
             print(f"\nReached {Config.MAX_RUNTIME_PER_CANDIDATE}s limit. Moving to next candidate.")
@@ -497,6 +520,7 @@ def train(variant_idx=None):
                     print(f"  Warning: Could not save robust (scripted/traced) model: {e}")
                     
                 print(f"  --> Saved new best rollout model!")
+                print(f"\033[94m{save_path}\033[0m")
             
             wandb.run.summary["best_rollout_mse"] = best_rollout_loss
             wandb.run.summary["best_improvement"] = best_improvement
@@ -519,6 +543,8 @@ def train(variant_idx=None):
                 'val_l2': val_loss,
                 'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
             }, save_path)
+            print(f"  --> Saved new best validation model (L2={val_loss:.6f})")
+            print(f"\033[94m{save_path}\033[0m")
             
             # Robust checkpointing: save scripted/traced model
             try:

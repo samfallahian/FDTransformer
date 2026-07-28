@@ -6,12 +6,13 @@ from tqdm import tqdm
 import time
 import random
 import sys
+import argparse
 from concurrent.futures import ProcessPoolExecutor
 from collections import Counter
 
 # Paths
 PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-SOURCE_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data"
+SOURCE_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "transformer_neurIPS/data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -20,7 +21,7 @@ NUM_TIME_NEW = 40
 TOTAL_TIMESTAMPS = 1200
 WINDOWS_PER_COORD = TOTAL_TIMESTAMPS // NUM_TIME_NEW # 30
 NUM_X = 26
-X_COORDS = np.linspace(-30, 30, NUM_X)
+X_COORDS = np.array([-29, -26, -22, -18, -14, -10, -6, -2, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69], dtype='float32')
 
 # 24 unique wake coordinates identified from documentation
 WAKE_COORDS = [
@@ -46,7 +47,9 @@ def extract_from_file(args):
     
     try:
         df = pd.read_pickle(f_path, compression='gzip')
-        latent_cols = df.columns.tolist()[10:57]
+        latent_cols = [c for c in df.columns if 'latent' in c.lower()]
+        if not latent_cols:
+             raise ValueError(f"No 'latent' columns found in {f_path}")
         
         results = {}
         # Pre-filter dataframe for all requested coordinates at once to speed up lookups
@@ -64,11 +67,12 @@ def extract_from_file(args):
             lats = np.nan_to_num(rows[latent_cols].values)
             
             # Stack features: latents(47), x(1), y(1), z(1), t_idx(placeholder), param(1)
+            # Coordinates y and z are stored as int32
             extracted = np.column_stack([
-                lats, 
+                lats.astype('float32'), 
                 rows['x'].values.astype('float32'),
-                np.full(NUM_X, y_val, dtype='float32'),
-                np.full(NUM_X, z_val, dtype='float32'),
+                np.full(NUM_X, y_val, dtype='int32'),
+                np.full(NUM_X, z_val, dtype='int32'),
                 np.zeros(NUM_X, dtype='float32'), # t_idx placeholder
                 np.full(NUM_X, param_val, dtype='float32')
             ])
@@ -78,33 +82,71 @@ def extract_from_file(args):
         # print(f"Error processing {f_path}: {e}")
         return None
 
-def process_set(param_list, out_name, selected_wake_coords):
+def process_set(param_list, out_name, selected_wake_coords, sample_percent=100.0, test_mode=False):
     print(f"\n🚀 Building {out_name}...")
     
     # 1. Determine all unique coordinates needed per parameter set
     param_to_coords = {ps: set() for ps in param_list}
     wake_plans = []
-    for ps in param_list:
-        for y, z in selected_wake_coords:
+    
+    if test_mode:
+        print("Running in TEST MODE: only first sequence for each experiment.")
+        for ps in param_list:
+            y, z = selected_wake_coords[0]
+            start_step = 1
+            wake_plans.append((ps, y, z, start_step, True))
             param_to_coords[ps].add((y, z))
-            for w_idx in range(WINDOWS_PER_COORD):
-                start_step = w_idx * NUM_TIME_NEW + 1
-                wake_plans.append((ps, y, z, start_step, True))
+    else:
+        for ps in param_list:
+            for y, z in selected_wake_coords:
+                param_to_coords[ps].add((y, z))
+                for w_idx in range(WINDOWS_PER_COORD):
+                    start_step = w_idx * NUM_TIME_NEW + 1
+                    wake_plans.append((ps, y, z, start_step, True))
+
+        if sample_percent < 100.0:
+            sample_size = max(1, int(len(wake_plans) * (sample_percent / 100.0)))
+            print(f"Sampling {sample_percent}% of wake sequences ({sample_size}/{len(wake_plans)})")
+            wake_plans = random.sample(wake_plans, sample_size)
+            # Re-evaluate which coordinates we actually need
+            param_to_coords = {ps: set() for ps in param_list}
+            for ps, y, z, _, _ in wake_plans:
+                param_to_coords[ps].add((y, z))
 
     num_wake_plans = len(wake_plans)
     
     # Generate random plans 1-for-1
     random_plans = []
-    random.seed(42)
-    while len(random_plans) < num_wake_plans:
-        ps = random.choice(param_list)
-        y = random.choice(np.arange(-80, 81, 4))
-        z = random.choice(np.arange(-80, 81, 4))
-        if (y, z) in WAKE_COORDS: continue
-        w_idx = random.randint(0, WINDOWS_PER_COORD - 1)
-        start_step = w_idx * NUM_TIME_NEW + 1
-        random_plans.append((ps, y, z, start_step, False))
-        param_to_coords[ps].add((y, z))
+    if not test_mode:
+        random.seed(42)
+        
+        # Get range of y and z from a sample file if possible, else use default
+        sample_ps = param_list[0]
+        sample_file = get_file_path(sample_ps, 1)
+        if os.path.exists(sample_file):
+            try:
+                sdf = pd.read_pickle(sample_file, compression='gzip')
+                y_min, y_max = int(sdf['y'].min()), int(sdf['y'].max())
+                z_min, z_max = int(sdf['z'].min()), int(sdf['z'].max())
+                y_range = np.arange(y_min, y_max + 1, 4)
+                z_range = np.arange(z_min, z_max + 1, 4)
+                print(f"Random sampling from y:[{y_min}, {y_max}], z:[{z_min}, {z_max}]")
+            except:
+                y_range = np.arange(-80, 81, 4)
+                z_range = np.arange(-80, 81, 4)
+        else:
+            y_range = np.arange(-80, 81, 4)
+            z_range = np.arange(-80, 81, 4)
+
+        while len(random_plans) < num_wake_plans:
+            ps = random.choice(param_list)
+            y = random.choice(y_range)
+            z = random.choice(z_range)
+            if (y, z) in WAKE_COORDS: continue
+            w_idx = random.randint(0, WINDOWS_PER_COORD - 1)
+            start_step = w_idx * NUM_TIME_NEW + 1
+            random_plans.append((ps, y, z, start_step, False))
+            param_to_coords[ps].add((y, z))
 
     print(f"Planned {num_wake_plans} wake sequences and {len(random_plans)} random sequences.")
     
@@ -116,7 +158,13 @@ def process_set(param_list, out_name, selected_wake_coords):
         param_val = parse_param(ps)
         
         tasks = []
-        for step in range(1, TOTAL_TIMESTAMPS + 1):
+        if test_mode:
+            # In test mode, we only need steps for the first sequence (1 to NUM_TIME_NEW)
+            steps_needed = range(1, NUM_TIME_NEW + 1)
+        else:
+            steps_needed = range(1, TOTAL_TIMESTAMPS + 1)
+
+        for step in steps_needed:
             f_path = get_file_path(ps, step)
             tasks.append((f_path, coords, param_val))
         
@@ -124,7 +172,7 @@ def process_set(param_list, out_name, selected_wake_coords):
             results = list(tqdm(executor.map(extract_from_file, tasks), total=len(tasks), desc=f"Reading {ps} once"))
         
         for step_idx, step_results in enumerate(results):
-            step = step_idx + 1
+            step = steps_needed[step_idx]
             if step_results is None:
                 continue
             for (y, z), data in step_results.items():
@@ -146,9 +194,17 @@ def process_set(param_list, out_name, selected_wake_coords):
             step = start_step + t_offset
             data = all_extracted_data.get((ps, y_val, z_val, step))
             if data is None:
+                # print(f"Skipping sequence {ps} at ({y_val}, {z_val}) step {step}: Missing data.")
                 valid_seq = False
                 break
             
+            # Check for non-trivial data (not just zeros in latent dimensions)
+            # Latents are columns 0:47
+            if np.all(data[:, :47] == 0):
+                print(f"Skipping sequence {ps} at ({y_val}, {z_val}) step {step}: All-zero latents found.")
+                valid_seq = False
+                break
+
             step_data = data.copy()
             step_data[:, 50] = float(t_offset)
             seq[t_offset] = step_data
@@ -166,9 +222,15 @@ def process_set(param_list, out_name, selected_wake_coords):
     print(f"Saving to {out_name}...")
     with h5py.File(os.path.join(OUTPUT_DIR, out_name), 'w') as f_out:
         f_out.create_dataset('data', data=np.array(final_data), compression='gzip')
+        # Add metadata
+        f_out.attrs['source_root'] = SOURCE_ROOT
+        f_out.attrs['sample_percent'] = sample_percent
+        f_out.attrs['num_sequences'] = len(final_data)
+        f_out.attrs['creation_time'] = time.ctime()
+        f_out.attrs['param_list'] = [p.encode('utf-8') for p in param_list]
     print(f"Final {out_name} size: {len(final_data)} sequences.")
 
-def prepare_data():
+def prepare_data(sample_percent=100.0, test_mode=False):
     t0 = time.time()
     
     # Use all 24 wake coordinates for 100% coverage as requested
@@ -178,10 +240,14 @@ def prepare_data():
     train_params = ["3p6", "4p4", "4p6", "5p2", "6p6", "7p2", "7p8", "8p4", "10p4", "11p4"]
     val_params = ["6p4"]
 
-    process_set(train_params, "train_40.h5", selected_wake_coords)
-    process_set(val_params, "val_40.h5", selected_wake_coords)
+    process_set(train_params, "train_40.h5", selected_wake_coords, sample_percent, test_mode)
+    process_set(val_params, "val_40.h5", selected_wake_coords, sample_percent, test_mode)
     
     print(f"\n✅ Total time: {time.time()-t0:.2f}s")
 
 if __name__ == "__main__":
-    prepare_data()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample", type=float, default=100.0, help="Percentage of data to sample (0-100)")
+    parser.add_argument("--test", action="store_true", help="Test mode: only first sequence for each experiment")
+    args = parser.parse_args()
+    prepare_data(args.sample, args.test)

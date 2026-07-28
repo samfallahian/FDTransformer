@@ -7,7 +7,17 @@ import glob
 import sys
 
 # Add project root to path to allow imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+current_file_path = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))
+print(f"DEBUG: __file__ = {__file__}")
+print(f"DEBUG: abspath(__file__) = {current_file_path}")
+print(f"DEBUG: project_root = {project_root}")
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+    print(f"DEBUG: Inserted {project_root} to sys.path")
+
+print(f"DEBUG: sys.path = {sys.path}")
 
 from transformer_neurIPS.train_production_transformer import Config, TransformerDataset, mse_loss, l2_loss
 from transformer_neurIPS.model_variants import get_model

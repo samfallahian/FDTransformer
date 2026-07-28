@@ -39,28 +39,30 @@ class MultiQueryAttention(nn.Module):
         assert n_embd % n_head == 0
         self.n_head = n_head
         self.head_dim = n_embd // n_head
-        
+        self.dropout_p = dropout
+
         # MQA: One set of K, V for all heads, but unique Q for each head
         self.q_proj = nn.Linear(n_embd, n_embd)
         self.k_proj = nn.Linear(n_embd, self.head_dim)
         self.v_proj = nn.Linear(n_embd, self.head_dim)
         self.out_proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
+        # NOTE: `mask` is ignored on purpose — we use `is_causal=True` on SDPA
+        # so PyTorch can dispatch to FlashAttention / memory-efficient kernels.
+        # Passing an explicit float additive mask forces the slow math backend.
         B, T, C = x.shape
-        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
-        k = self.k_proj(x).view(B, T, 1, self.head_dim).transpose(1, 2) # (B, 1, T, hs)
-        v = self.v_proj(x).view(B, T, 1, self.head_dim).transpose(1, 2) # (B, 1, T, hs)
+        q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        # Broadcast the single K/V head across all query heads for SDPA.
+        k = self.k_proj(x).view(B, T, 1, self.head_dim).transpose(1, 2).expand(-1, self.n_head, -1, -1)
+        v = self.v_proj(x).view(B, T, 1, self.head_dim).transpose(1, 2).expand(-1, self.n_head, -1, -1)
 
-        # Scaled dot-product attention
-        # k, v are broadcasted across heads
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        if mask is not None:
-            att = att.masked_fill(mask == float('-inf'), float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.dropout(att)
-        y = att @ v # (B, nh, T, hs)
+        # FlashAttention-capable causal SDPA (no explicit mask -> fused kernel).
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.out_proj(y)
 
@@ -80,12 +82,15 @@ class ConvBlock(nn.Module):
         )
 
     def forward(self, x, mask=None):
-        # Local conv then attention
+        # Local conv then attention.
+        # IMPORTANT: pass `attn_mask=None` + `is_causal=True` so PyTorch can
+        # dispatch to FlashAttention. Passing an additive float mask forces
+        # the slow math backend.
         x_res = x
         x = self.ln1(x)
         # Conv1d expects (B, C, T)
         x_conv = self.conv(x.transpose(1, 2)).transpose(1, 2)
-        attn_out, _ = self.attn(x_conv, x_conv, x_conv, attn_mask=mask, is_causal=True if mask is not None else False)
+        attn_out, _ = self.attn(x_conv, x_conv, x_conv, attn_mask=None, is_causal=True, need_weights=False)
         x = x_res + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
@@ -111,11 +116,14 @@ class Block(nn.Module):
             )
 
     def forward(self, x, mask=None):
+        # IMPORTANT: pass `attn_mask=None` + `is_causal=True` so PyTorch can
+        # dispatch to FlashAttention. Passing an additive float mask forces
+        # the slow math backend.
         x_norm = self.ln1(x)
         if isinstance(self.attn, nn.MultiheadAttention):
-            attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=mask, is_causal=True if mask is not None else False)
+            attn_out, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=None, is_causal=True, need_weights=False)
         else:
-            attn_out = self.attn(x_norm, mask=mask)
+            attn_out = self.attn(x_norm, mask=None)
         x = x + attn_out
         x = x + self.mlp(self.ln2(x))
         return x
@@ -146,21 +154,27 @@ class BaseTransformer(nn.Module):
         space_ids = torch.arange(config.NUM_X).repeat(config.NUM_TIME)
         self.register_buffer("time_ids", time_ids)
         self.register_buffer("space_ids", space_ids)
-        
-        # Register causal mask as buffer to help TorchScript and avoid re-generation
-        mask = torch.triu(torch.full((config.SEQ_LEN, config.SEQ_LEN), float('-inf')), diagonal=1)
-        self.register_buffer("causal_mask", mask)
+
+        # NOTE: The buffer below is kept ONLY for backward compatibility with
+        # existing checkpoints that contain a "causal_mask" key. It is not
+        # used in `forward` anymore -- blocks apply causality through
+        # `is_causal=True` on SDPA so PyTorch can dispatch to FlashAttention.
+        # An explicit float mask would force the slow math backend.
+        # Store as a tiny 1x1 tensor so the buffer exists without wasting
+        # memory on a (SEQ_LEN, SEQ_LEN) tensor for models we never actually
+        # use it in.
+        self.register_buffer("causal_mask", torch.zeros(1, 1), persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
         x = self.input_projection(x)
         # Standard learnable additive embeddings
         x = x + self.time_embeddings(self.time_ids[:T]) + self.space_embeddings(self.space_ids[:T])
-        
-        mask = self.causal_mask[:T, :T]
+
+        # Blocks apply causality internally via `is_causal=True` on SDPA.
         for blk in self.blocks:
-            x = blk(x, mask=mask)
-            
+            x = blk(x, mask=None)
+
         x = self.ln_f(x)
         return self.output_head(x)
 

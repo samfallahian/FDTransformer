@@ -1,11 +1,11 @@
 """
-Formal documentation figures: r1_a3b_delta_ar_rollout_best.pt vs. persistence.
+Formal documentation figures: r1_a3b_delta_ar_best.pt vs. persistence.
 
-`tests/test_model_vs_baseline.py` (as currently defaulted, TX_MODELS =
-"r1_a3b_delta_ar_rollout_best.pt") answers PASS/FAIL: does the model beat
-persistence. This script produces the documentation-grade evidence behind
-that answer -- run once, remotely, on the GPU box (it is not a test and is
-not run in CI).
+This script targets exactly ONE checkpoint -- r1_a3b_delta_ar_best.pt (the
+best teacher-forced VAL checkpoint of that run, NOT the _rollout_best twin
+tests/test_model_vs_baseline.py defaults to). It produces the
+documentation-grade evidence behind a PASS/FAIL claim -- run once, remotely,
+on the GPU box (it is not a test and is not run in CI).
 
 WHAT "40-frame setup" MEANS HERE
 =================================
@@ -66,13 +66,13 @@ Outputs (under Documentation/persistence_formal/, created if missing):
 
 Tunable via environment variables (all optional):
     PFD_RUN              target run name                (default "r1_a3b_delta_ar")
-    PFD_KIND             target checkpoint kind          (default "rollout_best")
+    PFD_KIND             target checkpoint kind          (default "best")
     PFD_SUBSET_RATIO     val-set fraction to load        (default 0.2)
     PFD_SAMPLES          sequences to use, 0 = all loaded (default 0)
     PFD_HORIZON_FRAMES   comma list of horizon frames    (default "1,6,12,18,24,28")
     PFD_CONTEXT_MS       wall-clock ms the context spans (default 100.0)
     PFD_N_BOOTSTRAP      bootstrap resamples for the CI  (default 10000)
-    PFD_BATCH_SIZE       sequences per rollout batch     (default 32)
+    PFD_BATCH_SIZE       sequences per rollout batch     (default: 32 on cuda, 4 on mps/cpu)
     PFD_SEED             RNG seed (bootstrap only)       (default 0)
     PFD_OUT_DIR          output directory                (default Documentation/persistence_formal)
 """
@@ -120,6 +120,80 @@ METRICS = ("mae", "rmse", "l2")
 METRIC_LABELS = {"mae": "MAE", "rmse": "RMSE", "l2": "L2 (mean vector norm)"}
 
 
+# --- console color (ANSI) -----------------------------------------------------
+# Separate from the matplotlib palette above: this is terminal styling only,
+# never written into report.md/results_by_horizon.csv, which stay plain text.
+# Off automatically when stdout isn't a tty (piped to a log file) unless
+# PFD_FORCE_COLOR is set; off entirely with PFD_NO_COLOR or the NO_COLOR
+# convention (https://no-color.org/).
+_COLOR_ON = (
+    os.environ.get("PFD_NO_COLOR") is None
+    and os.environ.get("NO_COLOR") is None
+    and (sys.stdout.isatty() or os.environ.get("PFD_FORCE_COLOR") is not None)
+)
+
+_ANSI = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
+    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
+}
+_RAINBOW = ["red", "yellow", "green", "cyan", "blue", "magenta"]
+# Device -> a fitting single accent color when not rainbow-ing it letter by letter.
+_DEVICE_COLOR = {"cuda": "green", "mps": "magenta", "cpu": "yellow"}
+
+
+def _c(text, color):
+    if not _COLOR_ON:
+        return text
+    return f"{_ANSI[color]}{text}{_ANSI['reset']}"
+
+
+def _bold(text, color=None):
+    if not _COLOR_ON:
+        return text
+    prefix = _ANSI["bold"] + (_ANSI[color] if color else "")
+    return f"{prefix}{text}{_ANSI['reset']}"
+
+
+def _rainbow(text):
+    """Cycle non-whitespace characters through the rainbow palette."""
+    if not _COLOR_ON:
+        return text
+    out, i = [], 0
+    for ch in text:
+        if ch.strip():
+            out.append(f"{_ANSI[_RAINBOW[i % len(_RAINBOW)]]}{ch}")
+            i += 1
+        else:
+            out.append(ch)
+    out.append(_ANSI["reset"])
+    return "".join(out)
+
+
+def _banner(title):
+    line = "=" * (len(title) + 4)
+    print(_c(line, "cyan"))
+    print(_bold(f"  {title}", "cyan"))
+    print(_c(line, "cyan"))
+
+
+def _kv(label, value, color=None, width=20):
+    val = _c(str(value), color) if color else str(value)
+    print(f"{label:<{width}}: {val}")
+
+
+def _ok(msg):
+    print(_c(f"[OK] {msg}", "green"))
+
+
+def _warn(msg):
+    print(_c(f"[!!] {msg}", "yellow"))
+
+
+def _err(msg):
+    print(_bold(f"[XX] {msg}", "red"))
+
+
 def _env_int(name, default):
     raw = os.environ.get(name)
     if raw is None or raw.strip() == "":
@@ -135,20 +209,74 @@ def _env_float(name, default):
 
 
 PFD_RUN = os.environ.get("PFD_RUN", "r1_a3b_delta_ar")
-PFD_KIND = os.environ.get("PFD_KIND", "rollout_best")
+PFD_KIND = os.environ.get("PFD_KIND", "best")
 PFD_SUBSET_RATIO = _env_float("PFD_SUBSET_RATIO", 0.2)
 PFD_SAMPLES = _env_int("PFD_SAMPLES", 0)  # 0 = all loaded
 PFD_HORIZON_FRAMES = [int(x) for x in os.environ.get(
     "PFD_HORIZON_FRAMES", "1,6,12,18,24,28").split(",") if x.strip()]
 PFD_CONTEXT_MS = _env_float("PFD_CONTEXT_MS", 100.0)
 PFD_N_BOOTSTRAP = _env_int("PFD_N_BOOTSTRAP", 10000)
-PFD_BATCH_SIZE = _env_int("PFD_BATCH_SIZE", 32)
+# None = device-dependent default, resolved in main() once the device is known
+# (see resolve_batch_size): 32 on cuda, 4 on mps/cpu. The autoregressive
+# rollout grows its sequence length over `n_frames` internal steps, each a
+# different shape, and MPS's caching allocator cannot reuse blocks across
+# shapes -- so peak memory during ONE rollout call scales with batch size,
+# and 32 sequences is enough to blow past a Mac's MPS ceiling on the very
+# first batch (see the OOM this default used to hit: 88 GB allocated before
+# a 298 MB request tipped it over -- not "many batches accumulating", one
+# batch's internal growth).
+PFD_BATCH_SIZE = _env_int("PFD_BATCH_SIZE", 0) or None
 PFD_SEED = _env_int("PFD_SEED", 0)
 PFD_OUT_DIR = os.environ.get("PFD_OUT_DIR",
                               os.path.join(PROJECT_ROOT, "Documentation", "persistence_formal"))
 
 GROUPS = ("all", "wake", "random")
 GROUP_TITLES = {"all": "All sequences", "wake": "Wake-targeted", "random": "Random-location"}
+
+
+def pick_device():
+    """cuda > mps > cpu. Local (Mac) runs otherwise silently fall back to CPU
+    even with Apple-silicon GPU available, since torch.cuda.is_available() is
+    always False there."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def resolve_batch_size(device):
+    """PFD_BATCH_SIZE overrides; otherwise 32 on cuda, 4 on mps/cpu.
+
+    mps/cpu default is small on purpose: the autoregressive rollout's
+    sequence length grows every internal step, and MPS's caching allocator
+    cannot reuse a block once a new step needs a different shape, so peak
+    memory during a SINGLE rollout call scales with batch size. 32 was
+    enough to hit an OOM on the first batch on a Mac.
+    """
+    if PFD_BATCH_SIZE is not None:
+        return PFD_BATCH_SIZE
+    return 32 if device == "cuda" else 4
+
+
+def clear_device_cache(device):
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif device == "cuda":
+        torch.cuda.empty_cache()
+
+
+def device_memory_str(device):
+    """Best-effort current/peak allocation, for diagnosing OOMs like this one."""
+    if device == "mps":
+        cur = torch.mps.current_allocated_memory() / (1024 ** 3)
+        drv = torch.mps.driver_allocated_memory() / (1024 ** 3)
+        return f"mps allocated={cur:.2f} GiB, driver={drv:.2f} GiB"
+    if device == "cuda":
+        cur = torch.cuda.memory_allocated() / (1024 ** 3)
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        return f"cuda allocated={cur:.2f} GiB, peak={peak:.2f} GiB"
+    return None
 
 
 def bootstrap_ci(values, n_boot, ci, rng):
@@ -179,50 +307,68 @@ def label_wake_or_random(dataset, num_avail):
 
 
 def load_model():
+    _banner("Loading checkpoint")
     ckpt_name = f"{PFD_RUN}_{PFD_KIND}"
     ckpt_path = os.path.join(CHECKPOINT_DIR, f"{ckpt_name}.pt")
     if not os.path.exists(ckpt_path):
+        _err(f"{ckpt_path} not found.")
         raise SystemExit(
             f"{ckpt_path} not found. This script targets one specific "
             f"checkpoint on the remote GPU box; set PFD_RUN/PFD_KIND to "
             f"point elsewhere if you meant a different one.")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"device              : {device}")
-    print(f"checkpoint          : {ckpt_path}")
+    device = pick_device()
+    _kv("device", _rainbow(device.upper()))
+    _kv("checkpoint", ckpt_path)
 
     ckpt = load_checkpoint(ckpt_path)
     apply_checkpoint_config(ckpt)
     model = get_model(Config)
     state_dict, stripped = normalize_state_dict(ckpt["model_state_dict"])
     if stripped:
-        print(f"  stripped state-dict prefix(es): {stripped}")
+        _warn(f"stripped state-dict prefix(es): {stripped}")
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing = [k for k in incompatible.missing_keys if k not in BENIGN_MISSING_KEYS]
     if missing:
+        _err(f"{ckpt_name}: {len(missing)} missing key(s): {missing[:4]}")
         raise SystemExit(f"{ckpt_name}: {len(missing)} missing key(s), cannot be "
                           f"scored: {missing[:4]}")
     model.eval()
     model.to(device)
 
     probe = probe_causality(model, Config, device)
-    print(f"causal              : {'OK' if probe['causal'] else 'LEAK'} "
-          f"(past outputs moved {probe['max_change_before_cut']:.3e}, "
-          f"tolerance {probe['tolerance']:.3e})")
-    if not probe["causal"]:
+    if probe["causal"]:
+        _ok(f"causal (past outputs moved {probe['max_change_before_cut']:.3e}, "
+            f"tolerance {probe['tolerance']:.3e})")
+    else:
+        _err(f"CAUSALITY LEAK: past outputs moved {probe['max_change_before_cut']:.3e} "
+             f"(tolerance {probe['tolerance']:.3e})")
         raise SystemExit("Architecture leaks the future; every downstream metric "
                           "would be meaningless. Fix the leak before documenting it.")
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"architecture        : variant={getattr(Config, 'VARIANT', '?')} "
-          f"embed={getattr(Config, 'EMBED_SIZE', '?')} layers={getattr(Config, 'N_LAYERS', '?')} "
-          f"params={params_m:.2f}M epoch={ckpt.get('epoch')}")
+    _kv("architecture", f"variant={getattr(Config, 'VARIANT', '?')} "
+        f"embed={getattr(Config, 'EMBED_SIZE', '?')} layers={getattr(Config, 'N_LAYERS', '?')} "
+        f"params={params_m:.2f}M epoch={ckpt.get('epoch')}", color="cyan")
     return model, device, ckpt_name
 
 
-def run_rollouts(model, device, ae, converter, dataset, n_samples, num_x, latent_dim,
-                  context_steps, n_frames):
+def run_rollouts(model, device, ae, converter, data, n_samples, num_x, latent_dim,
+                  context_steps, n_frames, batch_size):
     """Full-horizon rollout for every sequence, batched for speed.
+
+    `data` must already be resident on `device` (see main(): the whole
+    validation subset is a few tens of MB, so it is moved once up front
+    rather than per-batch here -- repeated small host<->device transfers,
+    and worse, a `.cpu().numpy()` sync inside a per-frame/per-component
+    Python loop, were making this look "IO bound" the way disk reads used to
+    during training, except the stall was PCIe/Metal round-trips, not disk).
+
+    `batch_size` matters more than it looks: `rollout_frames` grows its
+    sequence length one step at a time internally (n_frames sequential
+    forward passes), and MPS's caching allocator cannot reuse a block once
+    the next step needs a different shape -- so peak memory during a SINGLE
+    batch's rollout call scales with batch_size. See resolve_batch_size().
 
     Returns a dict keyed by metric name ("mae", "rmse", "l2"), each value a
     dict with:
@@ -241,11 +387,12 @@ def run_rollouts(model, device, ae, converter, dataset, n_samples, num_x, latent
         "l2": dict(model=np.zeros((n_samples, n_frames)), pers=np.zeros((n_samples, n_frames))),
     }
 
+    _kv("batch size", batch_size, color="cyan")
     t0 = time.perf_counter()
     with torch.no_grad():
-        for start in range(0, n_samples, PFD_BATCH_SIZE):
-            end = min(start + PFD_BATCH_SIZE, n_samples)
-            batch = dataset.data[start:end].to(device)
+        for start in range(0, n_samples, batch_size):
+            end = min(start + batch_size, n_samples)
+            batch = data[start:end]  # already on `device` -- no per-batch transfer
 
             targets_latent = batch[:, context_len:context_len + n_frames * num_x, :latent_dim]
             last_frame = batch[:, context_len - num_x:context_len, :latent_dim]
@@ -259,42 +406,62 @@ def run_rollouts(model, device, ae, converter, dataset, n_samples, num_x, latent
             persistence_v = decode_latents_to_centroid(persistence_latent, ae, converter, device)
             preds_v = decode_latents_to_centroid(preds_latent, ae, converter, device)
 
-            for f in range(n_frames):
-                sl = slice(f * num_x, (f + 1) * num_x)
-                diff_m = preds_v[:, sl] - targets_v[:, sl]          # (B, 26, 3)
-                diff_p = persistence_v[:, sl] - targets_v[:, sl]
+            # Vectorized over ALL frames at once (B, n_frames, num_x, 3) --
+            # no Python loop over frames/components, so the GPU/MPS command
+            # queue runs the whole batch before the single sync at the end
+            # (the .cpu().numpy() calls below), instead of stalling on one
+            # every frame x metric x component.
+            preds_r = preds_v.reshape(B, n_frames, num_x, 3)
+            targets_r = targets_v.reshape(B, n_frames, num_x, 3)
+            pers_r = persistence_v.reshape(B, n_frames, num_x, 3)
 
-                metrics["mae"]["model"][start:end, f] = torch.mean(
-                    torch.abs(diff_m), dim=(1, 2)).cpu().numpy()
-                metrics["mae"]["pers"][start:end, f] = torch.mean(
-                    torch.abs(diff_p), dim=(1, 2)).cpu().numpy()
-                metrics["rmse"]["model"][start:end, f] = torch.sqrt(torch.mean(
-                    diff_m ** 2, dim=(1, 2))).cpu().numpy()
-                metrics["rmse"]["pers"][start:end, f] = torch.sqrt(torch.mean(
-                    diff_p ** 2, dim=(1, 2))).cpu().numpy()
-                # L2: per-coordinate Euclidean norm of the (vx, vy, vz) error,
-                # averaged over the 26 coords -- the trainer's own
-                # `l2_loss = mean(norm(diff, dim=-1))` geometry.
-                metrics["l2"]["model"][start:end, f] = torch.mean(
-                    torch.linalg.norm(diff_m, dim=2), dim=1).cpu().numpy()
-                metrics["l2"]["pers"][start:end, f] = torch.mean(
-                    torch.linalg.norm(diff_p, dim=2), dim=1).cpu().numpy()
+            diff_m = preds_r - targets_r      # (B, n_frames, num_x, 3)
+            diff_p = pers_r - targets_r
 
-                for c in range(3):
-                    metrics["mae"]["model_c"][start:end, f, c] = torch.mean(
-                        torch.abs(diff_m[:, :, c]), dim=1).cpu().numpy()
-                    metrics["mae"]["pers_c"][start:end, f, c] = torch.mean(
-                        torch.abs(diff_p[:, :, c]), dim=1).cpu().numpy()
-                    metrics["rmse"]["model_c"][start:end, f, c] = torch.sqrt(torch.mean(
-                        diff_m[:, :, c] ** 2, dim=1)).cpu().numpy()
-                    metrics["rmse"]["pers_c"][start:end, f, c] = torch.sqrt(torch.mean(
-                        diff_p[:, :, c] ** 2, dim=1)).cpu().numpy()
+            mae_m = diff_m.abs().mean(dim=(2, 3))                       # (B, n_frames)
+            mae_p = diff_p.abs().mean(dim=(2, 3))
+            rmse_m = torch.sqrt((diff_m ** 2).mean(dim=(2, 3)))
+            rmse_p = torch.sqrt((diff_p ** 2).mean(dim=(2, 3)))
+            # L2: per-coordinate Euclidean norm of the (vx, vy, vz) error,
+            # averaged over the 26 coords -- the trainer's own
+            # `l2_loss = mean(norm(diff, dim=-1))` geometry.
+            l2_m = torch.linalg.norm(diff_m, dim=3).mean(dim=2)         # (B, n_frames)
+            l2_p = torch.linalg.norm(diff_p, dim=3).mean(dim=2)
 
-            print(f"  rolled out sequences [{start}:{end}) of {n_samples}")
+            mae_c_m = diff_m.abs().mean(dim=2)                          # (B, n_frames, 3)
+            mae_c_p = diff_p.abs().mean(dim=2)
+            rmse_c_m = torch.sqrt((diff_m ** 2).mean(dim=2))
+            rmse_c_p = torch.sqrt((diff_p ** 2).mean(dim=2))
+
+            metrics["mae"]["model"][start:end] = mae_m.cpu().numpy()
+            metrics["mae"]["pers"][start:end] = mae_p.cpu().numpy()
+            metrics["rmse"]["model"][start:end] = rmse_m.cpu().numpy()
+            metrics["rmse"]["pers"][start:end] = rmse_p.cpu().numpy()
+            metrics["l2"]["model"][start:end] = l2_m.cpu().numpy()
+            metrics["l2"]["pers"][start:end] = l2_p.cpu().numpy()
+            metrics["mae"]["model_c"][start:end] = mae_c_m.cpu().numpy()
+            metrics["mae"]["pers_c"][start:end] = mae_c_p.cpu().numpy()
+            metrics["rmse"]["model_c"][start:end] = rmse_c_m.cpu().numpy()
+            metrics["rmse"]["pers_c"][start:end] = rmse_c_p.cpu().numpy()
+
+            # Release the batch's intermediate tensors back to the device
+            # allocator's free pool before the next (differently-shaped)
+            # batch starts -- otherwise MPS in particular tends to keep
+            # growing rather than reusing freed blocks across shapes.
+            del out, preds_latent, targets_v, persistence_v, preds_v
+            del preds_r, targets_r, pers_r, diff_m, diff_p
+            clear_device_cache(device)
+
+            pct = end / n_samples * 100
+            elapsed = time.perf_counter() - t0
+            mem = device_memory_str(device)
+            mem_suffix = f"  [{mem}]" if mem else ""
+            print(_c(f"  [{pct:5.1f}%] rolled out sequences [{start}:{end}) of {n_samples} "
+                      f"({elapsed:.1f}s elapsed){mem_suffix}", "dim"))
 
     total = time.perf_counter() - t0
-    print(f"rollout wall-clock  : {total:.1f}s for {n_samples} sequences "
-          f"({total / n_samples:.3f}s/sequence avg)")
+    _ok(f"rollout complete: {total:.1f}s for {n_samples} sequences "
+        f"({total / n_samples:.3f}s/sequence avg)")
     return metrics
 
 
@@ -549,12 +716,35 @@ def render_report(rows, horizon_frames, ckpt_name, n_avail, n_samples, params):
     return "\n".join(lines)
 
 
+def _print_console_summary(rows, horizon_frames):
+    """Console-only colored headline: frame1%/last% per group, per metric.
+    Never written to report.md -- that file stays plain text."""
+    by_key = {(r["group"], r["horizon_frames"], r["component"], r["metric"]): r for r in rows}
+    _banner("Headline: model vs. persistence")
+    for group in GROUPS:
+        print(_bold(f"{GROUP_TITLES[group]}", "cyan"))
+        for metric in METRICS:
+            frame1 = by_key[(group, horizon_frames[0], "all", metric)]
+            last = by_key[(group, horizon_frames[-1], "all", metric)]
+            frame1_pct = (frame1["persistence_mean"] - frame1["model_mean"]) / \
+                (frame1["persistence_mean"] + 1e-8) * 100
+            last_pct = (last["persistence_mean"] - last["model_mean"]) / \
+                (last["persistence_mean"] + 1e-8) * 100
+            f1c = "green" if frame1_pct > 0 else "red"
+            lc = "green" if last_pct > 0 else "red"
+            print(f"  {METRIC_LABELS[metric]:<22} frame1% = {_c(f'{frame1_pct:+.2f}%', f1c):<20} "
+                  f"last% = {_c(f'{last_pct:+.2f}%', lc)}")
+    print()
+
+
 def main():
     os.makedirs(PFD_OUT_DIR, exist_ok=True)
 
     model, device, ckpt_name = load_model()
+
+    _banner("Loading autoencoder + validation data")
     ae, ae_path, converter, metric_space = load_autoencoder(device)
-    print(f"metric space        : {metric_space}")
+    _kv("metric space", metric_space, color="cyan")
 
     val_h5 = os.path.join(HERE, "data/val_40.h5")
     if not os.path.exists(val_h5):
@@ -562,12 +752,13 @@ def main():
     dataset = TransformerDataset(val_h5, subset_ratio=PFD_SUBSET_RATIO)
     n_avail = len(dataset)
     n_samples = n_avail if PFD_SAMPLES <= 0 else min(PFD_SAMPLES, n_avail)
-    print(f"val data            : {val_h5} ({n_avail} sequences available, "
-          f"{n_samples} evaluated, subset_ratio={PFD_SUBSET_RATIO})")
+    _kv("val data", f"{val_h5} ({n_avail} available, {n_samples} evaluated, "
+        f"subset_ratio={PFD_SUBSET_RATIO})")
 
     is_wake = label_wake_or_random(dataset, n_samples)
-    print(f"groups              : all={n_samples}  wake={int(is_wake.sum())}  "
-          f"random={int((~is_wake).sum())}")
+    n_wake, n_random = int(is_wake.sum()), int((~is_wake).sum())
+    _kv("groups", f"all={_c(str(n_samples), 'cyan')}  wake={_c(str(n_wake), 'magenta')}  "
+        f"random={_c(str(n_random), 'yellow')}")
 
     context_steps = getattr(Config, "VAL_CONTEXT_STEPS", 12)
     num_x = getattr(Config, "NUM_X", 26)
@@ -581,38 +772,57 @@ def main():
         raise SystemExit(f"PFD_HORIZON_FRAMES {bad} outside the available "
                           f"1..{full_horizon_frames} frame horizon.")
     n_frames = max(horizon_frames)
-    print(f"horizons            : frames {horizon_frames} = "
-          f"{[round(f * dt_ms, 1) for f in horizon_frames]} ms "
-          f"(dt={dt_ms:.3f} ms/frame, rolling out to frame {n_frames})")
+    _kv("horizons", f"frames {horizon_frames} = {[round(f * dt_ms, 1) for f in horizon_frames]} ms "
+        f"(dt={dt_ms:.3f} ms/frame, rolling out to frame {n_frames})")
 
-    metrics = run_rollouts(model, device, ae, converter, dataset, n_samples, num_x, latent_dim,
-                            context_steps, n_frames)
+    # The whole evaluated subset is a few tens of MB (n_samples x 40 x 26 x 52
+    # float32) -- easily resident on the GPU/MPS device at once. Move it there
+    # ONCE here rather than per-batch inside run_rollouts: repeated small
+    # host<->device transfers (plus, previously, a sync inside a per-frame
+    # Python loop) were the "IO bound" symptom, just PCIe/Metal round-trips
+    # instead of disk reads.
+    data_mb = dataset.data[:n_samples].numel() * 4 / (1024 * 1024)
+    t_xfer0 = time.perf_counter()
+    data_on_device = dataset.data[:n_samples].to(device)
+    _ok(f"moved {data_mb:.1f} MB to {device} in {time.perf_counter() - t_xfer0:.2f}s "
+        f"(resident for the whole rollout, no further host<->device copies)")
 
+    batch_size = resolve_batch_size(device)
+
+    _banner("Running rollouts")
+    metrics = run_rollouts(model, device, ae, converter, data_on_device, n_samples, num_x,
+                            latent_dim, context_steps, n_frames, batch_size)
+
+    _banner("Building tidy table (bootstrap CIs)")
     rows = build_table(metrics, is_wake, horizon_frames, dt_ms, PFD_N_BOOTSTRAP, PFD_SEED)
+    _ok(f"{len(rows)} rows across {len(GROUPS)} groups x {len(horizon_frames)} horizons x "
+        f"{len(METRICS)} metrics")
 
+    _banner("Writing outputs")
     csv_path = os.path.join(PFD_OUT_DIR, "results_by_horizon.csv")
     write_csv(rows, csv_path)
-    print(f"wrote {csv_path}")
+    _ok(f"wrote {csv_path}")
 
     for metric in METRICS:
         summary_path = os.path.join(PFD_OUT_DIR, f"horizon_summary_{metric}.pdf")
         plot_horizon_summary(rows, horizon_frames, ckpt_name, summary_path, metric=metric)
-        print(f"wrote {summary_path}")
+        _ok(f"wrote {summary_path}")
 
         if metric == "l2":
             continue  # no per-component breakdown for L2
         components_path = os.path.join(PFD_OUT_DIR, f"velocity_components_{metric}.pdf")
         plot_velocity_components(rows, horizon_frames, ckpt_name, components_path, metric=metric)
-        print(f"wrote {components_path}")
+        _ok(f"wrote {components_path}")
 
     params_m = sum(p.numel() for p in model.parameters()) / 1e6
     report = render_report(rows, horizon_frames, ckpt_name, n_avail, n_samples, params_m)
     report_path = os.path.join(PFD_OUT_DIR, "report.md")
     with open(report_path, "w") as f:
         f.write(report)
-    print(f"wrote {report_path}")
+    _ok(f"wrote {report_path}")
 
-    print("\n" + report)
+    _print_console_summary(rows, horizon_frames)
+    print(report)
 
 
 if __name__ == "__main__":

@@ -49,14 +49,22 @@ class TestModelVsBaseline(unittest.TestCase):
         cls.model.to(cls.device)
 
         # 4. Initialize Autoencoder for decoding latents
-        cls.ae_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                                   "encoder_neurIPS/saved_models/round_production/model_04_best.pt")
-        if not os.path.exists(cls.ae_path):
-             # Fallback to standard location
-             cls.ae_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
-                                       "encoder_neurIPS/saved_models/model_04_best.pt")
+        # Try multiple potential locations for the AE model
+        ae_search_paths = [
+            "encoder_neurIPS/saved_models/round_production/model_04_best.pt",
+            "encoder_neurIPS/saved_models/round_4/model_04_best.pt",
+            "encoder_neurIPS/saved_models/simultaneous_training/model_04_best.pt",
+            "encoder_neurIPS/saved_models/model_04_best.pt"
+        ]
+        
+        cls.ae_path = None
+        for rel_path in ae_search_paths:
+            full_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), rel_path)
+            if os.path.exists(full_path):
+                cls.ae_path = full_path
+                break
 
-        if os.path.exists(cls.ae_path):
+        if cls.ae_path:
             print(f"Loading AE from: {cls.ae_path}")
             cls.ae = create_model_variant(4)
             ae_ckpt = torch.load(cls.ae_path, map_location='cpu')
@@ -140,6 +148,12 @@ class TestModelVsBaseline(unittest.TestCase):
                     for step in range(x_idx + 1):
                         out = self.model(curr)
                         next_lat = out[:, -1:, :]
+                        
+                        # In training, targets are from targets = batch[:, 1:, :Config.LATENT_DIM]
+                        # which are latent values. Model predicts raw values.
+                        # The AE expects values that were produced by Tanh if it's the encoder output,
+                        # but here we are passing it to the DECODER.
+                        
                         if step == x_idx:
                             pred_v = self.decode_to_centroid(next_lat)
                         

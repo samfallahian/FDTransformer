@@ -59,7 +59,7 @@ class Config:
     BATCH_SIZE = 128 if DEVICE == "cuda" else 32 # Higher on CUDA, safer on MPS
     ACCUMULATION_STEPS = 1 if DEVICE == "cuda" else 4 # Micro-batching for memory-constrained devices
     LEARNING_RATE = 2e-3 # Slightly higher LR to match larger batch size
-    EPOCHS = 50
+    EPOCHS = 10
     NUM_WORKERS = 8 if DEVICE == "cuda" else 0 # Multi-threaded only on CUDA
     PIN_MEMORY = True if DEVICE == "cuda" else False
 
@@ -198,23 +198,6 @@ def train(variant_idx=None):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=0.01)
     
-    # OneCycleLR for faster convergence
-    # Adjust steps_per_epoch for gradient accumulation
-    effective_steps_per_epoch = len(train_loader) // Config.ACCUMULATION_STEPS
-    if len(train_loader) % Config.ACCUMULATION_STEPS != 0:
-        effective_steps_per_epoch += 1
-
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, 
-        max_lr=Config.LEARNING_RATE, 
-        steps_per_epoch=effective_steps_per_epoch, 
-        epochs=Config.EPOCHS,
-        pct_start=0.1
-    )
-
-    # Gradient scaler for mixed precision
-    scaler = torch.amp.GradScaler(device='cuda', enabled=(Config.DEVICE == "cuda"))
-    
     best_val_loss = float('inf')
     best_train_l2 = float('inf')
     best_rollout_loss = float('inf')
@@ -232,11 +215,52 @@ def train(variant_idx=None):
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch']
-            # We skip restoring batch_idx for simplicity in the epoch loop, 
-            # but we start from the next epoch to be safe or continue this one.
+            # If the checkpoint was saved at the end of an epoch, we start from the next one.
+            if 'batch_idx' not in checkpoint or checkpoint['batch_idx'] >= len(train_loader) - 1:
+                start_epoch += 1
+
             print(f"  -> Resuming from Epoch {start_epoch + 1}")
+            
+            # Restore best metrics if available in checkpoint
+            if 'val_l2' in checkpoint: best_val_loss = checkpoint['val_l2']
+            if 'rollout_mse' in checkpoint: best_rollout_loss = checkpoint['rollout_mse']
+            if 'improvement' in checkpoint: best_improvement = checkpoint['improvement']
         except Exception as e:
             print(f"  -> Warning: Could not load checkpoint: {e}")
+
+    if start_epoch >= Config.EPOCHS:
+        print(f"Training already completed up to {start_epoch} epochs. Target is {Config.EPOCHS}. Skipping training.")
+        wandb.finish()
+        return {"val_l2": best_val_loss, "rollout_l2": best_rollout_loss, "improvement": best_improvement}
+
+    # OneCycleLR for faster convergence
+    # Adjust steps_per_epoch for gradient accumulation
+    effective_steps_per_epoch = len(train_loader) // Config.ACCUMULATION_STEPS
+    if len(train_loader) % Config.ACCUMULATION_STEPS != 0:
+        effective_steps_per_epoch += 1
+    
+    # Ensure total_steps is at least 10 to avoid ZeroDivisionError with small pct_start
+    total_steps = effective_steps_per_epoch * Config.EPOCHS
+    if total_steps < 10:
+        pct_start = 0.3 # Higher pct_start for very short runs
+    else:
+        pct_start = 0.1
+
+    try:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=Config.LEARNING_RATE, 
+            steps_per_epoch=effective_steps_per_epoch, 
+            epochs=Config.EPOCHS,
+            pct_start=pct_start,
+            last_epoch=start_epoch * effective_steps_per_epoch - 1 if start_epoch > 0 else -1
+        )
+    except Exception as e:
+        print(f"  -> Warning: Could not initialize OneCycleLR: {e}. Falling back to constant LR.")
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: 1.0)
+
+    # Gradient scaler for mixed precision
+    scaler = torch.amp.GradScaler(device='cuda', enabled=(Config.DEVICE == "cuda"))
 
     for epoch in range(start_epoch, Config.EPOCHS):
         model.train()
@@ -330,6 +354,9 @@ def train(variant_idx=None):
                     'batch_idx': batch_idx,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
+                    'val_l2': best_val_loss,
+                    'rollout_mse': best_rollout_loss,
+                    'improvement': best_improvement,
                     'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
                 }, cp_path)
                 
@@ -378,6 +405,9 @@ def train(variant_idx=None):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'train_l2': train_loss,
+                'val_l2': best_val_loss,
+                'rollout_mse': best_rollout_loss,
+                'improvement': best_improvement,
                 'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
             }, save_path)
             
@@ -494,6 +524,8 @@ def train(variant_idx=None):
                     'model_state_dict': model.state_dict(),
                     'rollout_mse': rollout_mse,
                     'persistence_improvement': persistence_improvement,
+                    'val_l2': best_val_loss,
+                    'improvement': best_improvement,
                     'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
                 }, save_path)
                 
@@ -541,6 +573,8 @@ def train(variant_idx=None):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'val_l2': val_loss,
+                'rollout_mse': best_rollout_loss,
+                'improvement': best_improvement,
                 'config': {k: getattr(Config, k) for k in dir(Config) if not k.startswith('_') and not callable(getattr(Config, k))}
             }, save_path)
             print(f"  --> Saved new best validation model (L2={val_loss:.6f})")

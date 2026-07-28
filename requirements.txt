@@ -41,7 +41,7 @@ joblib==1.5.3
 keras==2.15.0
 kiwisolver==1.5.0
 libclang==16.0.6
-lightphe==0.0.11
+# lightphe==0.0.11
 locket==1.0.0
 Markdown==3.5.2
 MarkupSafe==3.0.3
@@ -94,7 +94,7 @@ setuptools==78.1.0
 setuptools_scm==9.2.2
 six==1.17.0
 smmap==5.0.1
-sympy==1.14.0
+sympy>=1.13.3,<=1.14.0
 tensorboard==2.15.1
 tensorboard-data-server==0.7.2
 tensorflow-estimator==2.15.0
@@ -103,10 +103,10 @@ threadpoolctl==3.6.0
 tokenizers==0.15.2
 tomli==2.4.0
 toolz==0.12.0
-torch==2.12.0.dev20260312
-torchaudio==2.11.0.dev20260312
+torch>=2.12.0.dev20260312
+torchaudio>=2.11.0.dev20260312
 torchsummary==1.5.1
-torchvision==0.26.0.dev20260312
+torchvision>=0.26.0.dev20260312
 tqdm==4.67.3
 transformers==4.36.2
 types-pytz==2026.1.1.20260304

@@ -77,7 +77,10 @@ print(f"DEBUG: sys.path = {sys.path}")
 from transformer_neurIPS.train_production_transformer_deep_dive import (
     Config, TransformerDataset, mse_loss, l2_loss, rollout_frames, probe_causality)
 from transformer_neurIPS.model_variants import get_model
-from encoder_neurIPS.models import create_model_variant
+# NOTE (v2.0 AE swap): the v1.0 encoder_neurIPS variant-4 model is retired
+# downstream. `load_autoencoder` now targets the scripted GEN3-05-AttentionSE
+# decoder directly via torch.jit.load, so we no longer import
+# `create_model_variant` here.
 
 
 # --- FloatConverter resolution ------------------------------------------------
@@ -209,56 +212,88 @@ def mae_loss(pred, target):
     return torch.mean(torch.abs(pred - target))
 
 
-def load_autoencoder(device):
-    """Locate + load the AE used to decode latents -> centroid velocities.
+# v2.0 AE swap: the decoder is now the scripted GEN3-05-AttentionSE model.
+# Path is absolute and hard-coded (per plan Step 3b) rather than searched --
+# a silent fallback here would produce nonsense metrics.
+GEN3_SCRIPTED_AE_PATH = (
+    "/Users/kkreth/PycharmProjects/cgan/encoder/autoencoderGEN3/"
+    "saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt"
+)
+AE_ORIGINAL_DIM = 375   # decoder output width (concatenated neighbor cubes)
+AE_LATENT_DIM = 47      # decoder input width
+AE_CENTROID_SLICE = slice(186, 189)  # neighbor index 62 = centroid (vx, vy, vz)
 
-    Returns (ae, ae_path, converter, metric_space). `ae` is None (and
-    metric_space says so) if no checkpoint is found on any of the known
-    round-naming layouts; callers then fall back to raw latent dims 0:3.
+
+def load_autoencoder(device):
+    """Load the scripted GEN3-05-AttentionSE AE used to decode 47-D latents
+    into 375-D physical-space vectors.
+
+    Returns (ae, ae_path, converter, metric_space). Hard-fails if the scripted
+    checkpoint is missing or its decode entry point does not produce a 375-D
+    output for a 47-D latent -- there is no silent fallback to latents[:, :3].
     """
-    ae_search_paths = [
-        "encoder_neurIPS/saved_models/round_production/model_04_best.pt",
-        "encoder_neurIPS/saved_models/round_4/model_04_best.pt",
-        "encoder_neurIPS/saved_models/simultaneous_training/model_04_best.pt",
-        "encoder_neurIPS/saved_models/model_04_best.pt",
-    ]
-    ae_path = None
-    for rel_path in ae_search_paths:
-        full_path = os.path.join(PROJECT_ROOT, rel_path)
-        print(f"DEBUG: AE candidate {full_path} -> exists={os.path.exists(full_path)}")
-        if os.path.exists(full_path):
-            ae_path = full_path
-            break
+    ae_path = GEN3_SCRIPTED_AE_PATH
+    if not os.path.exists(ae_path):
+        raise FileNotFoundError(
+            f"Scripted GEN3 autoencoder not found at {ae_path}. "
+            "The v2.0 evaluation harness requires this exact scripted decoder; "
+            "no fallback path exists on purpose.")
+
+    print(f"Loading scripted AE from: {ae_path}")
+    ae = torch.jit.load(ae_path, map_location=device)
+    ae.eval()
+
+    # Probe the decode interface on a (1, 47) tensor. `.decode` is the
+    # documented entry point (RecursiveScriptModule exposes it); if a future
+    # rescript changes that we fall back to calling the module directly, but
+    # we still require the 375-D output shape.
+    probe_z = torch.zeros(1, AE_LATENT_DIM, device=device)
+    with torch.no_grad():
+        if hasattr(ae, "decode"):
+            probe_recon = ae.decode(probe_z)
+        else:
+            probe_recon = ae(probe_z)
+    if not (hasattr(probe_recon, "shape")
+            and probe_recon.dim() == 2
+            and probe_recon.shape[0] == 1
+            and probe_recon.shape[1] == AE_ORIGINAL_DIM):
+        raise RuntimeError(
+            f"Scripted AE decode interface unexpected: probe (1,{AE_LATENT_DIM}) -> "
+            f"{tuple(probe_recon.shape) if hasattr(probe_recon, 'shape') else type(probe_recon)}, "
+            f"expected (1, {AE_ORIGINAL_DIM}). Refusing to proceed with wrong metrics.")
 
     converter = FloatConverter()
-    if ae_path:
-        print(f"Loading AE from: {ae_path}")
-        ae = create_model_variant(4)
-        ae_ckpt = load_checkpoint(ae_path)
-        ae.load_state_dict(ae_ckpt["model_state_dict"])
-        ae.eval()
-        ae.to(device)
-        metric_space = "centroid velocity (m/s, AE-decoded)"
-    else:
-        print("WARNING: AE model not found. Centroid decoding falls back to "
-              "raw latent dims 0:3 -- numbers are still comparable across "
-              "models, but they are NOT physical velocities.")
-        ae = None
-        metric_space = "raw latent dims 0:3 (AE MISSING)"
+    metric_space = "centroid velocity (m/s, GEN3-05-AttentionSE scripted, AE-decoded)"
     return ae, ae_path, converter, metric_space
 
 
 def decode_latents_to_centroid(latents, ae, converter, device):
-    """Decode (..., 47) latents to (..., 3) centroid velocities [vx, vy, vz]."""
+    """Decode (..., 47) latents to (..., 3) centroid velocities [vx, vy, vz]
+    via the scripted GEN3 decoder. Fails loudly on any shape mismatch --
+    the v2.0 harness deliberately has no `latents[:, :3]` degradation path.
+    """
     if ae is None:
-        return latents[..., :3]
+        raise RuntimeError(
+            "decode_latents_to_centroid called with ae=None; the v2.0 harness "
+            "requires a loaded scripted GEN3 decoder.")
 
     with torch.no_grad():
         orig_shape = latents.shape
+        if orig_shape[-1] != AE_LATENT_DIM:
+            raise RuntimeError(
+                f"decode_latents_to_centroid: last-dim {orig_shape[-1]} != "
+                f"AE_LATENT_DIM ({AE_LATENT_DIM})")
         lat_flat = latents.reshape(-1, orig_shape[-1])
-        recon = ae.decode(lat_flat)                           # (N, 375)
+        if hasattr(ae, "decode"):
+            recon = ae.decode(lat_flat)                       # (N, 375)
+        else:
+            recon = ae(lat_flat)
+        if recon.dim() != 2 or recon.shape[-1] != AE_ORIGINAL_DIM:
+            raise RuntimeError(
+                f"decode_latents_to_centroid: AE output shape "
+                f"{tuple(recon.shape)} != (N, {AE_ORIGINAL_DIM}); refusing to slice.")
         # Centroid sits at neighbor index 62 -> columns 186:189
-        centroid_v = recon[:, 186:189].cpu().numpy()
+        centroid_v = recon[:, AE_CENTROID_SLICE].cpu().numpy()
         centroid_v = converter.unconvert(centroid_v)          # back to physical units
         new_shape = list(orig_shape[:-1]) + [3]
         return torch.from_numpy(centroid_v).reshape(new_shape).to(device)

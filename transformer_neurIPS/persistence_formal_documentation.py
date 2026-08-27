@@ -15,15 +15,15 @@ per frame -- see Documentation/persistence_baseline_design.md for the same
 100 ms context convention used elsewhere in this project):
 
     context : 12 frames =  100.0 ms
-    forecast: 28 frames =  233.3 ms
-    window  : 40 frames =  333.3 ms
+    forecast: 68 frames =  566.7 ms   (v2.0: was 28 frames / 233.3 ms in v1.0)
+    window  : 80 frames =  666.7 ms   (v2.0: was 40 frames / 333.3 ms in v1.0)
 
 Rather than push the forecast horizon further, this script spends the budget
 on evaluation rigor instead:
 
-  - ALL available validation sequences (165 at the default 0.2 subset ratio
-    of val_40.h5's 829 sequences -- the same subset TX_DEEPDIVE_SUBSET_RATIO
-    uses in the test file), not a handful.
+  - ALL available validation sequences (v2.0: val_80.h5 at the default 0.2
+    subset ratio -- see prepare_data.py --num-time 80. v1.0 used val_40.h5 at
+    the same subset ratio = 165 of 829 sequences.), not a handful.
   - Two disjoint sub-populations, reported SEPARATELY rather than pooled:
     "wake-targeted" sequences (centered on one of the 24 (y, z) coordinates
     prepare_data.py deliberately samples in the vortex wake) and
@@ -31,8 +31,10 @@ on evaluation rigor instead:
     They are NOT a 50/50 split of this val file -- see the printed group
     sizes -- because random-location sequences are dropped more often for
     landing outside the data's valid domain (see prepare_data.py).
-  - Six horizons: frames [1, 6, 12, 18, 24, 28] = [8.3, 50, 100, 150, 200,
-    233.3] ms past the context boundary.
+  - Eight horizons (v2.0): frames [1, 6, 12, 24, 36, 48, 60, 68] = [8.3, 50,
+    100, 200, 300, 400, 500, 566.7] ms past the context boundary. v1.0 used
+    six horizons up to 233.3 ms; the shared 1..28-frame prefix is preserved
+    so v1.0/v2.0 numbers are directly comparable at every retained horizon.
   - Mean, a 95% bootstrap CI (resampling over sequences), and the fraction
     of sequences where the model beats persistence -- at every (group,
     horizon), and per velocity component (vx, vy, vz) as well as overall.
@@ -66,10 +68,12 @@ Outputs (under Documentation/persistence_formal/, created if missing):
 
 Tunable via environment variables (all optional):
     PFD_RUN              target run name                (default "r1_a3b_delta_ar")
-    PFD_KIND             target checkpoint kind          (default "best")
+    PFD_KIND             target checkpoint kind          (default "rollout_best";
+                                                          v1.0 default was "best")
     PFD_SUBSET_RATIO     val-set fraction to load        (default 0.2)
     PFD_SAMPLES          sequences to use, 0 = all loaded (default 0)
-    PFD_HORIZON_FRAMES   comma list of horizon frames    (default "1,6,12,18,24,28")
+    PFD_HORIZON_FRAMES   comma list of horizon frames    (default v2.0:
+                                                          "1,6,12,24,36,48,60,68")
     PFD_CONTEXT_MS       wall-clock ms the context spans (default 100.0)
     PFD_N_BOOTSTRAP      bootstrap resamples for the CI  (default 10000)
     PFD_BATCH_SIZE       sequences per rollout batch     (default: 32 on cuda, 4 on mps/cpu)
@@ -209,11 +213,15 @@ def _env_float(name, default):
 
 
 PFD_RUN = os.environ.get("PFD_RUN", "r1_a3b_delta_ar")
-PFD_KIND = os.environ.get("PFD_KIND", "best")
+# v2.0: point at the rollout-best checkpoint by default (matches
+# tests/reports/r1_a3b_delta_ar_deep_dive.md's winner). v1.0 default was "best".
+PFD_KIND = os.environ.get("PFD_KIND", "rollout_best")
 PFD_SUBSET_RATIO = _env_float("PFD_SUBSET_RATIO", 0.2)
 PFD_SAMPLES = _env_int("PFD_SAMPLES", 0)  # 0 = all loaded
+# v2.0 horizons cover the 68-frame (566.7 ms) forecast; the first three
+# entries (1, 6, 12) are shared with v1.0 for direct A/B comparability.
 PFD_HORIZON_FRAMES = [int(x) for x in os.environ.get(
-    "PFD_HORIZON_FRAMES", "1,6,12,18,24,28").split(",") if x.strip()]
+    "PFD_HORIZON_FRAMES", "1,6,12,24,36,48,60,68").split(",") if x.strip()]
 PFD_CONTEXT_MS = _env_float("PFD_CONTEXT_MS", 100.0)
 PFD_N_BOOTSTRAP = _env_int("PFD_N_BOOTSTRAP", 10000)
 # None = device-dependent default, resolved in main() once the device is known
@@ -648,8 +656,8 @@ def render_report(rows, horizon_frames, ckpt_name, n_avail, n_samples, params):
     for group in GROUPS:
         n_group = by_key[(group, horizon_frames[0], "all", "mae")]["n_sequences"]
         add(f"  - {GROUP_TITLES[group]}: {n_group} sequences.")
-    add(f"- Context: 12 frames = 100.0 ms. Forecast: 28 frames = 233.3 ms. "
-        f"Window: 40 frames = 333.3 ms.")
+    add(f"- Context: 12 frames = 100.0 ms. Forecast: 68 frames = 566.7 ms. "
+        f"Window: 80 frames = 666.7 ms. (v2.0 -- v1.0 forecast/window was 28/40 frames.)")
     add(f"- Horizons reported: {horizon_frames} frames = "
         f"{[round(f * PFD_CONTEXT_MS / 12, 1) for f in horizon_frames]} ms.")
     add(f"- 95% CI: percentile bootstrap, {PFD_N_BOOTSTRAP} resamples over sequences.")
@@ -746,9 +754,35 @@ def main():
     ae, ae_path, converter, metric_space = load_autoencoder(device)
     _kv("metric space", metric_space, color="cyan")
 
-    val_h5 = os.path.join(HERE, "data/val_40.h5")
+    # v2.0 AE smoke assertion (plan Step 3b): before spending any rollout time,
+    # confirm the scripted GEN3 decoder round-trips a random (1, 47) latent to
+    # a (1, 375) reconstruction. If this ever fails (wrong scripted module, a
+    # future rescript that drops `.decode`, dtype/device mismatch), we bail out
+    # here rather than emitting nonsense metrics later.
+    with torch.no_grad():
+        _probe_z = torch.randn(1, 47, device=device)
+        _probe_recon = ae.decode(_probe_z) if hasattr(ae, "decode") else ae(_probe_z)
+    if not (hasattr(_probe_recon, "shape")
+            and tuple(_probe_recon.shape) == (1, 375)):
+        raise SystemExit(
+            f"[pfd] AE round-trip smoke FAILED: (1,47) -> "
+            f"{tuple(_probe_recon.shape) if hasattr(_probe_recon, 'shape') else type(_probe_recon)}, "
+            f"expected (1, 375). Refusing to run rollouts.")
+    _ok("AE round-trip smoke passed: (1, 47) -> (1, 375)")
+
+    # v2.0: point at the 80-frame val file. If it is missing (e.g. someone is
+    # regenerating v1.0 numbers on a checkout that never ran prepare_data.py
+    # --num-time 80), fall back to val_40.h5 with a very loud note so the
+    # horizon-vs-file mismatch is impossible to miss.
+    val_h5 = os.path.join(HERE, "data/val_80.h5")
     if not os.path.exists(val_h5):
-        raise SystemExit("Validation data not found at " + val_h5)
+        legacy = os.path.join(HERE, "data/val_40.h5")
+        if os.path.exists(legacy):
+            print(_c(f"[pfd] WARNING: {val_h5} missing; falling back to {legacy}. "
+                     f"Horizons > 28 will be rejected against the 40-frame window.", "yellow"))
+            val_h5 = legacy
+        else:
+            raise SystemExit("Validation data not found at " + val_h5)
     dataset = TransformerDataset(val_h5, subset_ratio=PFD_SUBSET_RATIO)
     n_avail = len(dataset)
     n_samples = n_avail if PFD_SAMPLES <= 0 else min(PFD_SAMPLES, n_avail)
@@ -763,7 +797,8 @@ def main():
     context_steps = getattr(Config, "VAL_CONTEXT_STEPS", 12)
     num_x = getattr(Config, "NUM_X", 26)
     latent_dim = getattr(Config, "LATENT_DIM", 47)
-    full_horizon_frames = getattr(Config, "NUM_TIME", 40) - context_steps  # 28
+    # v2.0: NUM_TIME=80 -> full_horizon_frames=68. v1.0 was NUM_TIME=40 -> 28.
+    full_horizon_frames = getattr(Config, "NUM_TIME", 80) - context_steps
     dt_ms = PFD_CONTEXT_MS / context_steps
 
     horizon_frames = sorted(set(PFD_HORIZON_FRAMES))

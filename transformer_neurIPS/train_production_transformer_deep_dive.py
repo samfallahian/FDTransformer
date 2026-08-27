@@ -1,17 +1,34 @@
 """
 Deep-dive transformer trainer for the NeurIPS latent fluid-dynamics sequences.
 
+v2.0 PINNING NOTE (NUM_TIME=80)
+===============================
+This trainer is intentionally pinned to the 80-frame (v2.0) target. There is
+NO 40/80 switch, NO --num-time flag, and NO 40-frame fallback. The v1.0
+40-frame model remains fully reproducible from its frozen inputs and outputs:
+
+  * data:       transformer_neurIPS/data/train_40.h5 / val_40.h5 (unchanged)
+  * checkpoint: transformer_neurIPS/saved_models/r1_a3b_delta_ar_rollout_best.pt
+  * results:    transformer_neurIPS/tests/reports/*.md
+
+v2.0 is a distinct, forward-only pinned target: `train_80.h5` / `val_80.h5`,
+positional-embedding capacity `NUM_TIME * NUM_X = 80 * 26 = 2080` tokens.
+See transformer_neurIPS/OVERVIEW.md for the full v1.0 -> v2.0 rationale.
+
 This is the ARM-DRIVEN rewrite. One process trains exactly one "arm" (a named
 set of config overrides); `sweep_deep_dive.py` runs several arms concurrently on
 one box and aggregates the results into a single uploadable report.
 
-    # answer the diagnostic questions once, cheaply, before spending GPU-hours
-    python train_production_transformer_deep_dive.py --diagnostics-only
+    # zero-arg default (Mac/MPS friendly): launches the v1.0 winner arm
+    # `a3b_delta_ar` with the default warm-start from
+    # `saved_models/r1_a3b_delta_ar_rollout_best.pt` and the auto-detected
+    # device regime (rainbow micro-batch on MPS/CPU, H200-defaults on CUDA).
+    python train_production_transformer_deep_dive.py
 
-    # train one arm
+    # explicit overrides (all optional):
     python train_production_transformer_deep_dive.py --arm a0_control --max-steps 6000
-
-    # list what exists
+    python train_production_transformer_deep_dive.py --diagnostics-only
+    python train_production_transformer_deep_dive.py --smoke-test
     python train_production_transformer_deep_dive.py --list-arms
 
 WHAT CHANGED VS THE PREVIOUS VERSION, AND WHY
@@ -71,6 +88,76 @@ either makes the whole sweep meaningless:
   transformer is broken. If the linear map also gets ~0%, persistence is simply
   a strong baseline at this sampling rate and the framing needs to change, not
   the architecture.
+
+IF YOU ARE RUNNING THIS ON CUDA
+===============================
+The trainer detects the device once at startup via `pick_device()` and picks a
+`TrainRegime` accordingly. The CUDA branch is the fast-path; MPS/CPU is the
+laptop-debug path. What the CUDA branch flips vs. MPS, and why:
+
+  * physical micro-batch bumps from 1 to 32 (or 64 if the device name contains
+    "H200") and gradient accumulation collapses to 1. On MPS the caching
+    allocator cannot reuse blocks across the changing shapes of an
+    autoregressive rollout, so peak memory scales with the batch inside ONE
+    rollout call -- a batch of 32 blows past a Mac's MPS ceiling on the very
+    first batch. CUDA has no such fragmentation problem, so we run the full
+    batch physically and drop the accumulation loop entirely.
+  * autocast to bf16 turns on (Ampere+/H200); GradScaler is NOT used because
+    bf16 does not underflow the way fp16 does.
+  * `torch.compile(model)` is attempted in a try/except (never fatal): a 15-30%
+    step-time win on H200, but MPS Inductor is not production-ready.
+  * `torch.backends.cudnn.benchmark = True` and
+    `torch.set_float32_matmul_precision('high')` are set so the residual fp32
+    ops (LayerNorm, softmax reductions) run on TF32 cores.
+
+The banner printed at startup shows a small CUDA-vs-MPS diff table so the
+regime is obvious in every log; set `PFD_NO_COLOR=1` (or `NO_COLOR=1`, or pipe
+stdout to a file) to strip the ANSI colouring.
+
+H200 PERMUTATIONS (intended, NOT executed by this agent)
+========================================================
+Three runs are meant to be launched on an H200 host once the repo lands there.
+The code is already H200-ready: dropping the tree onto a CUDA box and invoking
+this trainer picks up all the CUDA-branch defaults automatically. No code edits
+are required on the CUDA host.
+
+  (a) WARM-START FROM v1.0 (promoted path):
+        python train_production_transformer_deep_dive.py --arm a3b_delta_ar
+      Uses the default `--warm-start saved_models/r1_a3b_delta_ar_rollout_best.pt`
+      so 99.57% of the 4.79 M params transfer from the 40-frame winner and only
+      `time_embeddings.weight` reinitialises for the new 80-frame horizon.
+
+  (b) COLD-START FROM SCRATCH (comparison run):
+        python train_production_transformer_deep_dive.py --arm a3b_delta_ar --no-warm-start
+      Same arm, no v1.0 weights. Answers "how much of v2.0 quality is the extra
+      horizon vs. the pre-training".
+
+  (c) STAGED 40->80 CURRICULUM (optional):
+      Reserved for the case where (a) plateaus. Fine-tune (a) at frozen
+      transformer body and only re-train the time embedding + output head for a
+      short window, then unfreeze. Not implemented here -- the code path is
+      just (a) with a manual LR schedule / param-group override.
+
+PROMOTION GATE (H200)
+=====================
+An 80-frame checkpoint is promotable only if BOTH of the following hold:
+
+  * `probe_causality(...)['causal'] is True` on the FINAL weights, not just at
+    startup. The trainer already refuses to save otherwise.
+  * val-loss at the shared 1..28-frame horizon is not WORSE than the frozen
+    v1.0 numbers in `tests/reports/r1_a3b_delta_ar_deep_dive.md`
+    (single-step centroid MAE 2.47e-4, 28-frame rollout MAE 9.96e-4,
+    latent MSE 4.11e-5). This is exactly the shared window `persistence_formal_documentation.py`
+    reports; a v2.0 regression at those horizons means the extension to 68 frames
+    is being paid for by short-horizon quality, which we do not want.
+
+CHECKPOINT NAMING (compatible with persistence_formal_documentation.py)
+=======================================================================
+Every saved checkpoint follows the `r{SWEEP_ROUND}_{ARM}_{kind}.pt` pattern
+(kinds: `best`, `rollout_best`, `train_best`, `latest`). This is exactly the
+pattern `persistence_formal_documentation.py`'s `PFD_RUN` / `PFD_KIND` env-vars
+key off, so a promoted H200 checkpoint drops straight into that harness with
+no rename step.
 """
 
 import argparse
@@ -79,6 +166,8 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 import h5py
 import numpy as np
@@ -93,20 +182,178 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------- #
+# Console color (ANSI) + device-adaptive training regime
+# --------------------------------------------------------------------------- #
+# Copied verbatim from persistence_formal_documentation.py to avoid taking a
+# hard dependency on that module (it does file I/O and reads env vars at
+# import time). Step 6 of the migration plan owns that file; if the helpers
+# diverge, sync them back there.
+_COLOR_ON = (
+    os.environ.get("PFD_NO_COLOR") is None
+    and os.environ.get("NO_COLOR") is None
+    and (sys.stdout.isatty() or os.environ.get("PFD_FORCE_COLOR") is not None)
+)
+
+_ANSI = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[91m", "green": "\033[92m", "yellow": "\033[93m",
+    "blue": "\033[94m", "magenta": "\033[95m", "cyan": "\033[96m",
+}
+_RAINBOW = ["red", "yellow", "green", "cyan", "blue", "magenta"]
+
+
+def _c(text, color):
+    if not _COLOR_ON:
+        return text
+    return f"{_ANSI[color]}{text}{_ANSI['reset']}"
+
+
+def _bold(text, color=None):
+    if not _COLOR_ON:
+        return text
+    prefix = _ANSI["bold"] + (_ANSI[color] if color else "")
+    return f"{prefix}{text}{_ANSI['reset']}"
+
+
+def _rainbow(text):
+    """Cycle non-whitespace characters through the rainbow palette."""
+    if not _COLOR_ON:
+        return text
+    out, i = [], 0
+    for ch in text:
+        if ch.strip():
+            out.append(f"{_ANSI[_RAINBOW[i % len(_RAINBOW)]]}{ch}")
+            i += 1
+        else:
+            out.append(ch)
+    out.append(_ANSI["reset"])
+    return "".join(out)
+
+
+def _banner(title):
+    line = "=" * (len(title) + 4)
+    print(_c(line, "cyan"))
+    print(_bold(f"  {title}", "cyan"))
+    print(_c(line, "cyan"))
+
+
+def pick_device():
+    """Prefer cuda > mps > cpu. Returns a torch.device."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+@dataclass
+class TrainRegime:
+    device: str
+    micro_batch: int
+    virtual_batch: int
+    eval_micro_batch: int
+    use_amp: bool
+    amp_dtype: Any
+    compile_model: bool
+    cudnn_benchmark: bool
+    banner: str
+
+
+def _regime_banner_mps_cpu(micro_batch):
+    header = _rainbow(f"🌈 MICRO-BATCH MODE (micro_batch={micro_batch})")
+    why = ("WHY: on MPS/CPU the caching allocator cannot reuse blocks across "
+           "the changing shapes of an autoregressive rollout, so peak memory "
+           "scales with the batch inside ONE rollout call and blows past the "
+           "device ceiling on the very first batch. micro_batch=1 keeps each "
+           "forward within budget (same rationale documented in "
+           "persistence_formal_documentation.py).")
+    what = ("WHAT CHANGES ON CUDA: micro_batch bumps to 32 (64 on H200), "
+            "gradient accumulation collapses to 1, AMP bf16 turns on, "
+            "torch.compile is attempted, cudnn.benchmark is enabled.")
+    return "\n".join([header, why, what])
+
+
+def _regime_banner_cuda(micro_batch, virtual_batch):
+    header = _bold("[CUDA DETECTED — H200 DEFAULTS ACTIVE]", "green")
+    diff = [
+        ("batch size",         str(micro_batch),  "1"),
+        ("eval batch",         str(micro_batch),  "1"),
+        ("AMP dtype",          "bfloat16",         "off"),
+        ("torch.compile",      "on",               "off"),
+        ("cudnn.benchmark",    "on",               "off"),
+        ("grad accumulation",  str(max(1, virtual_batch // micro_batch)), "32"),
+    ]
+    lines = [header, "  {:<22}  {:<20}  {:<20}".format(
+        "setting", _bold("CUDA", "green"), _c("MPS/CPU", "dim"))]
+    for label, cuda_val, mps_val in diff:
+        lines.append("  {:<22}  {:<20}  {:<20}".format(
+            label, _bold(cuda_val, "green"), _c(mps_val, "dim")))
+    return "\n".join(lines)
+
+
+def resolve_train_regime(device):
+    """Return the device-adaptive `TrainRegime` and apply the CUDA-only
+    matmul-precision / cudnn.benchmark side effects when applicable.
+    """
+    dev_str = device.type if hasattr(device, "type") else str(device)
+    dev_str = dev_str.split(":")[0]
+
+    if dev_str == "cuda":
+        try:
+            name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
+        except Exception:
+            name = ""
+        micro = 64 if "H200" in name.upper() else 32
+        virtual = micro                       # accumulation off
+        banner = _regime_banner_cuda(micro, virtual)
+        # CUDA-only side effects, guarded so this stays safe under a mocked
+        # torch.cuda.is_available() in the tests.
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+        try:
+            if torch.cuda.is_available():
+                torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        return TrainRegime(
+            device="cuda", micro_batch=micro, virtual_batch=virtual,
+            eval_micro_batch=micro,
+            use_amp=True, amp_dtype=torch.bfloat16,
+            compile_model=True, cudnn_benchmark=True, banner=banner)
+
+    # MPS / CPU: eval also runs singleton. The AR rollout at NUM_TIME=80 grows
+    # the sequence to SEQ_LEN=2080 tokens; attention scores are
+    # (batch * n_heads * L^2 * 4B). At batch=32, heads=8, L=2080 this is
+    # ~34 GB PER LAYER just for the score tensor, which is exactly the 88 GB
+    # MPS OOM users have hit. batch=1 drops that to ~138 MB/layer -- a ~32x
+    # peak-memory reduction -- and keeps the TF-eval pass within budget too
+    # (EVAL_BATCH_SIZE=128 at L=2079 would otherwise need ~137 GB for attn).
+    banner = _regime_banner_mps_cpu(micro_batch=1)
+    return TrainRegime(
+        device=dev_str, micro_batch=1, virtual_batch=32,
+        eval_micro_batch=1,
+        use_amp=False, amp_dtype=None,
+        compile_model=False, cudnn_benchmark=False, banner=banner)
+
+
+# --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 class Config:
     """Defaults for a single run. Arms (below) override fields on this class."""
 
     # -- data ---------------------------------------------------------------
-    TRAIN_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/train_40.h5")
-    VAL_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/val_40.h5")
+    # v2.0 pinning: hard-coded 80-frame files. See top-of-file docstring.
+    TRAIN_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/train_80.h5")
+    VAL_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/val_80.h5")
     CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")
 
     LATENT_DIM = 47      # latent features per (t, x) location
     NUM_X = 26           # x-locations per time frame
-    NUM_TIME = 40        # time frames per sequence
-    SEQ_LEN = NUM_X * NUM_TIME              # 1040 tokens
+    NUM_TIME = 80        # time frames per sequence (v2.0 pinned; v1.0 was 40)
+    SEQ_LEN = NUM_X * NUM_TIME              # 2080 tokens (v1.0: 1040)
     # Column layout written by prepare_data.py:
     #   0:47 latents | 47 x | 48 y | 49 z | 50 t_index | 51 param
     INPUT_DIM = 52
@@ -121,7 +368,7 @@ class Config:
     BIAS = True
     VARIANT = 'base'           # base | swiglu | mqa | conv
     USE_SWIGLU = False         # set implicitly by VARIANT='swiglu'
-    TOKENIZATION = 'token'     # token (1040 tokens) | frame (40 tokens)
+    TOKENIZATION = 'token'     # token (NUM_TIME*NUM_X tokens) | frame (NUM_TIME tokens)
     ATTN_IMPL = 'sdpa'         # sdpa (causal by construction) | mha_hint (old, leaky)
     USE_ROPE = False
     PREDICT_DELTA = False
@@ -158,7 +405,7 @@ class Config:
 
     # -- evaluation ---------------------------------------------------------
     VAL_CONTEXT_STEPS = 12                      # frames fed as context
-    VAL_ROLLOUT_STEPS = NUM_X * (NUM_TIME - VAL_CONTEXT_STEPS)   # 728 tokens
+    VAL_ROLLOUT_STEPS = NUM_X * (NUM_TIME - VAL_CONTEXT_STEPS)   # 1768 tokens (v1.0: 728)
     VAL_ROLLOUT_SEQS = 64      # fixed row set; model AND persistence both use it
     VAL_EVERY_STEPS = 400
     LOG_EVERY_STEPS = 25
@@ -172,7 +419,15 @@ class Config:
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
-    WANDB_PROJECT = "runpod_b300_deepdive"
+    WANDB_PROJECT = "NI_Review"
+
+
+# These fields define the v2.0 data/model shape and are deliberately not
+# configurable through an arm or the generic --set escape hatch.
+PINNED_CONFIG_FIELDS = frozenset({
+    "LATENT_DIM", "NUM_X", "NUM_TIME", "SEQ_LEN", "INPUT_DIM",
+    "TRAIN_H5", "VAL_H5", "VAL_ROLLOUT_STEPS",
+})
 
 
 # --------------------------------------------------------------------------- #
@@ -222,8 +477,8 @@ ROUND1_ARMS = {
         "overrides": {"PREDICT_DELTA": True},
     },
     "a4_frame": {
-        "desc": "Frame-level tokenisation: 40 tokens of 26x47 features instead of "
-                "1040 tokens of 47.",
+        "desc": "Frame-level tokenisation: NUM_TIME tokens of 26x47 features instead of "
+                "NUM_TIME*NUM_X tokens of 47.",
         "hypothesis": "Token-level flattening makes the objective mostly SPATIAL "
                       "(only every 26th token crosses a time boundary), so capacity "
                       "goes to within-frame continuation rather than the temporal "
@@ -295,11 +550,11 @@ ROUND2_ARMS = {
     },
     # ---------------------------------------------------------------- branch F
     "F": {
-        "title": "Frame tokenisation won -- rebuild around 40-token sequences",
+        "title": "Frame tokenisation won -- rebuild around NUM_TIME-token sequences",
         "arms": {
             "f1_frame_delta": {"desc": "Frame + delta.",
                                "overrides": {"TOKENIZATION": "frame", "PREDICT_DELTA": True}},
-            "f2_frame_deep": {"desc": "Frame + E512/L12 (40 tokens is cheap, so spend it on depth).",
+            "f2_frame_deep": {"desc": "Frame + E512/L12 (NUM_TIME tokens is cheap, so spend it on depth).",
                               "overrides": {"TOKENIZATION": "frame", "EMBED_SIZE": 512,
                                             "N_LAYERS": 12}},
             "f3_frame_noise": {"desc": "Frame + noise.",
@@ -453,6 +708,9 @@ def apply_arm(name):
         if not hasattr(Config, k):
             raise AttributeError(
                 f"arm {name!r} overrides unknown Config field {k!r} -- typo?")
+        if k in PINNED_CONFIG_FIELDS:
+            raise ValueError(
+                f"arm {name!r} cannot override pinned v2.0 Config field {k!r}")
         setattr(Config, k, v)
     Config.ARM = name
     return spec
@@ -486,7 +744,7 @@ def base_loss(pred, target, cfg=Config):
 class TransformerDataset(torch.utils.data.Dataset):
     """The whole (small) split, read from HDF5 once and held as one tensor.
 
-    Full train is ~15k x 1040 x 52 float32 ~= 3.2 GB, which fits in RAM and on
+    Full train is ~3.7k x 2080 x 52 float32 ~= 1.6 GB, which fits in RAM and on
     the GPU, so there is no reason to re-open the HDF5 file per worker per epoch.
     """
 
@@ -987,7 +1245,8 @@ def sched_sampling_loss(model, batch, cfg, p, generator=None):
 # Evaluation
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32):
+def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
+             tf_batch_size=None):
     """Teacher-forced loss over all of val + rollout vs persistence.
 
     The rollout scores the model AND persistence on the SAME fixed, unshuffled
@@ -1006,10 +1265,14 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32):
         return torch.autocast(device_type='cuda', dtype=amp_dtype)
 
     # -- teacher forced, whole validation split ----------------------------
+    # On MPS the caller passes tf_batch_size=1 (via regime.eval_micro_batch)
+    # because a 128-batch forward at SEQ_LEN=2079 costs ~137 GB in attention
+    # scores alone. On CUDA cfg.EVAL_BATCH_SIZE (128) is used as-is.
+    tf_bs = int(tf_batch_size) if tf_batch_size else int(cfg.EVAL_BATCH_SIZE)
     tf_loss = tf_mse = 0.0
     tf_n = 0
-    for start in range(0, val_data.shape[0], cfg.EVAL_BATCH_SIZE):
-        b = val_data[start:start + cfg.EVAL_BATCH_SIZE]
+    for start in range(0, val_data.shape[0], tf_bs):
+        b = val_data[start:start + tf_bs]
         if b.device.type != device.split(':')[0]:
             b = b.to(device, non_blocking=True)
         with _autocast():
@@ -1160,6 +1423,288 @@ def save_checkpoint(path, model, optimizer, step, extra):
 
 
 # --------------------------------------------------------------------------- #
+# Warm-start (v2.0)
+# --------------------------------------------------------------------------- #
+# Default checkpoint fed to `--warm-start`: the v1.0 rollout-best winner from
+# tests/reports/r1_a3b_delta_ar_deep_dive.md (4.78 M-param, epoch 2400,
+# causal OK). NOT `_best.pt` -- the deep dive nominated `_rollout_best.pt`.
+DEFAULT_WARM_START_CKPT = os.path.join(
+    Config.CHECKPOINT_DIR, "r1_a3b_delta_ar_rollout_best.pt")
+
+# Keys whose absence is EXPECTED when warm-starting a v1.0 (NUM_TIME=40)
+# checkpoint into a v2.0 (NUM_TIME=80) model, and why:
+#   time_embeddings.weight  learned positional embedding of shape
+#                           (NUM_TIME, EMBED_SIZE): 40->80, length-dependent.
+#                           Cannot be transferred; will be freshly initialised
+#                           by the 80-frame model and re-learned during
+#                           warm-started training.
+# Additionally we honour BENIGN_MISSING_KEYS from tests/test_model_vs_baseline.py
+# (causal_mask/feat_mean/feat_std) for the same reasons the leaderboard test
+# tolerates them: legacy no-op buffers or normalisation stats that the trainer
+# repopulates before the first optimiser step (see `set_feature_stats` above).
+WARM_START_LENGTH_DEPENDENT_KEYS = frozenset({"time_embeddings.weight"})
+WARM_START_BENIGN_MISSING_KEYS = frozenset({"causal_mask", "feat_mean", "feat_std"})
+
+
+def _wsc(text, color):
+    """Console-colouring helper local to the warm-start log.
+
+    Honours NO_COLOR (and its de-facto pair PFD_NO_COLOR, already respected
+    by persistence_formal_documentation.py) plus non-tty stdout, so piping
+    the trainer to a file never emits stray ANSI. Kept intentionally tiny
+    and local so this step does not depend on the shared _ANSI helpers that
+    live in persistence_formal_documentation.py -- those move into the
+    shared module in Step 4.
+    """
+    if (os.environ.get("NO_COLOR") or os.environ.get("PFD_NO_COLOR")
+            or not sys.stdout.isatty()):
+        return text
+    codes = {"green": "\033[32m", "red": "\033[31m", "yellow": "\033[33m",
+             "cyan": "\033[36m", "bold": "\033[1m", "dim": "\033[2m"}
+    return f"{codes.get(color, '')}{text}\033[0m"
+
+
+def load_warm_start(model, ckpt_path, device, log=print):
+    """Warm-start `model` from a v1.0 checkpoint under the v2.0 (NUM_TIME=80)
+    shape.
+
+    Semantics:
+      * Only length-dependent tensors listed in
+        `WARM_START_LENGTH_DEPENDENT_KEYS` may be dropped due to shape
+        mismatch; everything else must transfer verbatim.
+      * `load_state_dict(..., strict=False)` is used, but `strict=False` is
+        NOT relied upon as a silent shape-mismatch shield: shape-mismatched
+        keys are sanitised out of the state_dict BEFORE the load call, and
+        any mismatch outside the allowlist is a hard failure.
+      * `unexpected_keys` is always a hard failure (an unexpected key means
+        the checkpoint and the current model disagree about architecture,
+        which no amount of warm-start will fix).
+      * Transferred vs. reinitialised parameter counts are logged in colour.
+
+    Returns a dict summarising what happened, for W&B / audit logging.
+    """
+    if not os.path.exists(ckpt_path):
+        raise SystemExit(
+            f"[warm-start] checkpoint not found: {ckpt_path}. Pass "
+            "--warm-start PATH or --no-warm-start.")
+
+    log(_wsc(f"[warm-start] loading v1.0 winner: {ckpt_path}", "cyan"))
+    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if isinstance(ck, dict) and "model_state_dict" in ck:
+        state_dict = ck["model_state_dict"]
+        ck_meta = {k: ck.get(k) for k in ("step", "epoch", "val_l2",
+                                          "train_l2", "rollout_mse")}
+    elif isinstance(ck, dict) and "state_dict" in ck:
+        state_dict = ck["state_dict"]
+        ck_meta = {}
+    else:
+        state_dict = ck
+        ck_meta = {}
+
+    model_sd = model.state_dict()
+
+    # Sanitise: drop keys whose shape does not match the target model's
+    # parameter shape. Every dropped key must be in the allowlist, else fail.
+    dropped_shape_mismatch = {}
+    filtered = {}
+    for k, v in state_dict.items():
+        if k in model_sd and hasattr(v, "shape"):
+            if tuple(v.shape) != tuple(model_sd[k].shape):
+                dropped_shape_mismatch[k] = (tuple(v.shape),
+                                             tuple(model_sd[k].shape))
+                continue
+        filtered[k] = v
+
+    bad_shape = [k for k in dropped_shape_mismatch
+                 if k not in WARM_START_LENGTH_DEPENDENT_KEYS]
+    if bad_shape:
+        detail = "\n  ".join(
+            f"{k}: ckpt{dropped_shape_mismatch[k][0]} vs model{dropped_shape_mismatch[k][1]}"
+            for k in bad_shape)
+        raise SystemExit(
+            f"[warm-start] REFUSING to load: shape mismatch outside the "
+            f"length-dependent allowlist:\n  {detail}\n"
+            f"Allowlist: {sorted(WARM_START_LENGTH_DEPENDENT_KEYS)}")
+
+    incompatible = model.load_state_dict(filtered, strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    if unexpected:
+        raise SystemExit(
+            f"[warm-start] REFUSING to load: unexpected keys in checkpoint "
+            f"(architecture drift):\n  {unexpected}")
+
+    # `missing_keys` after load = (target params never present in the
+    # sanitised state_dict). Allowed = union(dropped-by-shape, BENIGN).
+    allowed_missing = (set(dropped_shape_mismatch)
+                       | WARM_START_BENIGN_MISSING_KEYS)
+    bad_missing = [k for k in incompatible.missing_keys
+                   if k not in allowed_missing]
+    if bad_missing:
+        raise SystemExit(
+            f"[warm-start] REFUSING to load: missing keys not in allowlist:\n"
+            f"  {bad_missing}\n"
+            f"Allowed length-dependent: {sorted(WARM_START_LENGTH_DEPENDENT_KEYS)}\n"
+            f"Allowed benign:           {sorted(WARM_START_BENIGN_MISSING_KEYS)}")
+
+    # Parameter-count audit. `transferred` counts only rows/columns that
+    # actually landed in the model (i.e. every tensor in `filtered` that
+    # names a target parameter, not a buffer with no `.numel()` in
+    # model_sd -- but state_dict includes both, so we sum over model_sd
+    # keys that were populated).
+    populated = [k for k in filtered if k in model_sd]
+    n_transferred = sum(int(model_sd[k].numel()) for k in populated)
+    reinit_keys = [k for k in model_sd if k not in filtered]
+    n_reinit = sum(int(model_sd[k].numel()) for k in reinit_keys)
+    n_total = sum(int(v.numel()) for v in model_sd.values())
+    pct_transferred = 100.0 * n_transferred / max(1, n_total)
+
+    log(_wsc(
+        f"[warm-start] transferred {n_transferred/1e6:.2f} M "
+        f"({pct_transferred:.2f}% of {n_total/1e6:.2f} M) "
+        f"across {len(populated)} tensors", "green"))
+    if reinit_keys:
+        log(_wsc(
+            f"[warm-start] reinitialised {n_reinit/1e6:.4f} M across "
+            f"{len(reinit_keys)} tensors: {reinit_keys}", "yellow"))
+    if dropped_shape_mismatch:
+        for k, (ck_shape, m_shape) in dropped_shape_mismatch.items():
+            log(_wsc(
+                f"[warm-start]   dropped length-dependent {k}: "
+                f"ckpt{ck_shape} -> model{m_shape} (allowlisted; will be "
+                f"reinit-and-learned at NUM_TIME={Config.NUM_TIME})",
+                "yellow"))
+    if ck_meta:
+        meta_str = "  ".join(f"{k}={v}" for k, v in ck_meta.items()
+                             if v is not None)
+        if meta_str:
+            log(_wsc(f"[warm-start] source ckpt meta: {meta_str}", "dim"))
+
+    return {
+        "warm_start_path": ckpt_path,
+        "transferred_params": n_transferred,
+        "reinit_params": n_reinit,
+        "total_params": n_total,
+        "pct_transferred": pct_transferred,
+        "dropped_length_dependent": sorted(dropped_shape_mismatch),
+        "reinit_keys": reinit_keys,
+        "ckpt_meta": {k: v for k, v in ck_meta.items() if v is not None},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Per-epoch persistence report
+# --------------------------------------------------------------------------- #
+@torch.no_grad()
+def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
+                                 optimizer_step, telemetry=None,
+                                 n_seqs=32, n_frames=28, chunk=None,
+                                 log=print):
+    """Roll out `n_frames` on a fixed 32-sequence val subset and compare
+    MAE / RMSE / L2 against a persistence baseline (last-context-frame held
+    constant). Prints one colored line per metric with the `Δ` in green
+    when the model beats persistence and red otherwise; optionally logs
+    the numbers to W&B under the ``persistence/*`` namespace.
+    """
+    was_training = model.training
+    model.eval()
+    NX, LD = cfg.NUM_X, cfg.LATENT_DIM
+    ctx_frames = int(cfg.VAL_CONTEXT_STEPS)
+    max_horizon = max(0, cfg.NUM_TIME - ctx_frames)
+    n_frames = int(min(n_frames, max_horizon))
+    n_seqs = int(min(n_seqs, val_data.shape[0]))
+    if n_seqs <= 0 or n_frames <= 0:
+        if was_training:
+            model.train()
+        return {}
+
+    batch = val_data[:n_seqs]
+    target_device = torch.device(device) if isinstance(device, str) else device
+    if batch.device != target_device:
+        batch = batch.to(target_device, non_blocking=True)
+
+    # Chunked rollout: at NUM_TIME=80 the AR loop grows the sequence to
+    # SEQ_LEN=2080 tokens and the attention scores are
+    # (chunk * n_heads * L^2 * 4B) PER LAYER. On MPS the caller passes
+    # chunk=1 (via regime.eval_micro_batch); on CUDA the full n_seqs runs in
+    # one shot. Accumulators are scalar sums scaled by n_seqs at the end.
+    chunk = int(chunk) if chunk else int(n_seqs)
+    chunk = max(1, min(chunk, n_seqs))
+    gt_all = batch[:, :, :LD].reshape(n_seqs, cfg.NUM_TIME, NX, LD)
+    n_out = None
+    sum_abs_m = sum_sq_m = sum_l2_m = 0.0
+    sum_abs_p = sum_sq_p = sum_l2_p = 0.0
+    n_elems_m = n_elems_p = 0     # element count for MAE/RMSE means
+    n_l2_m = n_l2_p = 0           # vector count for L2 means
+    for start in range(0, n_seqs, chunk):
+        end = min(start + chunk, n_seqs)
+        sub = batch[start:end]
+        pred_c = rollout_frames(model, sub, cfg,
+                                ctx_frames=ctx_frames, n_frames=n_frames)
+        k = pred_c.shape[1]
+        if n_out is None:
+            n_out = k
+        else:
+            n_out = min(n_out, k)
+        gt_c = gt_all[start:end, ctx_frames:ctx_frames + k]
+        pers_c = gt_all[start:end, ctx_frames - 1:ctx_frames].expand(
+            -1, k, -1, -1).contiguous()
+        dm = (pred_c - gt_c).float()
+        dp = (pers_c - gt_c).float()
+        sum_abs_m += dm.abs().sum().item()
+        sum_sq_m += dm.pow(2).sum().item()
+        sum_l2_m += torch.linalg.vector_norm(dm, dim=-1).sum().item()
+        sum_abs_p += dp.abs().sum().item()
+        sum_sq_p += dp.pow(2).sum().item()
+        sum_l2_p += torch.linalg.vector_norm(dp, dim=-1).sum().item()
+        n_elems_m += dm.numel(); n_elems_p += dp.numel()
+        n_l2_m += dm.shape[0] * dm.shape[1] * dm.shape[2]
+        n_l2_p += dp.shape[0] * dp.shape[1] * dp.shape[2]
+
+    mae_m = sum_abs_m / max(n_elems_m, 1)
+    rmse_m = (sum_sq_m / max(n_elems_m, 1)) ** 0.5
+    l2_m = sum_l2_m / max(n_l2_m, 1)
+    mae_p = sum_abs_p / max(n_elems_p, 1)
+    rmse_p = (sum_sq_p / max(n_elems_p, 1)) ** 0.5
+    l2_p = sum_l2_p / max(n_l2_p, 1)
+
+    def _delta(m, p):
+        return (p - m) / max(p, 1e-12) * 100.0
+
+    def _line(name, m, p):
+        d = _delta(m, p)
+        colored_delta = _c(f"Δ={d:+.2f}%", "green" if d > 0 else "red")
+        log(f"epoch {epoch:>3}  {name:<5} model={m:.3e}  pers={p:.3e}  {colored_delta}")
+
+    _line("MAE",  mae_m,  mae_p)
+    _line("RMSE", rmse_m, rmse_p)
+    _line("L2",   l2_m,   l2_p)
+
+    payload = {
+        "persistence/mae_model": mae_m,
+        "persistence/mae_pers": mae_p,
+        "persistence/mae_delta_pct": _delta(mae_m, mae_p),
+        "persistence/rmse_model": rmse_m,
+        "persistence/rmse_pers": rmse_p,
+        "persistence/rmse_delta_pct": _delta(rmse_m, rmse_p),
+        "persistence/l2_model": l2_m,
+        "persistence/l2_pers": l2_p,
+        "persistence/l2_delta_pct": _delta(l2_m, l2_p),
+        "persistence/epoch": int(epoch),
+        "persistence/horizon_frames": int(n_out),
+        "persistence/n_seqs": int(n_seqs),
+    }
+    if telemetry is not None:
+        try:
+            telemetry.log(payload, step=int(optimizer_step))
+        except TypeError:
+            telemetry.log(payload)
+
+    if was_training:
+        model.train()
+    return payload
+
+
+# --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
 def train(args, log=print):
@@ -1168,6 +1713,11 @@ def train(args, log=print):
     torch.manual_seed(Config.SEED)
     np.random.seed(Config.SEED)
 
+    # Device-adaptive regime: resolved ONCE at startup. Everything the training
+    # loop is allowed to know about the hardware flows through this object.
+    regime = resolve_train_regime(device)
+    print(regime.banner, flush=True)
+
     if Config.USE_TF32 and torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -1175,14 +1725,11 @@ def train(args, log=print):
     if Config.USE_CUDNN_BENCHMARK and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
 
-    amp_dtype = None
+    # AMP is regime-driven. On CUDA we use bf16 autocast without GradScaler
+    # (bf16 has no fp16-style underflow to worry about). On MPS/CPU we do not
+    # autocast at all -- the extra dtype juggling costs more than it saves.
+    amp_dtype = regime.amp_dtype if regime.use_amp else None
     use_scaler = False
-    if Config.AMP and device == "cuda":
-        if torch.cuda.is_bf16_supported():
-            amp_dtype = torch.bfloat16          # no GradScaler needed, no overflow
-        else:
-            amp_dtype = torch.float16
-            use_scaler = True
 
     frame_level = Config.TOKENIZATION == 'frame'
 
@@ -1208,9 +1755,15 @@ def train(args, log=print):
     cpu_gen = torch.Generator()
     cpu_gen.manual_seed(Config.SEED + 2)
 
-    train_loader = InMemoryBatcher(train_ds.data, Config.BATCH_SIZE, shuffle=True,
+    # Regime-driven physical / effective batch. `Config.BATCH_SIZE` and
+    # `Config.ACCUMULATION_STEPS` are no longer read inside the loop.
+    micro_batch = int(regime.micro_batch)
+    virtual_batch = int(regime.virtual_batch)
+    accum_steps = max(1, virtual_batch // micro_batch)
+    train_loader = InMemoryBatcher(train_ds.data, micro_batch, shuffle=True,
                                    generator=data_gen)
     stream = infinite_batches(train_loader)
+    steps_per_epoch = max(1, len(train_loader) // accum_steps)
 
     # -- model --------------------------------------------------------------
     model = get_model(Config).to(device)
@@ -1225,6 +1778,39 @@ def train(args, log=print):
         model.set_feature_stats(mean, std)
         log(f"  [model] feature stats installed: mean|max|={mean.abs().max():.3f} "
             f"std range [{std.min():.4g}, {std.max():.4g}]")
+
+    # -- warm-start (v2.0) --------------------------------------------------
+    # Loads the v1.0 rollout-best winner and transfers all shape-compatible
+    # weights; the length-dependent positional embedding is dropped and
+    # reinitialised for NUM_TIME=80. Skipped when --no-warm-start is set,
+    # or when a resume checkpoint exists (--fresh is off and latest.pt is
+    # on disk), because the resume block below will overwrite these weights
+    # anyway and doing both would waste I/O.
+    run_name_for_resume = f"r{Config.SWEEP_ROUND}_{Config.ARM}"
+    latest_path_check = os.path.join(
+        Config.CHECKPOINT_DIR, f"{run_name_for_resume}_latest.pt")
+    will_resume = os.path.exists(latest_path_check) and not args.fresh
+    warm_start_summary = None
+    if getattr(args, "no_warm_start", False):
+        log(_wsc("  [warm-start] disabled by --no-warm-start", "yellow"))
+    elif will_resume:
+        log(_wsc(
+            f"  [warm-start] skipped: {latest_path_check} exists and "
+            "--fresh is off; resume will supply the weights.", "dim"))
+    else:
+        warm_start_summary = load_warm_start(
+            model, args.warm_start, device, log=lambda s: log("  " + s))
+
+    warm_started = warm_start_summary is not None
+
+    # -- torch.compile (CUDA only, never fatal) ----------------------------
+    if regime.compile_model:
+        try:
+            model = torch.compile(model)
+            log("  [compile] torch.compile(model): OK")
+        except Exception as e:
+            log(f"  [compile] torch.compile(model) failed "
+                f"({type(e).__name__}: {e}); continuing eager")
 
     # -- causality gate -----------------------------------------------------
     probe = probe_causality(model, Config, device)
@@ -1272,9 +1858,24 @@ def train(args, log=print):
         except Exception as e:
             log(f"  [resume] failed ({type(e).__name__}: {e}); starting fresh")
 
+    # W&B run name embeds arm, NUM_TIME, and whether warm-start was actually
+    # applied on this run (a resumed run or --no-warm-start reads as ws=0).
+    wandb_run_name = f"r{Config.SWEEP_ROUND}_{Config.ARM}_t{Config.NUM_TIME}_ws{int(warm_started)}"
+    wandb_config = dict(config_dict())
+    wandb_config.update({
+        "regime.device": regime.device,
+        "regime.micro_batch": regime.micro_batch,
+        "regime.virtual_batch": regime.virtual_batch,
+        "regime.use_amp": regime.use_amp,
+        "regime.amp_dtype": str(regime.amp_dtype),
+        "regime.compile_model": regime.compile_model,
+        "regime.cudnn_benchmark": regime.cudnn_benchmark,
+        "warm_started": warm_started,
+    })
     tel = _Telemetry(
-        not args.no_wandb, project=Config.WANDB_PROJECT, name=run_name, id=run_name,
-        resume="allow", config=config_dict())
+        not args.no_wandb, project=Config.WANDB_PROJECT,
+        name=wandb_run_name, id=run_name,
+        resume="allow", config=wandb_config)
 
     ar_mode = Config.AR_MODE
     ar_target_w = float(Config.AR_LOSS_WEIGHT)
@@ -1298,14 +1899,16 @@ def train(args, log=print):
     curves = []
     last_metrics = {}
     log(f"  [train] budget={Config.MAX_STEPS} optimizer steps  "
-        f"micro_batch={Config.BATCH_SIZE} x accum={Config.ACCUMULATION_STEPS} "
-        f"= effective {Config.BATCH_SIZE * Config.ACCUMULATION_STEPS}  "
-        f"amp={amp_dtype}  loss={Config.LOSS}")
+        f"micro_batch={micro_batch} x accum={accum_steps} "
+        f"= effective {micro_batch * accum_steps}  "
+        f"steps_per_epoch~{steps_per_epoch}  "
+        f"amp={amp_dtype}  loss={Config.LOSS}  device={regime.device}")
 
     stop_reason = "completed"
     # Rate is measured from where this PROCESS started, not from step 0, so an
     # ETA after resuming a checkpoint is not diluted by the earlier run's steps.
     start_step_for_rate = step
+    first_vbatch_micro_count_logged = False
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -1314,14 +1917,16 @@ def train(args, log=print):
         run_ar = (ar_mode != 'none' and ar_w > 0
                   and step % max(1, int(Config.AR_EVERY_N_STEPS)) == 0)
 
-        for micro in range(Config.ACCUMULATION_STEPS):
+        micro_count = 0
+        for micro in range(accum_steps):
             batch = next(stream)
             if batch.device.type != device.split(':')[0]:
                 batch = batch.to(device, non_blocking=True)
 
-            amp_ctx = (torch.autocast(device_type='cuda', dtype=amp_dtype)
-                       if amp_dtype is not None
-                       else torch.autocast(device_type='cpu', enabled=False))
+            if regime.use_amp and regime.device == "cuda" and amp_dtype is not None:
+                amp_ctx = torch.autocast(device_type='cuda', dtype=amp_dtype)
+            else:
+                amp_ctx = torch.autocast(device_type='cpu', enabled=False)
             with amp_ctx:
                 pred, tgt = teacher_forced(model, batch, Config,
                                            noise_std=Config.NOISE_STD, generator=dev_gen)
@@ -1339,12 +1944,24 @@ def train(args, log=print):
                         ar_acc = aux.item()
                         loss = loss + ar_w * aux
                 loss_acc += loss.item()
-                loss = loss / Config.ACCUMULATION_STEPS
+                loss = loss / accum_steps
 
             if use_scaler:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+
+            micro_count += 1
+
+        # First-vbatch accumulation observability: catch an early regression
+        # where the loop runs a different number of micro-batches than the
+        # regime asked for. Assertion is loud but non-fatal in prod (log only).
+        if not first_vbatch_micro_count_logged:
+            log(f"  [train] first virtual batch: observed {micro_count} "
+                f"micro-batches (expected {accum_steps})")
+            assert micro_count == accum_steps, (
+                f"accumulation mismatch: observed {micro_count} vs expected {accum_steps}")
+            first_vbatch_micro_count_logged = True
 
         if Config.GRAD_CLIP and Config.GRAD_CLIP > 0:
             if use_scaler:
@@ -1353,6 +1970,8 @@ def train(args, log=print):
         else:
             grad_norm = torch.tensor(float('nan'))
 
+        # optimizer.step() + zero_grad() only when accumulated == accum_steps,
+        # which is enforced by the accum_steps-length inner for-loop above.
         if use_scaler:
             scaler.step(optimizer)
             scaler.update()
@@ -1361,7 +1980,7 @@ def train(args, log=print):
         scheduler.step()
         step += 1
 
-        train_loss = base_acc / Config.ACCUMULATION_STEPS
+        train_loss = base_acc / accum_steps
         best["train_loss"] = min(best["train_loss"], train_loss)
 
         # Log the first few steps unconditionally. These runs are unattended and
@@ -1392,8 +2011,28 @@ def train(args, log=print):
                 f"{elapsed / 60:.1f}m{eta}{flag}")
 
         hit_budget = step >= Config.MAX_STEPS
+
+        # Per-epoch persistence report on a fixed 32-sequence val subset.
+        # Distinct from the VAL_EVERY_STEPS evaluation above -- this fires
+        # once per epoch and is cheap enough (28-frame rollout on 32 seqs)
+        # to be affordable every epoch, including on MPS.
+        if step % steps_per_epoch == 0 or hit_budget:
+            epoch = step // steps_per_epoch
+            try:
+                per_epoch_persistence_report(
+                    model, val_ds.data, Config, device,
+                    epoch=epoch, optimizer_step=step, telemetry=tel,
+                    n_seqs=32, n_frames=28,
+                    chunk=regime.eval_micro_batch, log=log)
+            except Exception as e:
+                log(f"  [persistence] report failed "
+                    f"({type(e).__name__}: {e}); continuing")
+
         if step % Config.VAL_EVERY_STEPS == 0 or hit_budget:
-            m = evaluate(model, val_ds.data, Config, device, amp_dtype=amp_dtype)
+            m = evaluate(model, val_ds.data, Config, device,
+                         amp_dtype=amp_dtype,
+                         chunk=regime.eval_micro_batch,
+                         tf_batch_size=regime.eval_micro_batch)
             m["step"] = step
             m["train_loss"] = train_loss
             m["lr"] = scheduler.get_last_lr()[0]
@@ -1590,6 +2229,96 @@ def run_diagnostics(args, log=print):
 
 
 # --------------------------------------------------------------------------- #
+# v2.0 pinning smoke path
+# --------------------------------------------------------------------------- #
+def run_smoke_test(args):
+    """Build the 80-frame model and prove the pinning is coherent.
+
+    This runs BEFORE any real training loop and touches NO HDF5 data. It:
+
+      1. Builds `get_model(Config)` at the pinned `NUM_TIME=80` /
+         `SEQ_LEN=2080` shape.
+      2. Calls `probe_causality(model, Config, device)` and asserts
+         `causal is True`. If the probe fails, this function raises
+         SystemExit BEFORE the first optimizer step -- which is the whole
+         point of the gate.
+      3. Only then runs a handful (`--smoke-steps`, default 3) of
+         `micro_batch=1` forward + backward + step cycles on synthetic
+         (2080-token) tensors, to prove the shapes flow end-to-end at the
+         new sequence length.
+
+    Intentionally minimal: no data loader, no checkpoint I/O, no W&B. This
+    is the shape/causality gate the pinning step needs -- the device-adaptive
+    regime and warm-start live in later steps.
+    """
+    device = Config.DEVICE if args.device is None else args.device
+    log = print
+    # Print the device-adaptive regime banner even in the smoke path so the
+    # colored banner is exercised end-to-end during CPU validation.
+    regime = resolve_train_regime(device)
+    print(regime.banner, flush=True)
+    log(f"[smoke] regime: device={regime.device} micro_batch={regime.micro_batch} "
+        f"virtual_batch={regime.virtual_batch} use_amp={regime.use_amp} "
+        f"compile={regime.compile_model}")
+    log(f"[smoke] pinned v2.0: NUM_TIME={Config.NUM_TIME}, "
+        f"NUM_X={Config.NUM_X}, SEQ_LEN={Config.SEQ_LEN} "
+        f"(expected 2080), device={device}")
+    if (Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN) != (80, 26, 2080):
+        raise SystemExit(f"[smoke] pinning invariant violated: "
+                         f"NUM_TIME={Config.NUM_TIME}, NUM_X={Config.NUM_X}, "
+                         f"SEQ_LEN={Config.SEQ_LEN}")
+
+    torch.manual_seed(Config.SEED)
+    model = get_model(Config).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    log(f"[smoke] built {type(model).__name__} "
+        f"({n_params/1e6:.2f} M params, frame_native={getattr(model, 'frame_native', False)})")
+
+    # -- causality gate ----------------------------------------------------
+    probe = probe_causality(model, Config, device)
+    log(f"[smoke] probe_causality: before_cut={probe['max_change_before_cut']:.3e} "
+        f"after_cut={probe['max_change_after_cut']:.3e} "
+        f"tol={probe['tolerance']:.3e} causal={probe['causal']}")
+    if not probe["causal"]:
+        raise SystemExit(
+            f"[smoke] causality gate FAILED at NUM_TIME={Config.NUM_TIME}: "
+            f"outputs before the cut moved {probe['max_change_before_cut']:.3e} "
+            f"(tolerance {probe['tolerance']:.3e}). Refusing to run optimizer "
+            "steps on a leaky model."
+        )
+    if not probe["probe_responsive"]:
+        raise SystemExit("[smoke] probe non-responsive: post-cut outputs did not move; "
+                         "the probe is not exercising the model.")
+    log("[smoke] causality gate PASSED. Running "
+        f"{args.smoke_steps} x micro_batch=1 forward+backward on synthetic data.")
+
+    # -- micro_batch=1 shakedown ------------------------------------------
+    frame_native = bool(getattr(model, 'frame_native', False))
+    if frame_native:
+        # (B, NUM_TIME, frame_dim + FRAME_META_COLS)
+        width = Config.NUM_X * Config.LATENT_DIM + FRAME_META_COLS
+        seq_len = Config.NUM_TIME
+    else:
+        width = Config.INPUT_DIM
+        seq_len = Config.SEQ_LEN
+
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    model.train()
+    for step in range(int(args.smoke_steps)):
+        x = torch.randn(1, seq_len, width, device=device)
+        y = torch.randn_like(x[..., :model.output_head.out_features])
+        pred = model(x)
+        loss = F.mse_loss(pred, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        log(f"[smoke]   step {step+1}/{args.smoke_steps}: loss={loss.item():.4e}")
+
+    log("[smoke] OK: 80-frame model builds, is causal, and trains one micro-batch at a time.")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def build_parser():
@@ -1617,6 +2346,23 @@ def build_parser():
     p.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint")
     p.add_argument("--allow-leak", action="store_true",
                    help="do not abort when the causality probe fails")
+    p.add_argument("--warm-start", default=DEFAULT_WARM_START_CKPT,
+                   metavar="CKPT",
+                   help="v1.0 checkpoint to warm-start the 80-frame model from "
+                        "(default: r1_a3b_delta_ar_rollout_best.pt). Loaded with "
+                        "strict=False after sanitising length-dependent tensors; "
+                        "any missing/unexpected keys outside the allowlist are a "
+                        "hard failure. Ignored when a resume checkpoint exists.")
+    p.add_argument("--no-warm-start", action="store_true",
+                   help="do NOT warm-start from any v1.0 checkpoint (cold start)")
+    p.add_argument("--smoke-test", action="store_true",
+                   help="v2.0 pinning smoke path: build the 80-frame model, prove "
+                        "probe_causality(...)['causal'] is True, then run a handful of "
+                        "micro_batch=1 forward+backward steps on synthetic data. NO "
+                        "optimizer step runs before the causality gate passes; no HDF5 "
+                        "data is touched. Exits nonzero on causality failure.")
+    p.add_argument("--smoke-steps", type=int, default=3,
+                   help="number of micro_batch=1 forward+backward passes in --smoke-test")
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE",
                    help="ad-hoc Config overrides, applied after the arm")
     return p
@@ -1655,6 +2401,15 @@ def main(argv=None):
         return 0
 
     Config.SWEEP_ROUND = args.round
+    # No-arg default (plan Step 2 "No-arg default on Mac"): running
+    #   python train_production_transformer_deep_dive.py
+    # with zero CLI flags launches the v1.0 winner arm (`a3b_delta_ar`) --
+    # its default `--warm-start` target (`r1_a3b_delta_ar_rollout_best.pt`)
+    # is already on disk, so this pairs a coherent arm with a coherent
+    # warm-start on the same line. `--arm NAME` / `--diagnostics-only` /
+    # `--smoke-test` / `--list-arms` remain explicit overrides.
+    if not args.arm and not (args.list_arms or args.diagnostics_only or args.smoke_test):
+        args.arm = "a3b_delta_ar"
     if args.arm:
         apply_arm(args.arm)
 
@@ -1674,6 +2429,9 @@ def main(argv=None):
         k, v = item.split("=", 1)
         if not hasattr(Config, k):
             raise SystemExit(f"--set: unknown Config field {k!r}")
+        if k in PINNED_CONFIG_FIELDS:
+            raise SystemExit(
+                f"--set cannot override pinned v2.0 Config field {k!r}")
         setattr(Config, k, _coerce(v))
 
     # Derived fields, recomputed after every override so the `config` dict stored
@@ -1690,8 +2448,14 @@ def main(argv=None):
         run_diagnostics(args)
         return 0
 
+    if args.smoke_test:
+        return run_smoke_test(args)
+
     if not args.arm:
-        raise SystemExit("need --arm NAME (or --diagnostics-only / --list-arms)")
+        # Unreachable under the no-arg default above; kept as a defensive
+        # guard so any future code path that clears args.arm still fails
+        # loudly rather than launching an unconfigured run.
+        raise SystemExit("need --arm NAME (or --diagnostics-only / --list-arms / --smoke-test)")
     train(args)
     return 0
 

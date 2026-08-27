@@ -498,15 +498,15 @@ def seq_to_frames(batch, num_x, latent_dim):
 class FrameTransformer(nn.Module):
     """One token per TIME FRAME instead of one token per (time, x) pair.
 
-    Motivation: with token-level flattening the sequence is 1040 tokens of which
-    only every 26th crosses a time-frame boundary, so a next-token objective is
+    Motivation: with token-level flattening the sequence is NUM_TIME*NUM_X tokens
+    of which only every NUM_X-th crosses a time-frame boundary, so a next-token objective is
     dominated by SPATIAL continuation within a frame and spends most of its
     capacity there. Collapsing each frame into a single 1222-dim token makes the
-    sequence 40 tokens long and the objective purely temporal -- which is the
+    sequence NUM_TIME tokens long and the objective purely temporal -- which is the
     quantity the persistence baseline is actually measured on.
 
-    Side benefit: rollout is 28 sequential steps instead of 728, so evaluation
-    is ~26x cheaper.
+    Side benefit: rollout is one step per frame instead of one per token, so
+    evaluation is approximately NUM_X times cheaper.
 
     Trade-off: there is no within-frame autoregression, so frame f is predicted
     from frames < f only (the token model additionally sees earlier x-positions
@@ -603,7 +603,8 @@ class FrameTransformer(nn.Module):
 def get_model(config):
     """Build the model described by `config`.
 
-    `TOKENIZATION` selects token-level (1040 tokens) vs frame-level (40 tokens);
+    `TOKENIZATION` selects token-level (NUM_TIME*NUM_X tokens) vs frame-level
+    (NUM_TIME tokens);
     `VARIANT` selects the attention/block type within that. Kept as a function
     rather than a class registry because checkpoints record these as strings and
     the leaderboard test rebuilds from them.
@@ -616,7 +617,7 @@ def get_model(config):
             config.USE_SWIGLU = True
         elif variant == 'conv':
             raise ValueError("VARIANT='conv' is token-level only; the frame "
-                             "sequence is 40 tokens and a depthwise conv over "
+                             "sequence has NUM_TIME tokens and a depthwise conv over "
                              "it mixes time frames without adding locality.")
         return FrameTransformer(config)
     if tokenization != 'token':

@@ -17,9 +17,16 @@ OUTPUT_DIR = os.path.join(PROJECT_ROOT, "transformer_neurIPS/data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configuration
+# NUM_TIME_NEW is the sequence length (context + forecast) in frames.
+# Default 40 (12 context + 28 forecast, 233.3 ms forecast @ 120 Hz -- v1.0).
+# For the v2.0 migration this is overridden to 80 (12 context + 68 forecast,
+# 566.7 ms forecast @ 120 Hz) via the --num-time CLI flag, which also switches
+# the output filenames to train_<N>.h5 / val_<N>.h5. WINDOWS_PER_COORD is
+# derived so that every coordinate contributes disjoint, non-overlapping
+# windows tiling all TOTAL_TIMESTAMPS frames.
 NUM_TIME_NEW = 40
 TOTAL_TIMESTAMPS = 1200
-WINDOWS_PER_COORD = TOTAL_TIMESTAMPS // NUM_TIME_NEW # 30
+WINDOWS_PER_COORD = TOTAL_TIMESTAMPS // NUM_TIME_NEW # 30 for N=40, 15 for N=80
 NUM_X = 26
 X_COORDS = np.array([-29, -26, -22, -18, -14, -10, -6, -2, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69], dtype='float32')
 
@@ -240,8 +247,10 @@ def prepare_data(sample_percent=100.0, test_mode=False):
     train_params = ["3p6", "4p4", "4p6", "5p2", "6p6", "7p2", "7p8", "8p4", "10p4", "11p4"]
     val_params = ["6p4"]
 
-    process_set(train_params, "train_40.h5", selected_wake_coords, sample_percent, test_mode)
-    process_set(val_params, "val_40.h5", selected_wake_coords, sample_percent, test_mode)
+    train_out = f"train_{NUM_TIME_NEW}.h5"
+    val_out = f"val_{NUM_TIME_NEW}.h5"
+    process_set(train_params, train_out, selected_wake_coords, sample_percent, test_mode)
+    process_set(val_params, val_out, selected_wake_coords, sample_percent, test_mode)
     
     print(f"\n✅ Total time: {time.time()-t0:.2f}s")
 
@@ -249,5 +258,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=float, default=100.0, help="Percentage of data to sample (0-100)")
     parser.add_argument("--test", action="store_true", help="Test mode: only first sequence for each experiment")
+    parser.add_argument("--num-time", type=int, default=NUM_TIME_NEW,
+                        help="Sequence length in frames (40 for v1.0, 80 for the v2.0 migration). "
+                             "Must divide TOTAL_TIMESTAMPS (1200). Output filenames switch to "
+                             "train_<N>.h5 / val_<N>.h5 accordingly.")
     args = parser.parse_args()
+
+    if TOTAL_TIMESTAMPS % args.num_time != 0:
+        raise SystemExit(
+            f"--num-time={args.num_time} does not divide TOTAL_TIMESTAMPS={TOTAL_TIMESTAMPS}; "
+            f"pick a value from {[n for n in (10, 20, 24, 30, 40, 48, 50, 60, 75, 80, 100, 120, 150, 200, 240, 300, 400, 600, 1200) if TOTAL_TIMESTAMPS % n == 0]}"
+        )
+    NUM_TIME_NEW = args.num_time
+    WINDOWS_PER_COORD = TOTAL_TIMESTAMPS // NUM_TIME_NEW
+    print(f"NUM_TIME_NEW={NUM_TIME_NEW}, WINDOWS_PER_COORD={WINDOWS_PER_COORD}")
     prepare_data(args.sample, args.test)

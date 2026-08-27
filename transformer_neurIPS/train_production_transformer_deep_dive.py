@@ -158,9 +158,54 @@ Every saved checkpoint follows the `r{SWEEP_ROUND}_{ARM}_{kind}.pt` pattern
 pattern `persistence_formal_documentation.py`'s `PFD_RUN` / `PFD_KIND` env-vars
 key off, so a promoted H200 checkpoint drops straight into that harness with
 no rename step.
+
+SCRIPTED MODEL SAVES
+====================
+`Config.SAVE_SCRIPTED_MODELS = True` (default) makes every call to
+`save_checkpoint(...)` also emit a self-contained TorchScript companion at
+`<path>_scripted.pt`. Unlike the plain state-dict `.pt`, the scripted file
+does NOT need `model_variants.py` / `Config` on the reload side: the whole
+computation graph and every parameter/buffer are baked into the artifact,
+so `torch.jit.load(path)` works standalone.
+
+For every kind of checkpoint the trainer produces, the paired files are:
+
+    r{SWEEP_ROUND}_{ARM}_{kind}.pt           # state dict (existing)
+    r{SWEEP_ROUND}_{ARM}_{kind}_scripted.pt  # TorchScript companion (new)
+
+Guardrails around the scripted save (see `save_scripted_model()` for the
+implementation of each one):
+
+  * `torch.compile(model)` is unwrapped via `getattr(model, "_orig_mod",
+    model)` BEFORE scripting -- TorchScript cannot script an
+    `OptimizedModule`.
+  * `torch.jit.script` is attempted first (preserves control flow such as
+    the `PREDICT_DELTA` branch), then `torch.jit.trace` on a
+    representative synthetic input as a fallback.
+  * `feat_mean` / `feat_std` are asserted to be registered buffers on
+    both `BaseTransformer` and `FrameTransformer` before saving, because
+    a plain attribute would not ride along in the scripted artifact and
+    the eval side would silently see uninitialised statistics.
+  * `frame_native` (class attribute) is honoured to size the
+    representative example correctly for `FrameTransformer` vs. the
+    token-native variants.
+  * After writing, the file is reloaded with `torch.jit.load` and one
+    forward is executed on a CPU synthetic input; a failed roundtrip is
+    logged in yellow but does not abort training -- the state-dict `.pt`
+    is authoritative.
+  * Every completed write (state-dict AND scripted) is logged with the
+    full absolute path in RAINBOW colouring via `_log_write()`, so
+    scrollback answers 'where did that go?' without re-deriving
+    `Config.CHECKPOINT_DIR`. Honours `PFD_NO_COLOR` / `NO_COLOR` /
+    non-tty stdout.
+
+Unit-tested end-to-end in `tests/test_scripted_save.py` (compile-unwrap,
+buffer-requirement failure mode, frame-native and token-native variants,
+`torch.jit.load` roundtrip on CPU, rainbow-log absolute-path emission).
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -252,6 +297,8 @@ class TrainRegime:
     micro_batch: int
     virtual_batch: int
     eval_micro_batch: int
+    aux_micro_batch: int
+    disable_ar: bool
     use_amp: bool
     amp_dtype: Any
     compile_model: bool
@@ -278,6 +325,8 @@ def _regime_banner_cuda(micro_batch, virtual_batch):
     diff = [
         ("batch size",         str(micro_batch),  "1"),
         ("eval batch",         str(micro_batch),  "1"),
+        ("AR/aux batch",       str(micro_batch),  "1"),
+        ("AR aux loss",        "enabled",          "DISABLED"),
         ("AMP dtype",          "bfloat16",         "off"),
         ("torch.compile",      "on",               "off"),
         ("cudnn.benchmark",    "on",               "off"),
@@ -319,7 +368,8 @@ def resolve_train_regime(device):
             pass
         return TrainRegime(
             device="cuda", micro_batch=micro, virtual_batch=virtual,
-            eval_micro_batch=micro,
+            eval_micro_batch=micro, aux_micro_batch=micro,
+            disable_ar=False,
             use_amp=True, amp_dtype=torch.bfloat16,
             compile_model=True, cudnn_benchmark=True, banner=banner)
 
@@ -331,9 +381,24 @@ def resolve_train_regime(device):
     # peak-memory reduction -- and keeps the TF-eval pass within budget too
     # (EVAL_BATCH_SIZE=128 at L=2079 would otherwise need ~137 GB for attn).
     banner = _regime_banner_mps_cpu(micro_batch=1)
+    # AR / scheduled-sampling losses also clamp to singleton on MPS/CPU: the AR
+    # loop is sequential and each intermediate forward keeps its full activation
+    # graph for backward, so peak memory scales linearly with AR_SEQS. With the
+    # default arm's AR_SEQS=4 that is ~4x a training forward at L=2080 and
+    # blows the 88 GB MPS ceiling from inside frame_ar_loss (observed OOM).
+    # AR aux loss is DISABLED on MPS/CPU. Even at AR_SEQS=1 the sequential
+    # AR loop does `AR_FRAMES * NUM_X` = 4*26 = 104 forwards under token
+    # tokenization, each retaining its full activation graph for backward
+    # through `preds` (the `.detach()` only truncates the fed-back token, not
+    # the graph of the forward itself). At L~=300+ and 6 layers that piles up
+    # past the 88 GB MPS ceiling from inside frame_ar_loss (observed OOM even
+    # after AR_SEQS was clamped to 1). The primary next-token loss still
+    # trains the model on MPS; the AR loss is a rollout-stabilization aux and
+    # is CUDA-only in v2.0 (kept on CUDA at the arm-specified AR_SEQS).
     return TrainRegime(
         device=dev_str, micro_batch=1, virtual_batch=32,
-        eval_micro_batch=1,
+        eval_micro_batch=1, aux_micro_batch=1,
+        disable_ar=True,
         use_amp=False, amp_dtype=None,
         compile_model=False, cudnn_benchmark=False, banner=banner)
 
@@ -389,8 +454,8 @@ class Config:
     ADAM_BETAS = (0.9, 0.95)
     LOSS = 'l2norm'            # l2norm | mse | huber
     HUBER_DELTA = 0.01
-    MAX_STEPS = 6000           # OPTIMIZER steps -- the primary clock
-    MAX_HOURS = 12.0           # wall-clock safety net only
+    MAX_STEPS = 600_000           # OPTIMIZER steps -- the primary clock
+    MAX_HOURS = 1200.0           # wall-clock safety net only
 
     # -- rollout-stability techniques --------------------------------------
     NOISE_STD = 5e-4           # gaussian noise on fed-in latents
@@ -407,15 +472,21 @@ class Config:
     VAL_CONTEXT_STEPS = 12                      # frames fed as context
     VAL_ROLLOUT_STEPS = NUM_X * (NUM_TIME - VAL_CONTEXT_STEPS)   # 1768 tokens (v1.0: 728)
     VAL_ROLLOUT_SEQS = 64      # fixed row set; model AND persistence both use it
-    VAL_EVERY_STEPS = 400
+    VAL_EVERY_STEPS = 25
     LOG_EVERY_STEPS = 25
-    CHECKPOINT_EVERY_STEPS = 400
+    CHECKPOINT_EVERY_STEPS = 25
 
     # -- runtime ------------------------------------------------------------
     USE_TF32 = True
     USE_CUDNN_BENCHMARK = True
     AMP = True
-    SAVE_SCRIPTED_MODELS = False
+    # TorchScript companion saves. When True, every call to `save_checkpoint`
+    # writes a self-contained `<name>_scripted.pt` alongside the plain
+    # state-dict `<name>.pt`. See `save_scripted_model()` and the SCRIPTED
+    # MODEL SAVES section of this module's docstring for the full contract
+    # (torch.compile `_orig_mod` unwrap, script->trace fallback, buffer
+    # verification, roundtrip check).
+    SAVE_SCRIPTED_MODELS = True
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
@@ -1408,18 +1479,264 @@ def config_dict():
             if not k.startswith('_') and not callable(getattr(Config, k))}
 
 
-def save_checkpoint(path, model, optimizer, step, extra):
+def _log_write(path, log=print, kind="checkpoint"):
+    """Rainbow-log a completed on-disk write.
+
+    Uses the absolute path so remote logs (wandb / tmux scrollback) are
+    unambiguous about where the artifact landed. The `_rainbow` helper
+    already honours PFD_NO_COLOR / NO_COLOR / non-tty stdout, so this
+    degrades to plain text automatically.
+    """
+    try:
+        abs_path = os.path.abspath(path)
+    except Exception:
+        abs_path = str(path)
+    size_hint = ""
+    try:
+        if os.path.exists(path):
+            size_hint = f" ({os.path.getsize(path) / 1e6:.2f} MB)"
+    except Exception:
+        pass
+    label = f"[write:{kind}]"
+    log(_rainbow(f"{label} {abs_path}{size_hint}"))
+
+
+def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
+    """Save a self-contained TorchScript companion of `model` to `script_path`.
+
+    This is the single guarded implementation used by `save_checkpoint` when
+    `Config.SAVE_SCRIPTED_MODELS` is True. It closes every caveat listed in
+    the module docstring's SCRIPTED MODEL SAVES section:
+
+      1. `torch.compile` unwrap. If `model` was wrapped by `torch.compile`,
+         its parameters are prefixed with `_orig_mod.` and it is not itself a
+         plain `nn.Module` from TorchScript's point of view. We unwrap via
+         `getattr(model, "_orig_mod", model)` before scripting.
+
+      2. `torch.jit.script` first, `torch.jit.trace` fallback. Scripting
+         preserves control flow (e.g. `if self.predict_delta:` branches)
+         but requires TorchScript-clean source. Tracing bakes in whichever
+         branch the example took but works on almost any eager module. If
+         script fails, we fall back to trace on a representative synthetic
+         input matching the arm's tokenization.
+
+      3. Buffer sanity. `feat_mean` and `feat_std` MUST be registered as
+         real buffers (they are on both `BaseTransformer` and
+         `FrameTransformer`) so they ride along in the scripted artifact.
+         We refuse to save otherwise -- a scripted module with a plain
+         attribute `feat_mean` would evaluate uninitialised on the reload
+         side and silently produce garbage.
+
+      4. Frame-native vs. token-native shape. `frame_native` is a class
+         attribute on the underlying module (True for `FrameTransformer`,
+         False for the token variants); we read it AFTER the compile
+         unwrap and size the representative example accordingly. The
+         scripted artifact takes the same input shape that `evaluate()`
+         and `rollout_frames()` already feed the eager model.
+
+      5. Non-fatal training state preservation. Scripting toggles
+         `model.eval()` and can move tensors; we restore `train()` on the
+         underlying module before returning so the training loop is
+         undisturbed.
+
+      6. Roundtrip verification. We reload the just-written file with
+         `torch.jit.load` and run one forward on a CPU-side synthetic
+         input, so a broken scripted save is caught HERE, not on the H200
+         evaluation box three hours from now. A failed roundtrip is
+         logged loudly in yellow but does not abort training (the plain
+         state-dict `.pt` is authoritative).
+
+    Returns a small dict describing what happened (method, error strings,
+    verification status) for callers that want to log/aggregate this.
+    """
+    inner = getattr(model, "_orig_mod", model)
+    if device is None:
+        try:
+            device = next(inner.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+
+    # Remember the eager module's original device BEFORE any scripting /
+    # tracing happens. `torch.jit.trace` shares parameter storage with the
+    # underlying eager module (unlike `torch.jit.script`, which copies), so
+    # a later `scripted.to("cpu")` on a traced artifact silently migrates
+    # the LIVE training model to CPU. The next optimizer step then dies
+    # with `Expected all tensors to be on the same device, but got mat1 is
+    # on cuda:0, different from other tensors on cpu`. We restore the
+    # eager module to its original device after saving (whether we went
+    # through script or trace) to close that leak. See the "SCRIPTED MODEL
+    # SAVES" section of the module docstring for the full story.
+    try:
+        orig_device = next(inner.parameters()).device
+    except StopIteration:
+        orig_device = torch.device("cpu")
+
+    # (3) buffer sanity -- must be REAL buffers so torch.jit picks them up.
+    buffer_names = {n for n, _ in inner.named_buffers()}
+    for req in ("feat_mean", "feat_std"):
+        if req not in buffer_names:
+            raise RuntimeError(
+                f"[scripted] refusing to save: '{req}' is not a registered "
+                f"buffer on {type(inner).__name__}; TorchScript would drop "
+                "it and eval would run against an uninitialised normaliser.")
+
+    # (4) shape the representative example for the arm's tokenization.
+    frame_native = bool(getattr(inner, "frame_native", False))
+    if frame_native:
+        seq_len = int(cfg.NUM_TIME)
+        width = int(cfg.NUM_X * cfg.LATENT_DIM + FRAME_META_COLS)
+    else:
+        seq_len = int(cfg.SEQ_LEN)
+        width = int(cfg.INPUT_DIM)
+
+    # (5) freeze training-state semantics for the caller.
+    was_training = inner.training
+    inner.eval()
+
+    result = {"path": script_path, "method": None,
+              "script_error": None, "trace_error": None,
+              "roundtrip_ok": False}
+    scripted = None
+    try:
+        try:
+            scripted = torch.jit.script(inner)
+            result["method"] = "script"
+        except Exception as e:
+            result["script_error"] = f"{type(e).__name__}: {e}"
+            # (2) trace fallback on a representative synthetic input.
+            ex = torch.zeros(1, seq_len, width, device=device)
+            try:
+                scripted = torch.jit.trace(
+                    inner, ex, strict=False, check_trace=False)
+                result["method"] = "trace"
+            except Exception as e2:
+                result["trace_error"] = f"{type(e2).__name__}: {e2}"
+                log(_c(
+                    f"  [scripted] BOTH script and trace failed for "
+                    f"{type(inner).__name__}: script={result['script_error']}; "
+                    f"trace={result['trace_error']}. Skipping "
+                    f"{os.path.basename(script_path)}.", "red"))
+                return result
+
+        # Convert to CPU before saving so the artifact is portable to a
+        # host without a CUDA / MPS device.
+        #
+        # CRITICAL: `torch.jit.trace` returns a ScriptModule that shares
+        # parameter/buffer STORAGE with `inner`. An in-place `.to("cpu")`
+        # on such a traced object migrates the eager training model to
+        # CPU as a side effect, which then explodes on the next
+        # `optimizer.step()` with an addmm device-mismatch. `torch.jit.script`
+        # already deep-copies params into a new ScriptModule, so its
+        # `.to("cpu")` is independent of `inner`. To keep both branches
+        # safe uniformly, we deep-copy the ScriptModule BEFORE moving --
+        # cheap on the tiny module sizes we save (~19 MB) and eliminates
+        # the storage-sharing footgun entirely. The `finally` block below
+        # also unconditionally restores `inner` to `orig_device` as a
+        # belt-and-suspenders guard against any future scripting mode
+        # (e.g. `torch.jit.freeze`) that might reintroduce the aliasing.
+        try:
+            scripted_cpu = copy.deepcopy(scripted).to("cpu")
+        except Exception:
+            # deepcopy of a ScriptModule can fail on some torch versions;
+            # if it does, save whichever object we have and rely on the
+            # `finally` device-restore below to keep `inner` correct.
+            try:
+                scripted_cpu = scripted.to("cpu")
+            except Exception:
+                scripted_cpu = scripted
+
+        tmp = script_path + ".tmp"
+        torch.jit.save(scripted_cpu, tmp)
+        os.replace(tmp, script_path)   # atomic
+        _log_write(script_path, log=log, kind=f"scripted:{result['method']}")
+
+        # (6) roundtrip: reload + one forward on CPU synthetic data.
+        try:
+            reloaded = torch.jit.load(script_path, map_location="cpu")
+            with torch.no_grad():
+                ex_cpu = torch.zeros(1, seq_len, width)
+                _ = reloaded(ex_cpu)
+            result["roundtrip_ok"] = True
+        except Exception as e:
+            log(_c(
+                f"  [scripted] WARNING: roundtrip check FAILED for "
+                f"{os.path.basename(script_path)} "
+                f"({type(e).__name__}: {e}); state-dict `.pt` is still "
+                f"authoritative.", "yellow"))
+    finally:
+        # Belt-and-suspenders: restore `inner` to the device it was on
+        # when we entered, in case some path above (e.g. a future
+        # torch.jit.freeze fallback, or a deepcopy that silently
+        # didn't) still migrated its parameters.
+        #
+        # IMPORTANT: only call `.to()` when the device ACTUALLY differs.
+        # `nn.Module.to()` unconditionally runs `_apply(...)`, which in
+        # recent PyTorch iterates every parameter and evaluates
+        # `param_grad = param.grad` (torch/nn/modules/module.py:~974).
+        # On a `torch.compile`-wrapped model whose parameters are
+        # exposed via a proxy, that grad access trips the "The .grad
+        # attribute of a Tensor that is not a leaf Tensor is being
+        # accessed" UserWarning even though nothing here needs to move.
+        # Gating the call on a real device change avoids the spurious
+        # warning without weakening the safety net: if `inner` ever
+        # ends up on the wrong device, we still move it back.
+        try:
+            current_device = next(inner.parameters()).device
+        except StopIteration:
+            current_device = orig_device
+        if current_device != orig_device:
+            try:
+                inner.to(orig_device)
+            except Exception:
+                pass
+        if was_training:
+            inner.train()
+
+    return result
+
+
+def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
+                    save_scripted=None, cfg=Config, log=print):
+    """Write a state-dict checkpoint (atomically) and, if enabled, a
+    TorchScript companion at `<path without .pt>_scripted.pt`.
+
+    Every completed on-disk write is rainbow-logged with the FULL absolute
+    path via `_log_write` so an operator scrolling through a long log can
+    always answer 'where did that best-rollout artifact go?' without
+    re-deriving `Config.CHECKPOINT_DIR`.
+
+    `save_scripted` overrides `Config.SAVE_SCRIPTED_MODELS` for callers that
+    want to force the behaviour one way or the other (e.g. the unit test);
+    default None means 'obey the config flag'.
+    """
     payload = {
         'step': step,
         'epoch': step,          # back-compat: the leaderboard test reads 'epoch'
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'config': config_dict(),
     }
     payload.update(extra)
     tmp = path + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, path)       # atomic: a killed run never leaves a half file
+    _log_write(path, log=log, kind="state_dict")
+
+    do_scripted = (bool(cfg.SAVE_SCRIPTED_MODELS)
+                   if save_scripted is None else bool(save_scripted))
+    if do_scripted:
+        if path.endswith(".pt"):
+            script_path = path[:-3] + "_scripted.pt"
+        else:
+            script_path = path + "_scripted.pt"
+        try:
+            save_scripted_model(script_path, model, cfg=cfg, log=log)
+        except Exception as e:
+            log(_c(
+                f"  [scripted] save failed for {os.path.basename(script_path)}"
+                f" ({type(e).__name__}: {e}); state-dict `.pt` was still "
+                f"written and is authoritative.", "yellow"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1488,6 +1805,15 @@ def load_warm_start(model, ckpt_path, device, log=print):
             f"[warm-start] checkpoint not found: {ckpt_path}. Pass "
             "--warm-start PATH or --no-warm-start.")
 
+    # Rainbow-log the starting-point checkpoint the same way `_log_write`
+    # rainbow-logs a completed on-disk write, so "we're STARTING from THIS
+    # file" is as visually unmissable in scrollback as "we JUST WROTE that
+    # file". Absolute path so remote logs are unambiguous.
+    try:
+        abs_ckpt = os.path.abspath(ckpt_path)
+    except Exception:
+        abs_ckpt = str(ckpt_path)
+    log(_rainbow(f"[start-from:warm-start] {abs_ckpt}"))
     log(_wsc(f"[warm-start] loading v1.0 winner: {ckpt_path}", "cyan"))
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(ck, dict) and "model_state_dict" in ck:
@@ -1846,15 +2172,108 @@ def train(args, log=print):
     if os.path.exists(latest_path) and not args.fresh:
         try:
             ck = torch.load(latest_path, map_location=device, weights_only=False)
-            missing, unexpected = model.load_state_dict(ck['model_state_dict'], strict=False)
-            if ck.get('optimizer_state_dict'):
+            raw_sd = ck['model_state_dict']
+            # Sanitize length-dependent tensors just like load_warm_start:
+            # a `latest.pt` produced by a v1.0 (NUM_TIME=40) run has
+            # `time_embeddings.weight` of shape (40, 256), which cannot be
+            # copied into the v2.0 (NUM_TIME=80) model's (80, 256) parameter.
+            # `strict=False` alone does NOT skip shape-mismatched present
+            # keys -- it still raises. So we drop them explicitly and let
+            # them stay at their freshly-initialised (or warm-started) values.
+            model_sd = model.state_dict()
+            dropped = {}
+            filtered = {}
+            for k, v in raw_sd.items():
+                if k in model_sd and hasattr(v, "shape") and tuple(v.shape) != tuple(model_sd[k].shape):
+                    dropped[k] = (tuple(v.shape), tuple(model_sd[k].shape))
+                    continue
+                filtered[k] = v
+            bad = [k for k in dropped if k not in WARM_START_LENGTH_DEPENDENT_KEYS]
+            if bad:
+                detail = ", ".join(
+                    f"{k}: ckpt{dropped[k][0]} vs model{dropped[k][1]}" for k in bad)
+                raise RuntimeError(
+                    f"resume shape mismatch outside length-dependent allowlist: {detail}")
+            missing, unexpected = model.load_state_dict(filtered, strict=False)
+            # Cross-version detection: if length-dependent tensors had to be
+            # dropped, this is not a real resume -- it is a warm-start out of
+            # a v1.0 (NUM_TIME=40) checkpoint that just happens to be sitting
+            # in the v2.0 saved_models/ directory. In that case:
+            #   * the step counter from v1.0 is meaningless for v2.0 (v1.0
+            #     ran to MAX_STEPS=6000; keeping step=6000 makes the
+            #     `while step < MAX_STEPS:` loop exit immediately without
+            #     training a single step at NUM_TIME=80 -- observed regression);
+            #   * the optimizer's per-parameter moment tensors are stale for
+            #     any reinitialised parameter;
+            #   * the scheduler's `last_epoch` should start at 0 so the v2.0
+            #     run gets its full warmup+cosine schedule, not the v1.0
+            #     annealed tail;
+            #   * `best` metrics from v1.0 (at NUM_TIME=40, VAL_ROLLOUT_STEPS=728)
+            #     are not comparable to v2.0 (VAL_ROLLOUT_STEPS=1768).
+            # So we reset step/best/scheduler to fresh in that branch. Same
+            # optimizer/scheduler skip still applies for the regular
+            # (no-dropped) resume path.
+            cross_version = bool(dropped)
+            if ck.get('optimizer_state_dict') and not cross_version:
                 optimizer.load_state_dict(ck['optimizer_state_dict'])
-            step = int(ck.get('step', 0))
-            for _ in range(step):
-                scheduler.step()
-            best.update({k: v for k, v in ck.get('best', {}).items()})
+            elif ck.get('optimizer_state_dict') and cross_version:
+                log(f"  [resume] skipping optimizer state: length-dependent "
+                    f"tensors were reinitialised ({sorted(dropped)})")
+            if cross_version:
+                log(f"  [resume] cross-version detected (v1.0 -> v2.0): "
+                    f"resetting step=0 and best/* -- v1.0 metrics at "
+                    f"NUM_TIME=40 are not comparable to v2.0 at NUM_TIME=80. "
+                    f"Effectively a warm-start from {latest_path}.")
+                step = 0
+            else:
+                step = int(ck.get('step', 0))
+            # Restore scheduler state directly instead of replaying
+            # scheduler.step() `step` times: the replay path called
+            # scheduler.step() before any optimizer.step() had run in this
+            # process, which is exactly the pattern PyTorch warns about
+            # ("Detected call of `lr_scheduler.step()` before
+            # `optimizer.step()`") and which also silently skips the first
+            # scheduled LR value. If the checkpoint carries a scheduler
+            # state_dict (v2.0.2+), load it verbatim; else fall back to
+            # setting `last_epoch` and rebuilding the LR without calling
+            # `.step()` (see PyTorch docs: setting last_epoch and calling
+            # get_last_lr is the supported resume-without-warning path).
+            sched_sd = ck.get('scheduler_state_dict')
+            if sched_sd is not None and not cross_version:
+                try:
+                    scheduler.load_state_dict(sched_sd)
+                except Exception as e:
+                    log(f"  [resume] scheduler.load_state_dict failed "
+                        f"({type(e).__name__}: {e}); reconstructing from step")
+                    sched_sd = None
+            elif cross_version:
+                # Leave the scheduler at last_epoch=-1 so v2.0 gets its full
+                # warmup+cosine schedule; no `.step()` is called pre-optimizer.
+                sched_sd = "cross_version_reset"
+            if sched_sd is None and step > 0:
+                # Reconstruct scheduler position without triggering the
+                # step-before-optimizer warning. LambdaLR reads last_epoch
+                # and applies the lr_lambda(last_epoch) on the next .step().
+                scheduler.last_epoch = step - 1
+                for group, base_lr in zip(optimizer.param_groups,
+                                          scheduler.base_lrs):
+                    group['lr'] = base_lr * scheduler.lr_lambdas[0](step - 1)
+                scheduler._last_lr = [g['lr'] for g in optimizer.param_groups]
+            if not cross_version:
+                best.update({k: v for k, v in ck.get('best', {}).items()})
+            # Rainbow-log the resume-from checkpoint the same way
+            # `_log_write` rainbow-logs a completed write and
+            # `load_warm_start` rainbow-logs its start-from checkpoint,
+            # so operators can visually pinpoint "we RESUMED from this
+            # exact file at step N" in a long scrollback.
+            try:
+                abs_resume = os.path.abspath(latest_path)
+            except Exception:
+                abs_resume = str(latest_path)
+            log(_rainbow(f"[start-from:resume] {abs_resume} @ step {step}"))
             log(f"  [resume] {latest_path} at step {step} "
-                f"(missing={len(missing)}, unexpected={len(unexpected)})")
+                f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+                f"dropped_length_dependent={sorted(dropped)})")
         except Exception as e:
             log(f"  [resume] failed ({type(e).__name__}: {e}); starting fresh")
 
@@ -1877,9 +2296,71 @@ def train(args, log=print):
         name=wandb_run_name, id=run_name,
         resume="allow", config=wandb_config)
 
+    # Disable AR aux loss on MPS/CPU. Even at AR_SEQS=1 the sequential AR loop
+    # under token tokenization does `AR_FRAMES * NUM_X` sequential forwards
+    # (e.g. 4*26 = 104 for the default arm), each retaining its own full
+    # activation graph for backward through `preds`. That accumulates past the
+    # 88 GB MPS ceiling regardless of AR_SEQS. CUDA branch keeps the AR loss
+    # at the arm-specified AR_SEQS. The primary next-token loss is unaffected.
+    if regime.disable_ar and Config.AR_MODE != 'none':
+        log(f"  [regime] disabling AR aux loss ({Config.AR_MODE} -> none) "
+            f"on device={regime.device}: sequential rollout retains "
+            f"AR_FRAMES*NUM_X={int(Config.AR_FRAMES)*Config.NUM_X} forward "
+            f"activation graphs, OOMs on MPS even at AR_SEQS=1. "
+            f"CUDA path is untouched.")
+        Config.AR_MODE = 'none'
+        Config.AR_LOSS_WEIGHT = 0.0
+    elif int(Config.AR_SEQS) > int(regime.aux_micro_batch):
+        log(f"  [regime] clamping AR_SEQS {Config.AR_SEQS} -> {regime.aux_micro_batch} "
+            f"on device={regime.device} (keeps CUDA defaults untouched)")
+        Config.AR_SEQS = int(regime.aux_micro_batch)
     ar_mode = Config.AR_MODE
     ar_target_w = float(Config.AR_LOSS_WEIGHT)
     ar_warm = max(1, int(Config.MAX_STEPS * float(Config.AR_WEIGHT_WARMUP_FRAC)))
+
+    # -- memory expectation printout ---------------------------------------
+    # Rough peak-attention-score estimate per code path, so an operator can
+    # see at a glance what the resolved regime is spending memory on and
+    # spot a regression immediately if a future edit re-inflates a path.
+    # Model: peak = B * n_heads * L^2 * 4 bytes, times N_LAYERS for the
+    # simultaneously-live layer activations, times a small forward-count
+    # factor for the sequential AR loop (retained-graph across forwards).
+    def _fmt_bytes(nbytes):
+        for unit in ("B", "KiB", "MiB", "GiB"):
+            if nbytes < 1024.0 or unit == "GiB":
+                return f"{nbytes:.2f} {unit}"
+            nbytes /= 1024.0
+
+    def _attn_bytes(B, L, layers=Config.N_LAYERS, heads=Config.N_HEADS,
+                    forwards=1):
+        return int(B) * heads * (int(L) ** 2) * 4 * layers * forwards
+
+    tf_L = Config.SEQ_LEN - 1
+    train_peak = _attn_bytes(micro_batch, tf_L)
+    eval_tf_peak = _attn_bytes(regime.eval_micro_batch, tf_L)
+    rollout_L = Config.SEQ_LEN
+    eval_rollout_peak = _attn_bytes(regime.eval_micro_batch, rollout_L)
+    if regime.disable_ar:
+        ar_peak_str = _c("DISABLED (MPS/CPU)", "yellow")
+    else:
+        # Approximate AR peak: activation graphs for AR_FRAMES*NUM_X forwards
+        # under token tokenization, at the growing sequence length. Use the
+        # final (largest) forward's L as the ceiling estimate.
+        n_ar_fwd = int(Config.AR_FRAMES) * (1 if frame_level else Config.NUM_X)
+        ar_peak = _attn_bytes(int(Config.AR_SEQS), rollout_L, forwards=n_ar_fwd)
+        ar_peak_str = _fmt_bytes(ar_peak) + f" ({n_ar_fwd} retained forwards)"
+    log(_bold("  [memory] expected peak attention-score bytes per path "
+              "(B*H*L^2*4B * layers):", "cyan"))
+    log(f"  [memory]   train forward         B={micro_batch:<3} L={tf_L:<5} "
+        f"-> {_fmt_bytes(train_peak)}")
+    log(f"  [memory]   eval TF forward       B={regime.eval_micro_batch:<3} "
+        f"L={tf_L:<5} -> {_fmt_bytes(eval_tf_peak)}")
+    log(f"  [memory]   eval rollout / persistence report  B={regime.eval_micro_batch:<3} "
+        f"L={rollout_L:<5} -> {_fmt_bytes(eval_rollout_peak)}")
+    log(f"  [memory]   AR aux loss           {ar_peak_str}")
+    if regime.device == "mps":
+        log(_c("  [memory]   MPS ceiling on this box is ~88 GB "
+               "(PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to override)", "dim"))
     latent_width = (Config.NUM_X * Config.LATENT_DIM) if frame_level else Config.LATENT_DIM
 
     # The sanity floor, logged before the first step so the whole run can be read
@@ -1981,7 +2462,17 @@ def train(args, log=print):
         step += 1
 
         train_loss = base_acc / accum_steps
+        prev_train_best = best["train_loss"]
         best["train_loss"] = min(best["train_loss"], train_loss)
+        # Save a train-best checkpoint on any real improvement so a run that
+        # crosses the previous-frame anchor early (e.g. step 25) has a durable
+        # artifact on disk, not just an in-memory `best["train_loss"]`. Rate is
+        # bounded by LOG_EVERY_STEPS via the gate below so we never write on
+        # every single optimizer step. The checkpoint is also gated on beating
+        # the anchor floor: below that the "improvement" is still worse than
+        # the previous-frame baseline and not worth persisting as best.
+        train_improved = train_loss < prev_train_best and train_loss < anchor
+        crossed_anchor = prev_train_best >= anchor and train_loss < anchor
 
         # Log the first few steps unconditionally. These runs are unattended and
         # often remote, and a log that shows nothing until step LOG_EVERY_STEPS is
@@ -1998,9 +2489,15 @@ def train(args, log=print):
             tel.log(payload)
             flag = ""
             if train_loss > floor:
-                flag = f"  <-- WORSE THAN PREDICTING ZERO ({floor:.6f})"
+                flag = _c(f"  <-- WORSE THAN PREDICTING ZERO ({floor:.6f})", "red")
             elif train_loss > anchor:
-                flag = f"  <-- worse than the previous-frame anchor ({anchor:.6f})"
+                flag = _c(
+                    f"  <-- worse than the previous-frame anchor ({anchor:.6f})",
+                    "red")
+            elif crossed_anchor:
+                flag = _c(
+                    f"  <-- beats previous-frame anchor ({anchor:.6f}); "
+                    f"saving _train_best.pt", "green")
             elapsed = time.time() - t_start
             eta = ""
             if step >= 3:
@@ -2009,6 +2506,16 @@ def train(args, log=print):
             log(f"  step {step:>6}/{Config.MAX_STEPS}  train={train_loss:.6f}  "
                 f"lr={lr:.2e}  gnorm={float(grad_norm):.3f}  "
                 f"{elapsed / 60:.1f}m{eta}{flag}")
+            # Persist train-best on new minima (post-anchor). Placed inside the
+            # log cadence so I/O is bounded to at most ~1 write per
+            # LOG_EVERY_STEPS optimizer steps, not per step.
+            if train_improved:
+                save_checkpoint(
+                    os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_train_best.pt"),
+                    model, optimizer, step,
+                    {'train_l2': train_loss, 'best': dict(best)},
+                    scheduler=scheduler)
+                tel.set_summary("best_train_loss", best["train_loss"])
 
         hit_budget = step >= Config.MAX_STEPS
 
@@ -2063,7 +2570,8 @@ def train(args, log=print):
                     model, optimizer, step,
                     {'rollout_mse': m['rollout_mse'], 'val_l2': m['val_tf_loss'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
-                     'best': dict(best)})
+                     'best': dict(best)},
+                    scheduler=scheduler)
                 log(f"  --> new best rollout ({m['rollout_mse']:.6f}, "
                     f"{m['improvement_pct']:+.2f}% vs persistence)")
             if m["val_tf_mse"] < best["val_tf_mse"]:
@@ -2073,7 +2581,8 @@ def train(args, log=print):
                     model, optimizer, step,
                     {'val_l2': m['val_tf_loss'], 'rollout_mse': m['rollout_mse'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
-                     'best': dict(best)})
+                     'best': dict(best)},
+                    scheduler=scheduler)
             tel.set_summary("best_rollout_mse", best["rollout_mse"])
             tel.set_summary("best_improvement_pct", best["improvement_pct"])
 
@@ -2082,7 +2591,8 @@ def train(args, log=print):
                             {'train_l2': train_loss, 'best': dict(best),
                              'val_l2': best['val_tf_mse'],
                              'rollout_mse': best['rollout_mse'],
-                             'improvement': best['improvement_pct']})
+                             'improvement': best['improvement_pct']},
+                            scheduler=scheduler)
 
         if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS:
             stop_reason = f"wall-clock limit ({Config.MAX_HOURS}h)"

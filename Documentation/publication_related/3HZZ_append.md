@@ -1,0 +1,7 @@
+## Follow-up on Q3 and Q5: completed persistence baseline
+
+After rerunning the pipeline under the revised exclusion protocol, including retraining the shared autoencoder, we completed the requested persistence comparison. Using the resulting autoregressive checkpoint, all 165 available 40-frame validation sequences were evaluated with 12 context frames (100 ms) and 28 generated forecast frames (233.3 ms); the agreed U* = 10 exclusion was preserved. The evaluation included 150 wake-targeted and 15 random-location sequences.
+
+The model has lower centroid-velocity RMSE than persistence at every reported horizon. At 8.3 ms, RMSE is 4.81 × 10⁻⁴ versus 5.40 × 10⁻⁴; at 100 ms, 1.188 × 10⁻³ versus 1.593 × 10⁻³; and at 233.3 ms, 1.534 × 10⁻³ versus 2.343 × 10⁻³. The final-horizon improvement is 34.6%, with a bootstrap confidence interval of [6.80 × 10⁻⁴, 9.40 × 10⁻⁴] for persistence RMSE minus model RMSE, and 78.2% of sequences individually favor the model.
+
+This result addresses both points raised in Q3 and Q5: persistence is now an explicit forecasting baseline, and the 28 future frames are evaluated after the supplied context rather than by supplying future same-slice ground truth. Persistence RMSE grows approximately 4.3-fold across the horizon, so the evaluated task is not adequately explained by copying a frozen field. MAE and mean vector L2 independently show the same conclusion. We do not present this as a formal statistical-stationarity test or as a replacement for the planned transformer-on-PCA-latents and raw-cube controls.

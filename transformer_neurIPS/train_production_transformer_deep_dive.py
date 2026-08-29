@@ -12,7 +12,8 @@ NO 40/80 switch, NO --num-time flag, and NO 40-frame fallback. The v1.0
   * results:    transformer_neurIPS/tests/reports/*.md
 
 v2.0 is a distinct, forward-only pinned target: `train_80.h5` / `val_80.h5`,
-positional-embedding capacity `NUM_TIME * NUM_X = 80 * 26 = 2080` tokens.
+positional-embedding capacity `NUM_TIME * NUM_X = 80 * 10 = 800` tokens
+(v3.1 restricted NUM_X from 26 to 10; see OVERVIEW.md §12.1).
 See transformer_neurIPS/OVERVIEW.md for the full v1.0 -> v2.0 rationale.
 
 This is the ARM-DRIVEN rewrite. One process trains exactly one "arm" (a named
@@ -202,6 +203,30 @@ implementation of each one):
 Unit-tested end-to-end in `tests/test_scripted_save.py` (compile-unwrap,
 buffer-requirement failure mode, frame-native and token-native variants,
 `torch.jit.load` roundtrip on CPU, rainbow-log absolute-path emission).
+
+DECODED-CENTROID TRAINING LOSS
+==============================
+The training / evaluation error metric is no longer computed in the 47-dim
+autoencoder latent space. Latent-L2 is not a physical quantity: its
+per-dimension scale is arbitrary, its rotation/basis is set by the encoder
+training seed, and L2 in latent space is not comparable across runs,
+checkpoints, arms, or encoder retrainings. Instead, both the prediction and
+the target are decoded through the frozen scripted GEN3 AttentionSE decoder
+(`encoder/autoencoderGEN3/saved_models_production/`
+`Model_GEN3_05_AttentionSE_absolute_best_scripted.pt`) and scored on the
+central velocity triplet `(vx, vy, vz)` at index 62 of 125 spatial points
+(slice `[186:189]` of the 375-dim reconstruction). Gradients flow through
+the decoder into the transformer -- the decoder's parameters are frozen
+(`requires_grad=False`) so nothing in the encoder is trained by this loss.
+
+The retirement is intentionally auditable: every latent-space error metric
+that was replaced carries a comment block beginning with the sentinel
+`# LATENT-SPACE ERROR RETIRED`. Grep for that string to find every disabled
+call site. The informational latent floor from `null_baselines()` and the
+`linear_frame_baseline()` diagnostic still use `l2_loss` / `mse_loss` /
+`base_loss` -- they are LATENT-space sanity anchors, not the training
+target. See `transformer_neurIPS/OVERVIEW.md` §10.9.7 for the rationale,
+centroid-index derivation, and the console/wandb schema changes.
 """
 
 import argparse
@@ -291,6 +316,29 @@ def pick_device():
     return torch.device("cpu")
 
 
+def print_device_detection_banner(requested=None):
+    """Print, as the FIRST thing this script does on any invocation path
+    (train / --smoke-test / --diagnostics-only / --list-arms), which compute
+    device this run resolved to. `resolve_train_regime()`'s banner (printed
+    later, only on the train/smoke paths) covers the detailed micro-batch
+    regime; this one line exists so a run's device is never a mystery you
+    have to scroll for.
+    """
+    device = torch.device(requested) if requested else pick_device()
+    if device.type == "cuda":
+        try:
+            name = torch.cuda.get_device_name(0)
+        except Exception:
+            name = "unknown GPU"
+        print(_bold(f"[DEVICE DETECTED] CUDA — {name}", "green"), flush=True)
+    elif device.type == "mps":
+        print(_rainbow("[DEVICE DETECTED] MPS (Apple Silicon)"), flush=True)
+    else:
+        print(_bold("[DEVICE DETECTED] CPU (no CUDA/MPS available)", "yellow"),
+              flush=True)
+    return device
+
+
 @dataclass
 class TrainRegime:
     device: str
@@ -374,27 +422,28 @@ def resolve_train_regime(device):
             compile_model=True, cudnn_benchmark=True, banner=banner)
 
     # MPS / CPU: eval also runs singleton. The AR rollout at NUM_TIME=80 grows
-    # the sequence to SEQ_LEN=2080 tokens; attention scores are
-    # (batch * n_heads * L^2 * 4B). At batch=32, heads=8, L=2080 this is
-    # ~34 GB PER LAYER just for the score tensor, which is exactly the 88 GB
-    # MPS OOM users have hit. batch=1 drops that to ~138 MB/layer -- a ~32x
-    # peak-memory reduction -- and keeps the TF-eval pass within budget too
-    # (EVAL_BATCH_SIZE=128 at L=2079 would otherwise need ~137 GB for attn).
+    # the sequence to SEQ_LEN=800 tokens (v3.1: NUM_X cut 26->10, see
+    # OVERVIEW.md §12.1); attention scores are (batch * n_heads * L^2 * 4B).
+    # The batch=1 clamp below predates that cut and was sized for the
+    # original L=2080 worst case -- still the safe conservative choice at
+    # L=800, just with more memory headroom than strictly required now.
     banner = _regime_banner_mps_cpu(micro_batch=1)
     # AR / scheduled-sampling losses also clamp to singleton on MPS/CPU: the AR
     # loop is sequential and each intermediate forward keeps its full activation
-    # graph for backward, so peak memory scales linearly with AR_SEQS. With the
-    # default arm's AR_SEQS=4 that is ~4x a training forward at L=2080 and
-    # blows the 88 GB MPS ceiling from inside frame_ar_loss (observed OOM).
+    # graph for backward, so peak memory scales linearly with AR_SEQS. This
+    # clamp predates the v3.1 NUM_X cut (26->10) and was sized against the
+    # original L=2080 worst case; it is disabled outright below rather than
+    # re-tuned for the smaller L=800, since the OOM this guards against was
+    # only ever observed/characterized at the old shape.
     # AR aux loss is DISABLED on MPS/CPU. Even at AR_SEQS=1 the sequential
-    # AR loop does `AR_FRAMES * NUM_X` = 4*26 = 104 forwards under token
-    # tokenization, each retaining its full activation graph for backward
-    # through `preds` (the `.detach()` only truncates the fed-back token, not
-    # the graph of the forward itself). At L~=300+ and 6 layers that piles up
-    # past the 88 GB MPS ceiling from inside frame_ar_loss (observed OOM even
-    # after AR_SEQS was clamped to 1). The primary next-token loss still
-    # trains the model on MPS; the AR loss is a rollout-stabilization aux and
-    # is CUDA-only in v2.0 (kept on CUDA at the arm-specified AR_SEQS).
+    # AR loop does `AR_FRAMES * NUM_X` forwards under token tokenization
+    # (4*10 = 40 at the default arm's AR_FRAMES=2, post-v3.1 NUM_X=10; was
+    # 4*26=104 pre-v3.1), each retaining its full activation graph for
+    # backward through `preds` (the `.detach()` only truncates the fed-back
+    # token, not the graph of the forward itself). The primary next-token
+    # loss still trains the model on MPS; the AR loss is a
+    # rollout-stabilization aux and is CUDA-only in v2.0 (kept on CUDA at the
+    # arm-specified AR_SEQS).
     return TrainRegime(
         device=dev_str, micro_batch=1, virtual_batch=32,
         eval_micro_batch=1, aux_micro_batch=1,
@@ -406,8 +455,29 @@ def resolve_train_regime(device):
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Decoded-centroid loss constants
+# --------------------------------------------------------------------------- #
+# The frozen GEN3 AttentionSE decoder reconstructs a 375-dim vector laid out as
+# [vx_0, vy_0, vz_0, vx_1, vy_1, vz_1, ..., vx_124, vy_124, vz_124]. The
+# central triplet (vx_62, vy_62, vz_62) at slice [186:189] is the physical
+# quantity the training loss is scored on. See OVERVIEW.md §10.9.7.
+DECODED_DIM = 375
+N_TRIPLETS = 125
+CENTROID_TRIPLET_IDX = 62            # 0-based, middle of 125
+CENTROID_SLICE = slice(186, 189)     # inclusive/exclusive; gives vx, vy, vz
+V_LABELS = ("vx", "vy", "vz")
+
+
 class Config:
-    """Defaults for a single run. Arms (below) override fields on this class."""
+    """Defaults for a single run. Arms (below) override fields on this class.
+
+    NOTE: `Config.LOSS` is now IGNORED at training time -- the training loss is
+    fixed to the decoded-centroid L2 via `centroid_velocity_loss`. The field is
+    kept because several arms (e.g. `a2_mse`, `d4_delta_mse`) still setattr it
+    and their overrides must not raise; those overrides simply have no effect
+    on the training objective any more. See OVERVIEW.md §10.9.7.
+    """
 
     # -- data ---------------------------------------------------------------
     # v2.0 pinning: hard-coded 80-frame files. See top-of-file docstring.
@@ -416,9 +486,14 @@ class Config:
     CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")
 
     LATENT_DIM = 47      # latent features per (t, x) location
-    NUM_X = 26           # x-locations per time frame
+    # v3.1 (prepare_data.py OVERVIEW.md §12.1): x-sweep restricted to
+    # |x| <= 20 (10 samples), down from the full 26-sample sensor line.
+    # train_80.h5 / val_80.h5 are written at this width -- keep in sync
+    # with prepare_data.py's NUM_X/X_COORDS or TransformerDataset's
+    # reshape will hard-crash on shape mismatch.
+    NUM_X = 10           # x-locations per time frame (v3.1: was 26)
     NUM_TIME = 80        # time frames per sequence (v2.0 pinned; v1.0 was 40)
-    SEQ_LEN = NUM_X * NUM_TIME              # 2080 tokens (v1.0: 1040)
+    SEQ_LEN = NUM_X * NUM_TIME              # 800 tokens (pre-v3.1: 2080; v1.0: 1040)
     # Column layout written by prepare_data.py:
     #   0:47 latents | 47 x | 48 y | 49 z | 50 t_index | 51 param
     INPUT_DIM = 52
@@ -462,7 +537,7 @@ class Config:
     AR_MODE = 'none'           # none | frame_ar | sched
     AR_LOSS_WEIGHT = 0.0
     AR_WEIGHT_WARMUP_FRAC = 0.2   # ramp AR weight 0 -> AR_LOSS_WEIGHT over this fraction
-    AR_FRAMES = 2              # horizon in whole TIME FRAMES (26 tokens each)
+    AR_FRAMES = 2              # horizon in whole TIME FRAMES (10 tokens each, v3.1)
     AR_SEQS = 4                # sequences used for the sequential AR loop
     AR_EVERY_N_STEPS = 4
     AR_DETACH_FEEDBACK = True  # truncate gradient through the fed-back token
@@ -487,6 +562,19 @@ class Config:
     # (torch.compile `_orig_mod` unwrap, script->trace fallback, buffer
     # verification, roundtrip check).
     SAVE_SCRIPTED_MODELS = True
+
+    # -- decoded-centroid training loss (see OVERVIEW.md §10.9.7) -----------
+    # Frozen scripted GEN3 AttentionSE decoder used to map the transformer's
+    # 47-dim latent output to a 375-dim reconstruction, of which the central
+    # triplet (vx_62, vy_62, vz_62) is the training target. The env var
+    # PFD_DECODER_PATH overrides this at load time (mirrors PFD_NO_COLOR).
+    DECODER_SCRIPTED_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "encoder/autoencoderGEN3/saved_models_production",
+        "Model_GEN3_05_AttentionSE_absolute_best_scripted.pt")
+    CENTROID_WEIGHTS = (1.0, 1.0, 1.0)   # (w_vx, w_vy, w_vz); future emphasis knob
+    CENTROID_LOSS = 'l2'                  # 'l2' = mean of vector-L2-norms;
+                                          # 'mse' = mean of squared components
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
@@ -791,14 +879,26 @@ def apply_arm(name):
 # Losses
 # --------------------------------------------------------------------------- #
 def mse_loss(pred, target):
+    """LATENT-space mean-squared-error. Retained for `null_baselines()` and
+    the linear-baseline diagnostic ONLY -- no longer used as a training loss.
+    See OVERVIEW.md §10.9.7."""
     return torch.mean((pred - target) ** 2)
 
 
 def l2_loss(pred, target):
+    """LATENT-space mean vector-L2 norm. Retained for `null_baselines()` and
+    the linear-baseline diagnostic ONLY -- no longer used as a training loss.
+    See OVERVIEW.md §10.9.7."""
     return torch.mean(torch.norm(pred - target, dim=-1))
 
 
 def base_loss(pred, target, cfg=Config):
+    """LATENT-space error kernel selected by `cfg.LOSS`.
+
+    Retained for informational latent-space baselines only (`null_baselines()`
+    reporting and the previous-frame anchor floor in `train()`). The training
+    loss is now `centroid_velocity_loss` and does not read `cfg.LOSS`.
+    """
     kind = getattr(cfg, 'LOSS', 'l2norm')
     if kind == 'l2norm':
         return l2_loss(pred, target)
@@ -810,13 +910,139 @@ def base_loss(pred, target, cfg=Config):
 
 
 # --------------------------------------------------------------------------- #
+# Decoded-centroid training loss
+# --------------------------------------------------------------------------- #
+# The 47-dim autoencoder latent is not a physical quantity; the training /
+# evaluation error is computed in decoded velocity space instead. Both the
+# prediction and the target are decoded through the FROZEN scripted GEN3
+# AttentionSE decoder, then scored on the central triplet (vx, vy, vz) at
+# CENTROID_TRIPLET_IDX=62 of 125 spatial points. See OVERVIEW.md §10.9.7.
+_DECODER_CACHE: dict = {}
+
+
+def _load_decoder(device, cfg=Config, log=print):
+    """Load, cache and freeze the scripted GEN3 AttentionSE decoder.
+
+    Returns a callable `decode_fn(z_47) -> velocity_375` that (a) runs on
+    `device`, (b) has `requires_grad=False` on all its parameters, and (c) is
+    in `eval()` mode. The callable accepts inputs of any leading shape ending
+    in `LATENT_DIM=47`, flattens the leading dims for the decoder forward,
+    and reshapes the 375-dim reconstruction back to the original leading
+    shape. Rainbow-logged with `[start-from:decoder] <abs path>` on the first
+    load per (path, device) key so scrollback pinpoints which decoder file
+    the run was scored against.
+
+    IMPORTANT: the callable is intentionally NOT wrapped in `torch.no_grad`
+    -- the training loss needs gradient flow through the decoder into the
+    transformer. Only the decoder's own parameters are frozen.
+    """
+    path = os.environ.get("PFD_DECODER_PATH") or cfg.DECODER_SCRIPTED_PATH
+    key = (path, str(device))
+    entry = _DECODER_CACHE.get(key)
+    if entry is None:
+        abs_path = os.path.abspath(path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(
+                f"scripted decoder not found: {abs_path} "
+                f"(set PFD_DECODER_PATH or Config.DECODER_SCRIPTED_PATH)")
+        mod = torch.jit.load(abs_path, map_location=device).eval()
+        # Freeze: gradients still FLOW through the decoder for backprop into
+        # the transformer, but the decoder's own weights never update.
+        for p in mod.parameters():
+            p.requires_grad_(False)
+        try:
+            log(_rainbow(f"[start-from:decoder] {abs_path}"))
+        except Exception:
+            # `_rainbow` should always work, but never let logging block a load.
+            print(f"[start-from:decoder] {abs_path}", flush=True)
+
+        def _decode(z):
+            # Flatten leading dims so the scripted decoder sees (N, 47), then
+            # restore the leading shape with a trailing DECODED_DIM=375.
+            orig_shape = z.shape
+            z_flat = z.reshape(-1, orig_shape[-1])
+            try:
+                out = mod.decode(z_flat)
+            except AttributeError:
+                # Very unlikely: some scripted archives only expose forward().
+                # For the GEN3 AttentionSE BaseAE, forward expects the 375-dim
+                # input, so this branch is a diagnostic fallback only.
+                out = mod(z_flat)
+            return out.reshape(*orig_shape[:-1], DECODED_DIM)
+
+        entry = _decode
+        _DECODER_CACHE[key] = entry
+    return entry
+
+
+def decode_centroid(latent, cfg=Config):
+    """`(..., 47) -> (..., 3)` via the frozen decoder, sliced at CENTROID_SLICE.
+
+    Assumes the decoder is already loadable onto `latent.device`. Preserves
+    all leading dimensions (batch, time, etc.) and returns the central
+    velocity triplet `(vx, vy, vz)` at index 62 of 125 spatial points.
+    """
+    dec = _load_decoder(latent.device, cfg)
+    v = dec(latent)                                      # (..., 375)
+    return v[..., CENTROID_SLICE]                         # (..., 3)
+
+
+def centroid_velocity_loss(pred_latent, tgt_latent, cfg=Config):
+    """Consistent L2-in-velocity-space training loss.
+
+    Decodes both latents through the frozen GEN3 AttentionSE decoder, takes
+    the central triplet (vx, vy, vz) at CENTROID_TRIPLET_IDX=62, applies the
+    per-dim weights from `cfg.CENTROID_WEIGHTS`, and returns the mean of the
+    per-token L2 norm of the weighted 3-vector error. Gradients flow through
+    the decoder (whose weights are frozen). `cfg.CENTROID_LOSS` selects
+    between `'l2'` (mean of vector-L2-norms, default) and `'mse'` (mean of
+    squared components). See OVERVIEW.md §10.9.7.
+    """
+    pv = decode_centroid(pred_latent, cfg)               # (..., 3)
+    tv = decode_centroid(tgt_latent, cfg)                # (..., 3)
+    w = torch.tensor(getattr(cfg, 'CENTROID_WEIGHTS', (1.0, 1.0, 1.0)),
+                     device=pv.device, dtype=pv.dtype)
+    err = (pv - tv) * w                                   # (..., 3)
+    if getattr(cfg, 'CENTROID_LOSS', 'l2') == 'mse':
+        return err.pow(2).mean()
+    return torch.linalg.vector_norm(err, dim=-1).mean()
+
+
+def centroid_per_dim_errors(pred_latent, tgt_latent, cfg=Config):
+    """Per-dim MAE / RMSE and combined L2 on the decoded centroid.
+
+    Returns a plain dict with keys `mae_vx`, `mae_vy`, `mae_vz`, `rmse_vx`,
+    `rmse_vy`, `rmse_vz`, `l2_centroid`. All values are Python floats. Used
+    for the console breakdown at every LOG_EVERY_STEPS tick and for the
+    per-epoch persistence report.
+    """
+    pv = decode_centroid(pred_latent, cfg)
+    tv = decode_centroid(tgt_latent, cfg)
+    d = pv - tv                                           # (..., 3)
+    out = {}
+    for i, lbl in enumerate(V_LABELS):
+        di = d[..., i]
+        out[f"mae_{lbl}"] = float(di.abs().mean())
+        out[f"rmse_{lbl}"] = float(di.pow(2).mean().sqrt())
+    out["l2_centroid"] = float(torch.linalg.vector_norm(d, dim=-1).mean())
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
 class TransformerDataset(torch.utils.data.Dataset):
-    """The whole (small) split, read from HDF5 once and held as one tensor.
+    """The whole split, read from HDF5 once and held as one tensor.
 
-    Full train is ~3.7k x 2080 x 52 float32 ~= 1.6 GB, which fits in RAM and on
-    the GPU, so there is no reason to re-open the HDF5 file per worker per epoch.
+    "Small" no longer describes this literally as of the v3.4 wake-atlas
+    rebuild: train is ~59.3k x 800 x 52 float32 ~= 9.2 GiB, val ~25.4k x 800 x
+    52 ~= 3.9 GiB (~13 GiB combined resident) -- up almost 10x from the v3
+    estimate of ~3.7k sequences / ~1.6 GB, because the physics-derived atlas
+    produces far more wake seeds than the old 24-tap list did (OVERVIEW.md
+    §15), even though NUM_X shrank 26->10 over the same period. Confirm this
+    still fits in RAM and (for CUDA) on the GPU before assuming the
+    single-resident-tensor design is still free; there is no reason to
+    re-open the HDF5 file per worker per epoch as long as it does.
     """
 
     def __init__(self, h5_path, subset_ratio=1.0):
@@ -1020,7 +1246,15 @@ def probe_legacy_attention(cfg, device):
 
 @torch.no_grad()
 def null_baselines(data, cfg, frame_level=False, max_seqs=256):
-    """What trivial predictors score on the TEACHER-FORCED training objective.
+    """Informational LATENT-SPACE floor only.
+
+    The training loss is now the decoded centroid L2 (see
+    `centroid_velocity_loss`); these numbers are retained as a sanity check
+    on data variance and are NOT the target the model is trained against.
+    Kept because the `<-- WORSE THAN PREDICTING ZERO` messaging in `train()`
+    and the diagnostics-only `run_diagnostics` reporting both rely on them.
+
+    What trivial predictors score on the TEACHER-FORCED training objective.
 
     This is the sanity floor, and it is the check whose absence let a badly
     broken run look like a plateau. Measured on the exact quantity the trainer
@@ -1085,8 +1319,9 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
       * linear ~= persistence too                             -> persistence is
         genuinely strong at this dt; the framing needs to change, not the model.
 
-    Solved on the normal equations in float64. D = 26*47 = 1222, so X'X is
-    1223x1223 -- trivial regardless of how many transitions are accumulated.
+    Solved on the normal equations in float64. D = NX*LATENT_DIM = 10*47 = 470
+    (post-v3.1; was 26*47=1222), so X'X is 471x471 -- trivial regardless of
+    how many transitions are accumulated.
     """
     NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
     D = NX * LD
@@ -1266,8 +1501,18 @@ def frame_ar_loss(model, batch, cfg, generator=None):
             nf = frames[:, ctx_frames + i:ctx_frames + i + 1, :].clone()
             nf[:, :, :width] = nxt.detach() if detach else nxt
             curr = torch.cat([curr, nf], dim=1)
-        return base_loss(torch.cat(preds, 1),
-                         frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg)
+        # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
+        # physical quantity: its per-dimension scale is arbitrary, its
+        # rotation/basis is set by the encoder training seed, and L2 in
+        # latent space is not comparable across runs, checkpoints, arms, or
+        # encoder retrainings. We now decode both the prediction and the
+        # target through the frozen GEN3 AttentionSE decoder and score on
+        # the central triplet (vx, vy, vz) at index 62 of 125 spatial
+        # points. See OVERVIEW.md §10.9.7 for the rationale and centroid-
+        # index derivation.
+        return centroid_velocity_loss(
+            torch.cat(preds, 1),
+            frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg)
 
     ctx_len = ctx_frames * NX
     horizon = n_fr * NX
@@ -1279,8 +1524,18 @@ def frame_ar_loss(model, batch, cfg, generator=None):
         tok = seqs[:, ctx_len + i:ctx_len + i + 1, :].clone()
         tok[:, :, :LD] = nxt.detach() if detach else nxt
         curr = torch.cat([curr, tok], dim=1)
-    return base_loss(torch.cat(preds, 1),
-                     seqs[:, ctx_len:ctx_len + horizon, :LD], cfg)
+    # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
+    # physical quantity: its per-dimension scale is arbitrary, its
+    # rotation/basis is set by the encoder training seed, and L2 in
+    # latent space is not comparable across runs, checkpoints, arms, or
+    # encoder retrainings. We now decode both the prediction and the
+    # target through the frozen GEN3 AttentionSE decoder and score on
+    # the central triplet (vx, vy, vz) at index 62 of 125 spatial
+    # points. See OVERVIEW.md §10.9.7 for the rationale and centroid-
+    # index derivation.
+    return centroid_velocity_loss(
+        torch.cat(preds, 1),
+        seqs[:, ctx_len:ctx_len + horizon, :LD], cfg)
 
 
 def sched_sampling_loss(model, batch, cfg, p, generator=None):
@@ -1309,7 +1564,15 @@ def sched_sampling_loss(model, batch, cfg, p, generator=None):
                       generator=generator) >= p
     inp = inp.clone()
     inp[..., :width] = torch.where(keep, inp[..., :width], repl.to(inp.dtype))
-    return base_loss(model(inp), tgt, cfg)
+    # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
+    # physical quantity: its per-dimension scale is arbitrary, its
+    # rotation/basis is set by the encoder training seed, and L2 in latent
+    # space is not comparable across runs, checkpoints, arms, or encoder
+    # retrainings. We now decode both the prediction and the target through
+    # the frozen GEN3 AttentionSE decoder and score on the central triplet
+    # (vx, vy, vz) at index 62 of 125 spatial points. See OVERVIEW.md
+    # §10.9.7 for the rationale and centroid-index derivation.
+    return centroid_velocity_loss(model(inp), tgt, cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -1337,8 +1600,9 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
 
     # -- teacher forced, whole validation split ----------------------------
     # On MPS the caller passes tf_batch_size=1 (via regime.eval_micro_batch)
-    # because a 128-batch forward at SEQ_LEN=2079 costs ~137 GB in attention
-    # scores alone. On CUDA cfg.EVAL_BATCH_SIZE (128) is used as-is.
+    # because a 128-batch forward at SEQ_LEN-1=799 tokens (pre-v3.1: 2079)
+    # costs proportionally large attention-score memory. On CUDA
+    # cfg.EVAL_BATCH_SIZE (128) is used as-is.
     tf_bs = int(tf_batch_size) if tf_batch_size else int(cfg.EVAL_BATCH_SIZE)
     tf_loss = tf_mse = 0.0
     tf_n = 0
@@ -1949,7 +2213,7 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
         batch = batch.to(target_device, non_blocking=True)
 
     # Chunked rollout: at NUM_TIME=80 the AR loop grows the sequence to
-    # SEQ_LEN=2080 tokens and the attention scores are
+    # SEQ_LEN=800 tokens (pre-v3.1: 2080) and the attention scores are
     # (chunk * n_heads * L^2 * 4B) PER LAYER. On MPS the caller passes
     # chunk=1 (via regime.eval_micro_batch); on CUDA the full n_seqs runs in
     # one shot. Accumulators are scalar sums scaled by n_seqs at the end.
@@ -2298,7 +2562,7 @@ def train(args, log=print):
 
     # Disable AR aux loss on MPS/CPU. Even at AR_SEQS=1 the sequential AR loop
     # under token tokenization does `AR_FRAMES * NUM_X` sequential forwards
-    # (e.g. 4*26 = 104 for the default arm), each retaining its own full
+    # (e.g. 4*10 = 40 for the default arm, post-v3.1; was 4*26=104), each retaining its own full
     # activation graph for backward through `preds`. That accumulates past the
     # 88 GB MPS ceiling regardless of AR_SEQS. CUDA branch keeps the AR loss
     # at the arm-specified AR_SEQS. The primary next-token loss is unaffected.
@@ -2747,14 +3011,14 @@ def run_smoke_test(args):
     This runs BEFORE any real training loop and touches NO HDF5 data. It:
 
       1. Builds `get_model(Config)` at the pinned `NUM_TIME=80` /
-         `SEQ_LEN=2080` shape.
+         `SEQ_LEN=800` shape (v3.1: NUM_X restricted 26->10).
       2. Calls `probe_causality(model, Config, device)` and asserts
          `causal is True`. If the probe fails, this function raises
          SystemExit BEFORE the first optimizer step -- which is the whole
          point of the gate.
       3. Only then runs a handful (`--smoke-steps`, default 3) of
          `micro_batch=1` forward + backward + step cycles on synthetic
-         (2080-token) tensors, to prove the shapes flow end-to-end at the
+         (800-token) tensors, to prove the shapes flow end-to-end at the
          new sequence length.
 
     Intentionally minimal: no data loader, no checkpoint I/O, no W&B. This
@@ -2770,10 +3034,10 @@ def run_smoke_test(args):
     log(f"[smoke] regime: device={regime.device} micro_batch={regime.micro_batch} "
         f"virtual_batch={regime.virtual_batch} use_amp={regime.use_amp} "
         f"compile={regime.compile_model}")
-    log(f"[smoke] pinned v2.0: NUM_TIME={Config.NUM_TIME}, "
+    log(f"[smoke] pinned v3.1: NUM_TIME={Config.NUM_TIME}, "
         f"NUM_X={Config.NUM_X}, SEQ_LEN={Config.SEQ_LEN} "
-        f"(expected 2080), device={device}")
-    if (Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN) != (80, 26, 2080):
+        f"(expected 800), device={device}")
+    if (Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN) != (80, 10, 800):
         raise SystemExit(f"[smoke] pinning invariant violated: "
                          f"NUM_TIME={Config.NUM_TIME}, NUM_X={Config.NUM_X}, "
                          f"SEQ_LEN={Config.SEQ_LEN}")
@@ -2894,6 +3158,7 @@ def _coerce(raw):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    print_device_detection_banner(args.device)
 
     if args.list_arms:
         for rnd in (1, 2):

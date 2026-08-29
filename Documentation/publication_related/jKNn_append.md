@@ -1,0 +1,7 @@
+## Follow-up on Q1 and dynamical scope: completed persistence baseline
+
+After rerunning the pipeline under the revised exclusion protocol, including retraining the shared autoencoder, we completed the persistence baseline. The resulting autoregressive checkpoint was evaluated on all 165 available 40-frame validation sequences, using 12 context frames (100 ms) followed by 28 forecast frames (233.3 ms), while preserving the agreed U* = 10 exclusion. The evaluation comprised 150 wake-targeted and 15 random-location sequences.
+
+Across all sequences, model RMSE remains below persistence at every reported horizon: 4.81 × 10⁻⁴ versus 5.40 × 10⁻⁴ at 8.3 ms, 1.188 × 10⁻³ versus 1.593 × 10⁻³ at 100 ms, and 1.534 × 10⁻³ versus 2.343 × 10⁻³ at 233.3 ms. Improvement grows from 10.8% to 34.6%; at the final horizon, the bootstrap confidence interval for persistence RMSE minus model RMSE is [6.80 × 10⁻⁴, 9.40 × 10⁻⁴]. Final-horizon improvement is 34.3% for wake-targeted sequences and 37.2% for random-location sequences.
+
+Persistence RMSE increases approximately 4.3-fold from the first to the final horizon. Operationally, the measured trajectories are therefore not well represented by a static-field forecast, and the result is not confined to targeted wake locations. The same conclusion holds under MAE and mean vector L2. We use this only to reject a frozen or weakly changing-field explanation; it is not a formal claim of statistical nonstationarity and does not replace the broader learned baselines requested by the reviewer.

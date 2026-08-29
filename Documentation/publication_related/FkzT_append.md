@@ -1,0 +1,7 @@
+## Follow-up on W3 and W4: persistence and empirical rollout dynamics
+
+After rerunning the pipeline under the revised exclusion protocol, including retraining the shared autoencoder, we completed a persistence comparison using the resulting autoregressive checkpoint on all 165 available 40-frame validation sequences. Each evaluation uses 12 context frames (100 ms) and 28 forecast frames (233.3 ms); the agreed U* = 10 exclusion was preserved. The source pool contains 150 wake-targeted and 15 random-location sequences.
+
+The model outperforms persistence at every reported horizon. At 233.3 ms, centroid-velocity RMSE is 1.534 × 10⁻³ for the model and 2.343 × 10⁻³ for persistence, a 34.6% improvement; the 95% bootstrap interval for persistence RMSE minus model RMSE is [6.80 × 10⁻⁴, 9.40 × 10⁻⁴]. Improvement at the final horizon is 34.3% on wake-targeted sequences and 37.2% on random-location sequences. Final-horizon improvements also hold for vx (36.1%), vy (26.3%), and vz (39.3%). Persistence RMSE grows approximately 4.3-fold from 8.3 to 233.3 ms.
+
+This provides empirical evidence that the rollout is not succeeding by extrapolating a frozen field or merely copying the latest state. It does not, by itself, establish that lower divergence is physically superior or exclude over-damping; prediction-versus-truth energy spectra and the measured-ground-truth divergence floor remain the appropriate controls for that question.

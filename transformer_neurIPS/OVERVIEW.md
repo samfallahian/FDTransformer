@@ -1691,27 +1691,363 @@ current trainer consumes it. Training can proceed directly against
 present on disk, regardless of whether the `_enriched.h5` companions
 exist.
 
-### 17.5 Known stale tests found during this pass (not fixed)
+### 17.5 Stale tests found during this pass — fixed in v3.7 (§18.4)
 
 Surfaced by running the full suite against the freshly-rebuilt data
-files; left as-is because fixing them was out of scope for this pass —
-tracked here so they aren't mistaken for new regressions:
+files. Left as-is at the time of the v3.6 pass; all three were fixed in
+the v3.7 pass (§18.4) and are noted here only for the historical record
+of what was found and when:
 
-- `tests/test_data_files_present.py` — hard-codes a single `NUM_X = 26`
+- `tests/test_data_files_present.py` — hard-coded a single `NUM_X = 26`
   applied to both the 40-frame (legacy, correctly 26) and 80-frame
-  (v3.1+, actually 10) cohorts. `test_80_files_present` currently fails
-  (`10 != 26`) against a correctly-built file. Fix: make the expected
-  x-dimension per-`(num_time, filename)` entry instead of one global
-  constant.
-- `tests/test_data_files_size_parity.py` — asserts 40- and 80-frame
+  (v3.1+, actually 10) cohorts, so `test_80_files_present` failed
+  (`10 != 26`) against a correctly-built file.
+- `tests/test_data_files_size_parity.py` — asserted 40- and 80-frame
   on-disk byte sizes stay within 2% of each other. That invariant
   predates both the v3.1 x-window cut and the v3.4 wake-atlas density
   increase; `train_80.h5` is now legitimately ~6x the size of
   `train_40.h5` (different `NUM_X`, ~8x more sequences), not evidence of
-  truncation. The invariant this test encodes no longer holds and needs
-  to be retired or rewritten against a different premise, not patched.
+  truncation.
 - `tests/test_model_vs_baseline.py` — two `setUpClass` errors evaluating
-  v1.0 checkpoints against `val_40.h5`; pre-existing (reproduces against
-  both the old `SEQ_LEN=2080` and the new `SEQ_LEN=800`), caused by the
-  test not scoping `Config` back to the v1.0 shape before loading the
-  legacy file. Unrelated to this pass's `NUM_X` fix.
+  checkpoints against `val_40.h5`, caused by the test not scoping
+  `Config` back to the v1.0 shape before loading the legacy file.
+
+---
+
+## 18. v3.7 — the trainer actually trains on centroid velocity now, plus a checkpoint-promotion gate and alerting
+
+**Status:** shipped this pass. Triggered by a direct question during a live
+CUDA training run ("where is the centroid loss being tracked?") that led to
+discovering the primary training/eval loop was never actually using
+`centroid_velocity_loss` despite extensive comments claiming it was, and
+then, once that was fixed and a real run's log was read closely, that
+`_rollout_best.pt` had been promoting checkpoints with no check against the
+persistence baseline at all.
+
+### 18.1 The bug: `centroid_velocity_loss` was documented, not wired in
+
+`centroid_velocity_loss()` / `centroid_per_dim_errors()` (added in an
+earlier pass, §10.9.7) are correctly implemented and were already used
+inside the optional AR auxiliary loss (`frame_ar_loss` / `sched_sampling_loss`)
+-- but that's a secondary term added on top of the DOMINANT per-step loss,
+which was still `base_loss(pred, tgt, Config)`: latent-space L2norm/MSE/huber
+on the raw 47-dim autoencoder latent, exactly the thing multiple docstrings
+in this file said had been "retired." The same gap existed in `evaluate()`
+(`val_tf_loss`, and the `rollout_mse`/`persistence_mse`/`improvement_pct`
+that `_rollout_best.pt` is selected on) and in `per_epoch_persistence_report()`
+(the console/wandb `persistence/*` MAE/RMSE/L2 numbers) -- all computed
+directly on raw latents, never decoded through the frozen GEN3 decoder.
+
+Consequence: every "centroid" framing in this file's comments and in
+OVERVIEW.md's earlier sections was aspirational for the primary loop. The
+live `train_loss`/`val_tf_loss`/`persistence/*` numbers a human or wandb
+dashboard would actually see were latent-space numbers with no direct
+physical meaning, not the decoded-velocity numbers the design intended.
+
+### 18.2 The fix: decode through the frozen GEN3 decoder everywhere it matters
+
+- `train()`'s per-step teacher-forced loss now calls `centroid_velocity_loss`
+  directly (previously `base_loss`). The accumulator variable was renamed
+  `base_acc` -> `primary_acc` to stop implying a latent-space quantity.
+  `base_loss()` itself is now dead code and was deleted.
+- New shared helper `to_per_token_latent(t, cfg)` reshapes a possibly
+  frame-flattened tensor (`cfg.TOKENIZATION == 'frame'` models produce a
+  trailing `NUM_X*LATENT_DIM` axis) back to a trailing `LATENT_DIM=47` axis
+  before it hits the decoder. Without this, a frame-native arm would feed
+  the decoder a 470-wide "latent" and silently misbehave -- this exact class
+  of bug was caught and fixed in three places (`null_baselines()`, the
+  per-step loop, `evaluate()`'s teacher-forced section) before it could ever
+  fire, since none of the arms currently in use are frame-native
+  (`frame_native=False` confirmed via `--smoke-test`).
+- `evaluate()`: the teacher-forced `val_tf_loss` and the rollout-vs-
+  persistence `rollout_mse`/`persistence_mse`/`improvement_pct` (the metrics
+  `_rollout_best.pt` selects on) now decode `pred`/`tgt`/`pred_f`/`true_f`/
+  `pers_f` through `decode_centroid()` before computing error. `rollout_frames()`
+  already normalizes both tokenizations to a trailing `(NUM_X, LATENT_DIM)`
+  shape, so no `to_per_token_latent()` reshape was needed there.
+- `per_epoch_persistence_report()`: the console/wandb `persistence/*`
+  MAE/RMSE/L2 breakdown now decodes `gt_c`/`pred_c`/`pers_c` the same way,
+  matching the metric space this section's docstring already claimed.
+- `null_baselines()` gained a `centroid_l2` key per trivial predictor
+  (zeros/mean/previous-token/previous-frame), correctly reshaped through
+  `to_per_token_latent()` for the frame-flattened case. `train()`'s
+  floor/anchor sanity gate now reads `centroid_l2` instead of
+  `nulls[...][Config.LOSS]` -- the latent-space `l2norm`/`mse`/`huber` keys
+  are kept and logged separately, informational-only.
+- Periodic console/wandb logging gained an explicit `train/centroid_l2` key
+  (mirroring `train_loss`, which already IS that value, under a name that
+  can't be confused with the retired latent-space objective) and a per-dim
+  breakdown (`train/mae_vx`, `.../rmse_vz`, etc.) from `centroid_per_dim_errors()`
+  on the last micro-batch of each logged virtual batch -- diagnostic only,
+  computed under `torch.no_grad()`, does not affect the gradient just taken.
+
+Verified via `--smoke-test` (builds, causal, trains a micro-batch, at the
+correct `NUM_X=10`/`SEQ_LEN=800` shape) and a manual pass of
+`null_baselines()` / `evaluate()` / `per_epoch_persistence_report()` /
+`centroid_velocity_loss()` against real `val_80.h5` data with a freshly
+initialized model -- all four executed without shape errors and produced
+finite, velocity-scale (not latent-scale) numbers.
+
+**This changes what the model is actually optimized against.** A run
+already in progress under the old `base_loss` objective needs a restart to
+train against `centroid_velocity_loss` instead.
+
+### 18.3 `_rollout_best.pt` was being promoted with no check against persistence
+
+Reading a real CUDA run's log after the above fix landed surfaced a second,
+independent bug: single-step numbers looked healthy (`train_loss` ≈
+`val_tf_loss` ≈ 0.0012-0.0015, gradient norm stable, LR decaying on
+schedule), but the rollout comparison was catastrophic --
+`rollout_mse≈95` (≈9.75 m/s RMS) against `persistence_mse≈0.0028` (≈0.053
+m/s RMS), an improvement of roughly -3,300,000%, worsening by three orders
+of magnitude from frame 1 to the last frame of the 68-frame rollout. That
+shape (fine single-step, catastrophic and horizon-compounding on rollout)
+is the signature of autoregressive error compounding / exposure bias, not
+a static bias -- plausibly because the AR auxiliary loss's training horizon
+(`AR_FRAMES=2`, 20 tokens) is far shorter than the 68-frame (680-token) eval
+rollout it's meant to stabilize. **That root cause is NOT fixed in this
+pass** -- it needs its own design decision (how far to extend `AR_FRAMES`/
+`AR_SEQS`, whether to add a horizon curriculum, whether the `PREDICT_DELTA`
+integration needs damping over hundreds of sequential feedback steps) and
+is tracked as an open item, not a mechanical patch.
+
+What WAS fixed: the checkpoint-promotion logic that let this go unnoticed.
+`_rollout_best.pt` (`train()`'s rollout-best block) was gated purely on
+`rollout_mse < best["rollout_mse"]` -- a self-relative comparison against
+this run's own history, seeded at `float('inf')`. Any finite value beats
+infinity on the very first eval, and any run whose rollout is uniformly bad
+can keep re-earning "best" just by being marginally less bad than its own
+worst point, with zero check against the persistence baseline it's
+supposed to be beating. Given `DEFAULT_WARM_START_CKPT` points at
+`r1_a3b_delta_ar_rollout_best.pt` and is the default no-arg warm-start
+target for future runs, a garbage "best" doesn't just sit there mislabeled
+-- it becomes the seed for the next run too.
+
+### 18.4 The fix: a real promotion gate, plus alerting for when it fires
+
+- New `Config.MAX_SANE_ROLLOUT_RMSE_MPS = 3.0 * 17.8` (≈53.4 m/s) -- a
+  generous absolute ceiling (3x the fastest training free-stream speed;
+  observed real centroid velocities top out around 1 m/s per
+  `tests/test_centroid_availability.py`) meant to catch genuine decoder-fed
+  divergence, not to gatekeep marginal model quality.
+- `best` gained a `promoted_rollout_mse` field, distinct from the existing
+  `rollout_mse` (best-EVER-seen value regardless of gate outcome, kept so
+  the code can tell "found a new self-relative low" apart from "actually
+  promoted a checkpoint"). `_rollout_best.pt` is now only written when a new
+  low ALSO beats persistence (`improvement_pct > 0`) AND passes the sanity
+  ceiling.
+- When a new self-relative low is found but fails that gate, three things
+  fire together, not just a console line (a console print assumes someone
+  is watching a multi-hour unattended run in real time, which is exactly
+  how the original bug went unnoticed):
+  1. A red console line (`[alert] new rollout_mse low ... NOT promoted`).
+  2. `_Telemetry.alert()` (new method) -> a real `wandb.alert()` push
+     notification (email/Slack, per the user's wandb settings), distinct
+     from `.log()` which only ever lands in run history.
+  3. `append_local_alert()` (new function) appends one JSON line to
+     `{run_name}_alerts.jsonl` under `CHECKPOINT_DIR`, independent of
+     wandb -- `_Telemetry` can be disabled or fail silently mid-run (see its
+     class docstring), so the only-record-lives-in-wandb failure mode is
+     covered too.
+- Every eval now updates `wandb.summary["rollout_beats_persistence"]` and
+  `["latest_improvement_pct"]` regardless of promotion outcome, so a run's
+  health is visible on the wandb dashboard at a glance, and the final
+  per-run result dict gained `"ever_promoted_rollout_checkpoint"`.
+
+Verified: syntax check, a synthetic exercise of the alert path (wandb
+disabled -> `.alert()` no-ops without raising; local JSONL append/parse
+round-trips), a sanity-ceiling check against the actual observed 95.1
+rollout_mse (RMS 9.75 m/s, under the 53.4 m/s ceiling -- confirming the
+persistence-beating half of the gate is what actually catches this specific
+case, not the ceiling; the ceiling is a genuinely separate belt-and-suspenders
+guard for a different failure mode), and `--smoke-test`.
+
+### 18.5 What v3.7 does NOT change
+
+- `NUM_TIME`/`NUM_X`/`SEQ_LEN`/data files/split policy -- unchanged from
+  v3.5/v3.6.
+- The `_best.pt` (val_tf_mse) promotion gate -- still self-relative only, no
+  persistence-style baseline to gate against for that metric, and the
+  single-step numbers it tracks are currently healthy. Not touched.
+- The AR-horizon mismatch itself (§18.3) -- gating and alerting make the
+  symptom visible and stop it from silently contaminating the "best"
+  checkpoint; they do not fix the underlying training-methodology gap.
+
+---
+
+## 19. v3.8 -- rollout-divergence diagnosis and Round-2 sweep infrastructure
+
+**Status:** shipped this pass. Direct follow-on from §18.3's open item: the
+AR-horizon mismatch was identified but deliberately not fixed, since "what
+should `AR_FRAMES` become" is a design decision, not a mechanical patch. This
+section is that decision, made with evidence instead of guessing, plus the
+infrastructure to test several candidate fixes without picking just one.
+
+### 19.1 Two rollout-archive checkpoints exist, and neither is the same file
+
+Before the diagnostic could run against anything, `saved_models/` had to be
+located: mid-session the operator moved its entire contents to
+`saved_models/old/` to start the next real run from a clean slate --
+independent of, and consistent with, the "start fresh, don't resume the
+mixed-objective lineage" recommendation from §18. `r1_a3b_delta_ar_latest.pt`
+in that archive (dated 2026-09-01, the tail of the run analysed throughout
+§18) is what the diagnostic below was run against. `saved_models/` itself is
+empty except for this archive going forward, until the next real run starts.
+
+### 19.2 Stage 0 diagnostic: is the divergence chaotic, or a systematic bias?
+
+New script: `transformer_neurIPS/diagnose_rollout_noise_sensitivity.py`.
+Read-only, no training, no checkpoint writes -- it re-runs the eval-time
+autoregressive rollout at several injected-noise levels on the model's own
+fed-back prediction and checks two things: does error grow with injected
+noise (sensitivity/chaos), and is the error dominated by its mean (a
+consistent directional drift) or by its spread (symmetric variance)? These
+two failure modes call for different fixes, so the question is worth
+answering BEFORE picking one.
+
+Run against `saved_models/old/r1_a3b_delta_ar_latest.pt`, 8 val sequences,
+noise_std swept 0 -> 1e-2 (100x range):
+
+```
+ noise_std    rmse_f1   rmse_mid  rmse_last  |bias|/rmse
+   0.0e+00    0.0683      8.604      16.76        0.822
+   1.0e-04    0.0683      8.604      16.76        0.822
+   1.0e-03    0.0684      8.604      16.76        0.822
+   1.0e-02    0.0686      8.602      16.76        0.822
+```
+
+**Verdict: BIAS-dominated, not chaotic.** Last-frame RMSE is IDENTICAL
+(16.76, to 4 significant figures) whether injected noise is zero or 100x
+larger -- the rollout is completely insensitive to perturbation, which rules
+out sensitive-dependence/chaos as the mechanism. `|bias|/RMSE = 0.822` means
+the error is overwhelmingly a consistent directional drift, not random
+spread. Concretely: noise-robustness training (input noise, weight decay,
+dropout, and the new feedback-noise knob in §19.3) is unlikely to fix this
+on its own, because that's not what's driving the divergence -- the model
+has a repeatable, compounding directional error, the same way every rollout.
+The horizon-extension arms from §18.3 (`a4b_ar_very_long`, `e3_ar_long`) are
+the better-targeted lever: they give the model enough AR training exposure
+to see and correct its own accumulated drift, which is what a bias-dominated
+failure mode actually calls for.
+
+### 19.3 `sched` mode unblocked on MPS/CPU -- verified, not assumed
+
+`resolve_train_regime()`'s AR kill-switch (§9, §18.3) previously disabled
+BOTH `AR_MODE='frame_ar'` and `AR_MODE='sched'` on MPS/CPU under one
+condition (`Config.AR_MODE != 'none'`). Empirically measured on this Mac at
+the real trainer shape (`micro_batch=1`, `SEQ_LEN=800`) before touching the
+gate: `sched_sampling_loss` costs ~34 MB delta vs. ~32 MB for one ordinary
+teacher-forced step -- the same order of magnitude, NOT `frame_ar`'s
+exponential blowup (which scales with `AR_FRAMES * NUM_X` retained
+activation graphs). The guard was scoped to only force `frame_ar -> none`;
+`sched` now runs on MPS/CPU as designed. The informational `[memory]`
+startup banner and its log line were updated to reflect the split.
+
+### 19.4 New knob: `AR_FEEDBACK_NOISE_STD`
+
+Distinct from the existing `NOISE_STD` (perturbs GROUND-TRUTH inputs during
+ordinary teacher-forced training): `AR_FEEDBACK_NOISE_STD` perturbs the
+model's OWN fed-back prediction specifically, inside `frame_ar_loss`'s
+sequential loop and on the replaced positions in `sched_sampling_loss`'s
+mix. Default `0.0` (off, byte-identical behavior to before). Given §19.2's
+bias-dominated verdict, this is a secondary/optional mechanism, not a
+primary lever -- included because it's cheap to test alongside the horizon
+extension, not because the evidence points at it directly.
+
+### 19.5 Two new Round-2 arms
+
+- `e6_sched_noise` (branch E) -- scheduled sampling + `AR_FEEDBACK_NOISE_STD`.
+  The only AR-family arm that runs its real mechanism on MPS/CPU (per §19.3).
+- `a6b_ar_feedback_noise` (branch A) -- `a4b_ar_very_long`'s 14-frame horizon
+  plus feedback noise; tests whether the two mechanisms combine better than
+  either alone. CUDA-only (uses `frame_ar`).
+
+`sweep_deep_dive.py`'s per-arm config-display allowlist was extended to
+include `AR_FEEDBACK_NOISE_STD` so it shows up in `UPLOAD_ME.md` reports.
+
+### 19.6 `sweep_deep_dive.py` gained `--no-warm-start`
+
+Discovered while smoke-testing the new sweep scripts below: `arm_command()`
+had no way to pass `--no-warm-start` through to the trainer, so every arm
+launched via the sweep tool silently warm-started from
+`DEFAULT_WARM_START_CKPT` (`r1_a3b_delta_ar_rollout_best.pt`) whenever that
+file happened to exist -- biasing what's supposed to be a controlled
+comparison between arms, and (after §19.1's archive move) hard-failing
+outright since that file no longer exists at the default path. Added
+`--no-warm-start` to `build_parser()` / `arm_command()`; both new launcher
+scripts (§19.7) pass it so every arm in a sweep cold-starts from the same
+clean baseline.
+
+### 19.6.1 A second bug, found by actually running the real sweep
+
+The `--no-warm-start` fix let the real `run_sweep_mac.sh` launch land, which
+then exercised a code path the smoke test hadn't (the smoke test was run
+with `--skip-diagnostics`): `run_diagnostics()` calls `null_baselines()`
+TWICE, once per tokenization (`for tok, frame_level in (("token", False),
+("frame", True))`), without ever mutating `Config.TOKENIZATION` to match.
+`null_baselines()`'s internal `_centroid_score()` helper (added in §18.2)
+called `to_per_token_latent(pred, cfg)`, which reshapes based on the GLOBAL
+`cfg.TOKENIZATION` -- silently wrong on the `frame_level=True` pass, since
+that parameter is independent, per-call state. Result: a 470-wide
+(`NUM_X*LATENT_DIM`-flattened) tensor got fed straight to the decoder, which
+expects 47-wide, and `run_diagnostics()` crashed with a TorchScript matmul
+shape error the first time it ran end-to-end (previously it never had,
+since the trainer's own startup call to `null_baselines()` always computes
+`frame_level` FROM `Config.TOKENIZATION`, so the mismatch never triggered
+there).
+
+Fixed by reshaping on the local `frame_level` parameter directly inside
+`_centroid_score()` instead of delegating to `to_per_token_latent()`.
+`train()`'s own startup path is behaviourally unchanged (it never had the
+mismatch); only `run_diagnostics()`'s dual-tokenization pass is affected.
+Verified with `--diagnostics-only` end-to-end (both tokenizations printed
+correctly, `[diag] written to .../diagnostics.json`, exit 0) and the full
+test suite (41 passed, 3 skipped -- the `test_model_vs_baseline` skips are
+expected now that `saved_models/` is empty per §19.1, not a regression).
+
+The already-running `run_sweep_mac.sh` invocation was NOT restarted for
+this fix -- its diagnostics phase failed non-fatally before the fix landed
+(the sweep driver continues and just omits the diagnostics section from the
+final report), but each arm's OWN `null_baselines()` call at training
+startup was never affected, so its per-arm results are unaffected.
+
+### 19.7 Two launcher scripts, split by what each piece of hardware can test
+
+`AR_MODE='frame_ar'` needs CUDA (§19.3); `AR_MODE='sched'` and the
+non-AR arms don't. Rather than one script that silently degrades depending
+on where it's run, there are now two, each checking its own required files
+before doing anything:
+
+- **`transformer_neurIPS/run_sweep_mac.sh`** -- `e6_sched_noise` +
+  `a5b_wd_heavy` (weight-decay/dropout hypothesis). `--max-parallel 1`
+  (no CUDA to round-robin across), `ACCUM` cut from this hardware's normal
+  32 down to 4 by default for turnaround -- explicitly a shallow, throwaway
+  signal check, not a final-quality run.
+- **`transformer_neurIPS/run_sweep_h200.sh`** -- `a4b_ar_very_long`,
+  `e3_ar_long`, `a6b_ar_feedback_noise`. Refuses to run at all (checks
+  `nvidia-smi`) if no GPU is detected, since these arms would otherwise
+  silently degrade to control rather than error. `--max-parallel` defaults
+  to `min(detected GPU count, arm count)`.
+
+Both scripts check the same required-file list before launching anything --
+`train_production_transformer_deep_dive.py`, `model_variants.py`,
+`sweep_deep_dive.py`, `data/train_80.h5`, `data/val_80.h5`, and the frozen
+GEN3 decoder (`encoder/autoencoderGEN3/saved_models_production/
+Model_GEN3_05_AttentionSE_absolute_best_scripted.pt`) -- printing `[OK]`/
+`[MISSING]` per file before anything trains, so a missing file is a clear
+one-line diagnosis instead of a stack trace three minutes into a run.
+
+Smoke-tested both new arms end-to-end via `sweep_deep_dive.py --smoke
+--no-warm-start` before committing to a real shallow run.
+
+### 19.8 What v3.8 does NOT change
+
+- The actual AR-horizon fix is NOT applied to the production `a3b_delta_ar`
+  arm -- these are new, separate arms to test candidates against a clean
+  baseline first (per §18's "prove it before scaling to H200" plan).
+  `DEFAULT_WARM_START_CKPT` still points at the (now-archived)
+  `r1_a3b_delta_ar_rollout_best.pt`; nothing about which checkpoint a
+  future default warm-start resolves to was changed.
+- `_best.pt`'s gate, the AR-horizon mismatch's actual numeric fix
+  (`AR_FRAMES`'s production value), and the archived `saved_models/old/`
+  checkpoints are all exactly as `§18.5` left them.

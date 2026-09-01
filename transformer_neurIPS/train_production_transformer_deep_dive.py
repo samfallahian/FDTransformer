@@ -234,6 +234,8 @@ schema changes.
 
 import argparse
 import copy
+import shutil
+import warnings
 import json
 import math
 import os
@@ -545,6 +547,14 @@ class Config:
     AR_EVERY_N_STEPS = 4
     AR_DETACH_FEEDBACK = True  # truncate gradient through the fed-back token
     SCHED_SAMPLING_P = 0.25    # replacement probability when AR_MODE='sched'
+    # Gaussian noise added to the model's OWN fed-back prediction before it's
+    # used as a future input -- in frame_ar's sequential loop, and on the
+    # replaced positions in sched's mix. Distinct from NOISE_STD, which
+    # perturbs GROUND-TRUTH inputs during ordinary teacher-forced training;
+    # this instead simulates "the thing you're about to condition on is
+    # already slightly wrong", closer to the actual rollout failure mode.
+    # 0.0 (off) preserves existing arm behavior exactly.
+    AR_FEEDBACK_NOISE_STD = 0.0
 
     # -- evaluation ---------------------------------------------------------
     VAL_CONTEXT_STEPS = 12                      # frames fed as context
@@ -553,6 +563,15 @@ class Config:
     VAL_EVERY_STEPS = 25
     LOG_EVERY_STEPS = 25
     CHECKPOINT_EVERY_STEPS = 25
+    # `_latest.pt` is overwritten in place every CHECKPOINT_EVERY_STEPS -- on
+    # its own that means a run which quietly regresses for hours (see the
+    # rollout-divergence case this Config.MAX_SANE_ROLLOUT_RMSE_MPS gate was
+    # added for) leaves no way to recover an earlier state short of whatever
+    # _best.pt/_rollout_best.pt happened to catch. Archive the last N
+    # `_latest.pt` snapshots (tagged by step) under
+    # `{CHECKPOINT_DIR}/{run_name}_archive/` instead, pruned to this count.
+    # 5 * ~57 MB is trivial disk cost for real rollback insurance.
+    LATEST_ARCHIVE_KEEP = 5
 
     # -- runtime ------------------------------------------------------------
     USE_TF32 = True
@@ -578,6 +597,19 @@ class Config:
     CENTROID_WEIGHTS = (1.0, 1.0, 1.0)   # (w_vx, w_vy, w_vz); future emphasis knob
     CENTROID_LOSS = 'l2'                  # 'l2' = mean of vector-L2-norms;
                                           # 'mse' = mean of squared components
+    # _rollout_best.pt promotion gate: a rollout MSE that merely improves on
+    # this run's own history is NOT sufficient -- it must also beat the
+    # persistence baseline (see train()'s rollout-best block). This is a
+    # belt-and-suspenders absolute ceiling on top of that: reject promotion
+    # outright if the implied RMS centroid velocity is nonsense regardless of
+    # what persistence happens to score, since a badly diverged rollout can
+    # in principle still edge out an equally-bad persistence measurement on a
+    # tiny/unlucky eval sample. Corpus training speeds top out at 17.8 m/s
+    # (param 11p4); centroid wake velocities observed in practice are a small
+    # fraction of that (~1 m/s, see tests/test_centroid_availability.py).
+    # 3x the fastest training free-stream speed is generous headroom while
+    # still catching genuine divergence (observed case: ~9.75 m/s RMS).
+    MAX_SANE_ROLLOUT_RMSE_MPS = 3.0 * 17.8
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
@@ -708,6 +740,16 @@ ROUND2_ARMS = {
                                                "AR_LOSS_WEIGHT": 0.5, "AR_FRAMES": 4}},
             "e5_delta_noise": {"desc": "Delta parameterisation + noise: shrink the thing that accumulates.",
                                "overrides": {"PREDICT_DELTA": True, "NOISE_STD": 2e-2}},
+            "e6_sched_noise": {"desc": "Scheduled sampling + noise on the fed-back "
+                                       "prediction itself (not ground truth): simulates "
+                                       "'the thing you're about to condition on is "
+                                       "already wrong', not just generic input noise. "
+                                       "sched's 2-forward cost (no sequential chain) "
+                                       "makes this the only AR-family arm that runs on "
+                                       "MPS/CPU unmodified -- see resolve_train_regime().",
+                               "overrides": {"AR_MODE": "sched", "AR_LOSS_WEIGHT": 1.0,
+                                             "SCHED_SAMPLING_P": 0.25,
+                                             "AR_FEEDBACK_NOISE_STD": 5e-3}},
         },
     },
     # ---------------------------------------------------------------- branch F
@@ -744,6 +786,15 @@ ROUND2_ARMS = {
                                                "AR_EVERY_N_STEPS": 16}},
             "a5b_wd_heavy": {"desc": "Weight decay 0.1 + dropout 0.1: damp the amplifying modes.",
                              "overrides": {"WEIGHT_DECAY": 0.1, "DROPOUT": 0.1}},
+            "a6b_ar_feedback_noise": {"desc": "a4b's long AR horizon (14 frames) PLUS noise "
+                                              "on the fed-back prediction at each AR step -- "
+                                              "tests whether widening the horizon alone is "
+                                              "enough, or whether the model also needs to "
+                                              "practice on a noisy version of its own errors.",
+                                     "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                   "AR_FRAMES": 14, "AR_SEQS": 2,
+                                                   "AR_EVERY_N_STEPS": 16,
+                                                   "AR_FEEDBACK_NOISE_STD": 5e-3}},
         },
     },
     # ---------------------------------------------------------------- branch R
@@ -1294,9 +1345,20 @@ def null_baselines(data, cfg, frame_level=False, max_seqs=256):
                  "previous frame": torch.cat([lat[:, :k, :], lat[:, :T - k, :]], 1)}
 
     def _centroid_score(pred, tgt):
+        # Deliberately NOT to_per_token_latent(pred, cfg) -- that reshapes
+        # based on cfg.TOKENIZATION, but this function's `frame_level`
+        # parameter is an independent, per-call argument (run_diagnostics()
+        # calls this twice, once for each tokenization, without ever
+        # mutating cfg.TOKENIZATION). Using the global config here silently
+        # skipped the reshape on the frame_level=True pass and fed the
+        # decoder a 470-wide "latent", producing a matmul shape error
+        # (470 vs the decoder's expected 47) the first time run_diagnostics()
+        # actually ran end-to-end.
+        if frame_level:
+            pred = pred.reshape(*pred.shape[:-1], cfg.NUM_X, cfg.LATENT_DIM)
+            tgt = tgt.reshape(*tgt.shape[:-1], cfg.NUM_X, cfg.LATENT_DIM)
         with torch.no_grad():
-            return float(centroid_velocity_loss(
-                to_per_token_latent(pred, cfg), to_per_token_latent(tgt, cfg), cfg))
+            return float(centroid_velocity_loss(pred, tgt, cfg))
 
     out = {}
     for name, pred in cands.items():
@@ -1499,6 +1561,21 @@ def frame_ar_loss(model, batch, cfg, generator=None):
                                    device='cpu').item())
     detach = bool(getattr(cfg, 'AR_DETACH_FEEDBACK', True))
 
+    fb_noise_std = float(getattr(cfg, 'AR_FEEDBACK_NOISE_STD', 0.0))
+
+    def _feed(x):
+        """The value written into `curr` for the next step: detach per
+        AR_DETACH_FEEDBACK, then (optionally) perturb -- simulating "the
+        thing you're about to condition on is already slightly wrong",
+        distinct from NOISE_STD which perturbs ground-truth inputs. Applied
+        AFTER detach, so the noise itself never receives gradient either;
+        only the clean `nxt` used for the loss below does.
+        """
+        x = x.detach() if detach else x
+        if fb_noise_std > 0:
+            x = x + fb_noise_std * torch.randn_like(x)
+        return x
+
     if getattr(model, 'frame_native', False):
         frames = seq_to_frames(seqs, NX, LD)
         width = NX * LD
@@ -1508,7 +1585,7 @@ def frame_ar_loss(model, batch, cfg, generator=None):
             nxt = model(curr)[:, -1:, :]
             preds.append(nxt)
             nf = frames[:, ctx_frames + i:ctx_frames + i + 1, :].clone()
-            nf[:, :, :width] = nxt.detach() if detach else nxt
+            nf[:, :, :width] = _feed(nxt)
             curr = torch.cat([curr, nf], dim=1)
         # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
         # physical quantity: its per-dimension scale is arbitrary, its
@@ -1531,7 +1608,7 @@ def frame_ar_loss(model, batch, cfg, generator=None):
         nxt = model(curr)[:, -1:, :]
         preds.append(nxt)
         tok = seqs[:, ctx_len + i:ctx_len + i + 1, :].clone()
-        tok[:, :, :LD] = nxt.detach() if detach else nxt
+        tok[:, :, :LD] = _feed(nxt)
         curr = torch.cat([curr, tok], dim=1)
     # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
     # physical quantity: its per-dimension scale is arbitrary, its
@@ -1569,6 +1646,13 @@ def sched_sampling_loss(model, batch, cfg, p, generator=None):
     # own[t] is the prediction of position t+1, so the replacement for input
     # position t is own[t-1]. Position 0 has no predecessor; keep ground truth.
     repl = torch.cat([inp[:, :1, :width], own[:, :-1, :]], dim=1)
+    # AR_FEEDBACK_NOISE_STD, same knob and same rationale as in frame_ar_loss:
+    # perturb the model's OWN fed-back prediction (not the ground-truth
+    # positions), so the replaced positions simulate "already slightly
+    # wrong" rather than a clean one-step prediction.
+    fb_noise_std = float(getattr(cfg, 'AR_FEEDBACK_NOISE_STD', 0.0))
+    if fb_noise_std > 0:
+        repl = repl + fb_noise_std * torch.randn_like(repl)
     keep = torch.rand(inp.shape[0], inp.shape[1], 1, device=inp.device,
                       generator=generator) >= p
     inp = inp.clone()
@@ -1728,6 +1812,22 @@ class _Telemetry:
         except Exception:
             pass
 
+    def alert(self, title, text, level=None):
+        """Push notification (email/Slack, per the user's wandb settings) --
+        NOT the same as .log(), which only ever lands in the run's history
+        and is invisible unless someone is actively watching. Used for
+        events that matter even if nobody is looking at this run right now
+        (e.g. an unattended multi-hour job). No-op, never fatal, if wandb is
+        disabled or the call fails for any reason -- see class docstring.
+        """
+        if self.run is None:
+            return
+        try:
+            lvl = level or self.wandb.AlertLevel.WARN
+            self.run.alert(title=title, text=text, level=lvl)
+        except Exception:
+            pass
+
     def finish(self):
         if self.run is None:
             return
@@ -1785,6 +1885,99 @@ def _log_write(path, log=print, kind="checkpoint"):
         pass
     label = f"[write:{kind}]"
     log(_rainbow(f"{label} {abs_path}{size_hint}"))
+
+
+def append_local_alert(cfg, run_name, record, log=print):
+    """Append one JSON line to `{run_name}_alerts.jsonl` under CHECKPOINT_DIR.
+
+    Independent of wandb -- `_Telemetry` can be disabled (`--no-wandb`) or
+    can silently fail mid-run (see its class docstring), and a multi-hour
+    unattended run's only record of "something needs attention" shouldn't
+    live solely in a service that might not be there. One line per event,
+    so a `tail -f` or a `cat | jq` afterward is enough to see the whole
+    alert history without scrolling the full training log.
+    """
+    try:
+        path = os.path.join(cfg.CHECKPOINT_DIR, f"{run_name}_alerts.jsonl")
+        record = dict(record)
+        record.setdefault("wall_time", time.strftime("%Y-%m-%dT%H:%M:%S"))
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        log(f"  [alert] failed to append local alert log ({type(e).__name__}: {e})")
+
+
+def archive_latest_checkpoint(cfg, run_name, latest_path, step, log=print):
+    """Copy the just-written `_latest.pt` (+ scripted twin, if present) into
+    `{run_name}_archive/step_{step:07d}.pt` under CHECKPOINT_DIR, then prune
+    that directory down to the `cfg.LATEST_ARCHIVE_KEEP` most recent steps.
+
+    Cheap `shutil.copy2` of an already-serialized file, not a re-save --
+    `save_checkpoint` has already done the expensive `torch.save`/scripting
+    work by the time this runs. Never fatal: a failure here should not take
+    down a training run over what is, at worst, lost rollback insurance.
+    """
+    try:
+        archive_dir = os.path.join(cfg.CHECKPOINT_DIR, f"{run_name}_archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        dest = os.path.join(archive_dir, f"step_{step:07d}.pt")
+        shutil.copy2(latest_path, dest)
+        script_src = latest_path[:-3] + "_scripted.pt" if latest_path.endswith(".pt") \
+            else latest_path + "_scripted.pt"
+        if os.path.exists(script_src):
+            shutil.copy2(script_src, dest[:-3] + "_scripted.pt")
+
+        # Prune to the most recent LATEST_ARCHIVE_KEEP steps, keyed off the
+        # plain `.pt` files (the scripted twin for a pruned step is removed
+        # alongside it, never orphaned).
+        keep = max(1, int(getattr(cfg, "LATEST_ARCHIVE_KEEP", 5)))
+        entries = sorted(
+            (int(f[len("step_"):-3]), f)
+            for f in os.listdir(archive_dir)
+            if f.startswith("step_") and f.endswith(".pt") and not f.endswith("_scripted.pt")
+        )
+        for step_num, fname in entries[:-keep]:
+            for suffix in (".pt", "_scripted.pt"):
+                stale = os.path.join(archive_dir, f"step_{step_num:07d}{suffix}")
+                if os.path.exists(stale):
+                    os.remove(stale)
+    except Exception as e:
+        log(f"  [archive] failed to archive step {step} ({type(e).__name__}: {e})")
+
+
+def write_status_json(cfg, run_name, step, train_loss, best, last_metrics,
+                       t_start, log=print):
+    """Small human-readable snapshot of run health, written atomically
+    alongside every `_latest.pt` write.
+
+    Exists so "how is this run doing" is a `cat`/`jq`, not a `torch.load` of
+    a multi-hundred-MB checkpoint or a scroll through hours of console log --
+    the same visibility gap `append_local_alert` closed for the FAILURE case
+    (a checkpoint that regressed), generalised to "what's the current state"
+    regardless of whether anything alert-worthy has happened.
+    """
+    try:
+        elapsed_s = time.time() - t_start
+        eta_hours = None
+        if step > 0 and cfg.MAX_STEPS > step:
+            eta_hours = (elapsed_s / step) * (cfg.MAX_STEPS - step) / 3600.0
+        snapshot = {
+            "run_name": run_name, "arm": cfg.ARM, "step": step,
+            "max_steps": cfg.MAX_STEPS, "wall_seconds": elapsed_s,
+            "eta_hours": eta_hours, "train_loss_centroid_l2": train_loss,
+            "best": dict(best), "last_eval": {
+                k: v for k, v in (last_metrics or {}).items()
+                if not isinstance(v, list)
+            },
+            "wall_time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        path = os.path.join(cfg.CHECKPOINT_DIR, f"{run_name}_status.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(snapshot, f, indent=2, default=str)
+        os.replace(tmp, path)   # atomic, matches the checkpoint-write pattern
+    except Exception as e:
+        log(f"  [status] failed to write status.json ({type(e).__name__}: {e})")
 
 
 def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
@@ -1883,100 +2076,126 @@ def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
               "script_error": None, "trace_error": None,
               "roundtrip_ok": False}
     scripted = None
-    try:
+    # torch.jit.{script,trace,save,load} are explicitly unsupported on
+    # Python 3.14+ ("may break; switch to torch.compile/torch.export") --
+    # confirmed empirically (see OVERVIEW.md) that on this interpreter they
+    # emit: torch.jit's own DeprecationWarning at every entry point, a
+    # TracerWarning from tracing any data-shape-derived Python control flow
+    # (unavoidable in general, since trace's whole model is "record one
+    # concrete execution"), and dozens of repeated "`.grad` attribute of a
+    # Tensor that is not a leaf Tensor" UserWarnings from trace's own
+    # internal parameter handling -- NOT from any `.to()` call in this
+    # function (verified: still fires with every `.to()` call in this
+    # function guarded/removed). All three are noise from a deprecated API
+    # on this Python version, not actionable signal, and were flooding
+    # multi-hour training logs on every periodic scripted-checkpoint write.
+    # Scoped to just this block so a genuinely new/unexpected warning
+    # elsewhere in the program is never silently swallowed.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", category=DeprecationWarning,
+            message=r".*torch\.jit\..*is not supported in Python 3\.14\+.*")
+        warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+        warnings.filterwarnings(
+            "ignore", category=UserWarning,
+            message=r".*\.grad attribute of a Tensor that is not a leaf Tensor.*")
         try:
-            scripted = torch.jit.script(inner)
-            result["method"] = "script"
-        except Exception as e:
-            result["script_error"] = f"{type(e).__name__}: {e}"
-            # (2) trace fallback on a representative synthetic input.
-            ex = torch.zeros(1, seq_len, width, device=device)
             try:
-                scripted = torch.jit.trace(
-                    inner, ex, strict=False, check_trace=False)
-                result["method"] = "trace"
-            except Exception as e2:
-                result["trace_error"] = f"{type(e2).__name__}: {e2}"
+                scripted = torch.jit.script(inner)
+                result["method"] = "script"
+            except Exception as e:
+                result["script_error"] = f"{type(e).__name__}: {e}"
+                # (2) trace fallback on a representative synthetic input.
+                ex = torch.zeros(1, seq_len, width, device=device)
+                try:
+                    scripted = torch.jit.trace(
+                        inner, ex, strict=False, check_trace=False)
+                    result["method"] = "trace"
+                except Exception as e2:
+                    result["trace_error"] = f"{type(e2).__name__}: {e2}"
+                    log(_c(
+                        f"  [scripted] BOTH script and trace failed for "
+                        f"{type(inner).__name__}: script={result['script_error']}; "
+                        f"trace={result['trace_error']}. Skipping "
+                        f"{os.path.basename(script_path)}.", "red"))
+                    return result
+
+            # Convert to CPU before saving so the artifact is portable to a
+            # host without a CUDA / MPS device.
+            #
+            # CRITICAL: `torch.jit.trace` returns a ScriptModule that shares
+            # parameter/buffer STORAGE with `inner`. An in-place `.to("cpu")`
+            # on such a traced object migrates the eager training model to
+            # CPU as a side effect, which then explodes on the next
+            # `optimizer.step()` with an addmm device-mismatch. `torch.jit.script`
+            # already deep-copies params into a new ScriptModule, so its
+            # `.to("cpu")` is independent of `inner`. To keep both branches
+            # safe uniformly, we deep-copy the ScriptModule BEFORE moving --
+            # cheap on the tiny module sizes we save (~19 MB) and eliminates
+            # the storage-sharing footgun entirely. The `finally` block below
+            # also unconditionally restores `inner` to `orig_device` as a
+            # belt-and-suspenders guard against any future scripting mode
+            # (e.g. `torch.jit.freeze`) that might reintroduce the aliasing.
+            try:
+                scripted_cpu = copy.deepcopy(scripted).to("cpu")
+            except Exception:
+                # deepcopy of a ScriptModule can fail on some torch versions;
+                # if it does, save whichever object we have and rely on the
+                # `finally` device-restore below to keep `inner` correct.
+                try:
+                    scripted_cpu = scripted.to("cpu")
+                except Exception:
+                    scripted_cpu = scripted
+
+            tmp = script_path + ".tmp"
+            torch.jit.save(scripted_cpu, tmp)
+            os.replace(tmp, script_path)   # atomic
+            _log_write(script_path, log=log, kind=f"scripted:{result['method']}")
+
+            # (6) roundtrip: reload + one forward on CPU synthetic data.
+            try:
+                reloaded = torch.jit.load(script_path, map_location="cpu")
+                with torch.no_grad():
+                    ex_cpu = torch.zeros(1, seq_len, width)
+                    _ = reloaded(ex_cpu)
+                result["roundtrip_ok"] = True
+            except Exception as e:
                 log(_c(
-                    f"  [scripted] BOTH script and trace failed for "
-                    f"{type(inner).__name__}: script={result['script_error']}; "
-                    f"trace={result['trace_error']}. Skipping "
-                    f"{os.path.basename(script_path)}.", "red"))
-                return result
-
-        # Convert to CPU before saving so the artifact is portable to a
-        # host without a CUDA / MPS device.
-        #
-        # CRITICAL: `torch.jit.trace` returns a ScriptModule that shares
-        # parameter/buffer STORAGE with `inner`. An in-place `.to("cpu")`
-        # on such a traced object migrates the eager training model to
-        # CPU as a side effect, which then explodes on the next
-        # `optimizer.step()` with an addmm device-mismatch. `torch.jit.script`
-        # already deep-copies params into a new ScriptModule, so its
-        # `.to("cpu")` is independent of `inner`. To keep both branches
-        # safe uniformly, we deep-copy the ScriptModule BEFORE moving --
-        # cheap on the tiny module sizes we save (~19 MB) and eliminates
-        # the storage-sharing footgun entirely. The `finally` block below
-        # also unconditionally restores `inner` to `orig_device` as a
-        # belt-and-suspenders guard against any future scripting mode
-        # (e.g. `torch.jit.freeze`) that might reintroduce the aliasing.
-        try:
-            scripted_cpu = copy.deepcopy(scripted).to("cpu")
-        except Exception:
-            # deepcopy of a ScriptModule can fail on some torch versions;
-            # if it does, save whichever object we have and rely on the
-            # `finally` device-restore below to keep `inner` correct.
+                    f"  [scripted] WARNING: roundtrip check FAILED for "
+                    f"{os.path.basename(script_path)} "
+                    f"({type(e).__name__}: {e}); state-dict `.pt` is still "
+                    f"authoritative.", "yellow"))
+        finally:
+            # Belt-and-suspenders: restore `inner` to the device it was on
+            # when we entered, in case some path above (e.g. a future
+            # torch.jit.freeze fallback, or a deepcopy that silently
+            # didn't) still migrated its parameters.
+            #
+            # IMPORTANT: only call `.to()` when the device ACTUALLY differs.
+            # `nn.Module.to()` unconditionally runs `_apply(...)`, which in
+            # recent PyTorch iterates every parameter and evaluates
+            # `param_grad = param.grad` (torch/nn/modules/module.py:~974).
+            # On a `torch.compile`-wrapped model whose parameters are
+            # exposed via a proxy, that grad access trips the "The .grad
+            # attribute of a Tensor that is not a leaf Tensor is being
+            # accessed" UserWarning even though nothing here needs to move.
+            # Gating the call on a real device change avoids the spurious
+            # warning without weakening the safety net: if `inner` ever
+            # ends up on the wrong device, we still move it back. (Also
+            # covered by this function's warnings.catch_warnings() scope
+            # above in the genuine-move case, where the warning is noise
+            # from torch.jit internals rather than actionable signal.)
             try:
-                scripted_cpu = scripted.to("cpu")
-            except Exception:
-                scripted_cpu = scripted
-
-        tmp = script_path + ".tmp"
-        torch.jit.save(scripted_cpu, tmp)
-        os.replace(tmp, script_path)   # atomic
-        _log_write(script_path, log=log, kind=f"scripted:{result['method']}")
-
-        # (6) roundtrip: reload + one forward on CPU synthetic data.
-        try:
-            reloaded = torch.jit.load(script_path, map_location="cpu")
-            with torch.no_grad():
-                ex_cpu = torch.zeros(1, seq_len, width)
-                _ = reloaded(ex_cpu)
-            result["roundtrip_ok"] = True
-        except Exception as e:
-            log(_c(
-                f"  [scripted] WARNING: roundtrip check FAILED for "
-                f"{os.path.basename(script_path)} "
-                f"({type(e).__name__}: {e}); state-dict `.pt` is still "
-                f"authoritative.", "yellow"))
-    finally:
-        # Belt-and-suspenders: restore `inner` to the device it was on
-        # when we entered, in case some path above (e.g. a future
-        # torch.jit.freeze fallback, or a deepcopy that silently
-        # didn't) still migrated its parameters.
-        #
-        # IMPORTANT: only call `.to()` when the device ACTUALLY differs.
-        # `nn.Module.to()` unconditionally runs `_apply(...)`, which in
-        # recent PyTorch iterates every parameter and evaluates
-        # `param_grad = param.grad` (torch/nn/modules/module.py:~974).
-        # On a `torch.compile`-wrapped model whose parameters are
-        # exposed via a proxy, that grad access trips the "The .grad
-        # attribute of a Tensor that is not a leaf Tensor is being
-        # accessed" UserWarning even though nothing here needs to move.
-        # Gating the call on a real device change avoids the spurious
-        # warning without weakening the safety net: if `inner` ever
-        # ends up on the wrong device, we still move it back.
-        try:
-            current_device = next(inner.parameters()).device
-        except StopIteration:
-            current_device = orig_device
-        if current_device != orig_device:
-            try:
-                inner.to(orig_device)
-            except Exception:
-                pass
-        if was_training:
-            inner.train()
+                current_device = next(inner.parameters()).device
+            except StopIteration:
+                current_device = orig_device
+            if current_device != orig_device:
+                try:
+                    inner.to(orig_device)
+                except Exception:
+                    pass
+            if was_training:
+                inner.train()
 
     return result
 
@@ -2465,7 +2684,14 @@ def train(args, log=print):
 
     step = 0
     best = {"rollout_mse": float('inf'), "improvement_pct": -float('inf'),
-            "val_tf_mse": float('inf'), "train_loss": float('inf')}
+            "val_tf_mse": float('inf'), "train_loss": float('inf'),
+            # Tracks the best rollout_mse AMONG evals that actually passed
+            # the promotion gate (beats persistence + sane RMS). Distinct
+            # from "rollout_mse" above, which is the best-ever-seen value
+            # regardless of gate outcome -- kept so the alert below can tell
+            # "found a new self-relative low" apart from "promoted a new
+            # checkpoint".
+            "promoted_rollout_mse": float('inf')}
 
     if os.path.exists(latest_path) and not args.fresh:
         try:
@@ -2594,20 +2820,36 @@ def train(args, log=print):
         name=wandb_run_name, id=run_name,
         resume="allow", config=wandb_config)
 
-    # Disable AR aux loss on MPS/CPU. Even at AR_SEQS=1 the sequential AR loop
-    # under token tokenization does `AR_FRAMES * NUM_X` sequential forwards
-    # (e.g. 4*10 = 40 for the default arm, post-v3.1; was 4*26=104), each retaining its own full
-    # activation graph for backward through `preds`. That accumulates past the
-    # 88 GB MPS ceiling regardless of AR_SEQS. CUDA branch keeps the AR loss
-    # at the arm-specified AR_SEQS. The primary next-token loss is unaffected.
-    if regime.disable_ar and Config.AR_MODE != 'none':
+    # Disable the SEQUENTIAL AR aux loss on MPS/CPU. Even at AR_SEQS=1, the
+    # frame_ar loop under token tokenization does `AR_FRAMES * NUM_X`
+    # sequential forwards (e.g. 4*10 = 40 for the default arm, post-v3.1; was
+    # 4*26=104), each retaining its own full activation graph for backward
+    # through `preds`. That accumulates past the 88 GB MPS ceiling regardless
+    # of AR_SEQS. CUDA branch keeps the AR loss at the arm-specified AR_SEQS.
+    # The primary next-token loss is unaffected either way.
+    #
+    # `sched` mode is NOT covered by this guard -- empirically verified (not
+    # assumed) that `sched_sampling_loss` has a fundamentally different cost
+    # profile: exactly two forwards (one no_grad, one with grad) at the
+    # ordinary batch/seq shape, no sequential chain, no growing retained
+    # graph. Measured on this Mac at the real MPS regime shape
+    # (micro_batch=1, SEQ_LEN=800): ~34 MB delta vs. ~32 MB for a normal
+    # teacher-forced step -- same order of magnitude, not the exponential
+    # blowup frame_ar has. Blocking it here was over-broad; only frame_ar
+    # needs the kill-switch.
+    if regime.disable_ar and Config.AR_MODE == 'frame_ar':
         log(f"  [regime] disabling AR aux loss ({Config.AR_MODE} -> none) "
             f"on device={regime.device}: sequential rollout retains "
             f"AR_FRAMES*NUM_X={int(Config.AR_FRAMES)*Config.NUM_X} forward "
             f"activation graphs, OOMs on MPS even at AR_SEQS=1. "
-            f"CUDA path is untouched.")
+            f"CUDA path is untouched. (sched mode is unaffected by this "
+            f"guard -- see comment above.)")
         Config.AR_MODE = 'none'
         Config.AR_LOSS_WEIGHT = 0.0
+    elif regime.disable_ar and Config.AR_MODE == 'sched':
+        log(f"  [regime] AR mode 'sched' kept ACTIVE on device={regime.device} "
+            f"(unlike 'frame_ar', its 2-forward cost doesn't scale with "
+            f"horizon -- verified empirically, see comment above).")
     elif int(Config.AR_SEQS) > int(regime.aux_micro_batch):
         log(f"  [regime] clamping AR_SEQS {Config.AR_SEQS} -> {regime.aux_micro_batch} "
             f"on device={regime.device} (keeps CUDA defaults untouched)")
@@ -2638,8 +2880,10 @@ def train(args, log=print):
     eval_tf_peak = _attn_bytes(regime.eval_micro_batch, tf_L)
     rollout_L = Config.SEQ_LEN
     eval_rollout_peak = _attn_bytes(regime.eval_micro_batch, rollout_L)
-    if regime.disable_ar:
-        ar_peak_str = _c("DISABLED (MPS/CPU)", "yellow")
+    if regime.disable_ar and Config.AR_MODE == 'none':
+        ar_peak_str = _c("DISABLED (MPS/CPU, frame_ar guard; sched unaffected)", "yellow")
+    elif regime.disable_ar and Config.AR_MODE == 'sched':
+        ar_peak_str = _c("sched mode: ~2x a normal train-forward, no retained chain", "green")
     else:
         # Approximate AR peak: activation graphs for AR_FRAMES*NUM_X forwards
         # under token tokenization, at the growing sequence length. Use the
@@ -2888,8 +3132,22 @@ def train(args, log=print):
 
             if m["improvement_pct"] > best["improvement_pct"]:
                 best["improvement_pct"] = m["improvement_pct"]
-            if m["rollout_mse"] < best["rollout_mse"]:
+            # Promotion gate: a new self-relative low in rollout_mse is
+            # necessary but NOT sufficient to promote a checkpoint as
+            # "best". It must also actually beat the persistence baseline,
+            # and pass an absolute sanity ceiling on implied RMS velocity --
+            # otherwise a diverging rollout can keep re-earning "best" just
+            # by being marginally less catastrophic than its own history,
+            # which is exactly what happened before this gate existed.
+            found_new_low = m["rollout_mse"] < best["rollout_mse"]
+            if found_new_low:
                 best["rollout_mse"] = m["rollout_mse"]
+            rollout_rmse = m["rollout_mse"] ** 0.5
+            beats_persistence = m["improvement_pct"] > 0
+            is_sane = rollout_rmse < Config.MAX_SANE_ROLLOUT_RMSE_MPS
+            promotable = beats_persistence and is_sane
+            if found_new_low and promotable and m["rollout_mse"] < best["promoted_rollout_mse"]:
+                best["promoted_rollout_mse"] = m["rollout_mse"]
                 save_checkpoint(
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_rollout_best.pt"),
                     model, optimizer, step,
@@ -2899,6 +3157,34 @@ def train(args, log=print):
                     scheduler=scheduler)
                 log(f"  --> new best rollout ({m['rollout_mse']:.6f}, "
                     f"{m['improvement_pct']:+.2f}% vs persistence)")
+            elif found_new_low and not promotable:
+                # Found a new low relative to this run's own history, but it
+                # would NOT have been a legitimate promotion -- this is
+                # exactly the silent failure mode the old gate had. Surface
+                # it loudly: unattended runs can go 10+ hours between anyone
+                # actually reading the console.
+                reason = []
+                if not beats_persistence:
+                    reason.append(f"loses to persistence ({m['improvement_pct']:+.2f}%)")
+                if not is_sane:
+                    reason.append(f"implied RMS {rollout_rmse:.3g} m/s exceeds sanity "
+                                  f"ceiling {Config.MAX_SANE_ROLLOUT_RMSE_MPS:.3g} m/s")
+                reason_str = "; ".join(reason)
+                log(_c(f"  [alert] new rollout_mse low ({m['rollout_mse']:.6f}) NOT "
+                       f"promoted to _rollout_best.pt: {reason_str}", "red"))
+                tel.alert(
+                    title=f"{run_name}: rollout regression",
+                    text=(f"step {step}: rollout_mse={m['rollout_mse']:.6g} is a new "
+                          f"self-relative low but was not promoted -- {reason_str}."))
+                append_local_alert(Config, run_name, {
+                    "step": step, "type": "rollout_not_promoted",
+                    "rollout_mse": m["rollout_mse"], "rollout_rmse_mps": rollout_rmse,
+                    "improvement_pct": m["improvement_pct"],
+                    "beats_persistence": beats_persistence, "is_sane": is_sane,
+                    "reason": reason_str,
+                }, log=log)
+            tel.set_summary("rollout_beats_persistence", bool(beats_persistence))
+            tel.set_summary("latest_improvement_pct", m["improvement_pct"])
             if m["val_tf_mse"] < best["val_tf_mse"]:
                 best["val_tf_mse"] = m["val_tf_mse"]
                 save_checkpoint(
@@ -2918,6 +3204,9 @@ def train(args, log=print):
                              'rollout_mse': best['rollout_mse'],
                              'improvement': best['improvement_pct']},
                             scheduler=scheduler)
+            archive_latest_checkpoint(Config, run_name, latest_path, step, log=log)
+            write_status_json(Config, run_name, step, train_loss, best,
+                              last_metrics, t_start, log=log)
 
         if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS:
             stop_reason = f"wall-clock limit ({Config.MAX_HOURS}h)"
@@ -2939,6 +3228,7 @@ def train(args, log=print):
         "anchor_floor": anchor,
         "beat_constant_predictor": bool(best["train_loss"] < floor),
         "beat_frame_anchor": bool(best["train_loss"] < anchor),
+        "ever_promoted_rollout_checkpoint": bool(best["promoted_rollout_mse"] < float('inf')),
         "config": {k: v for k, v in config_dict().items()
                    if isinstance(v, (int, float, str, bool, tuple, list))},
         "arm_spec": {k: v for k, v in resolve_arm(Config.ARM).items() if k != "overrides"},

@@ -484,7 +484,8 @@ def render_report(run_dir, meta, diag, results, statuses):
             shown = {k: cfg.get(k) for k in (
                 "VARIANT", "TOKENIZATION", "EMBED_SIZE", "N_LAYERS", "N_HEADS",
                 "PREDICT_DELTA", "NORMALIZE_FEATURES", "USE_ROPE", "NOISE_STD",
-                "AR_MODE", "AR_LOSS_WEIGHT", "AR_FRAMES", "LOSS", "LEARNING_RATE",
+                "AR_MODE", "AR_LOSS_WEIGHT", "AR_FRAMES", "AR_FEEDBACK_NOISE_STD",
+                "LOSS", "LEARNING_RATE",
                 "DROPOUT", "WEIGHT_DECAY", "BATCH_SIZE", "ACCUMULATION_STEPS")}
             add(f"- **config**: `{shown}`")
         st = statuses.get(name)
@@ -551,6 +552,8 @@ def arm_command(arm, args, run_dir, round_no):
         cmd.append("--cpu-data")
     if args.fresh:
         cmd.append("--fresh")
+    if args.no_warm_start:
+        cmd.append("--no-warm-start")
     if args.batch_size:
         cmd += ["--batch-size", str(args.batch_size)]
     if args.accum:
@@ -649,6 +652,16 @@ def build_parser():
     p.add_argument("--cpu-data", action="store_true")
     p.add_argument("--fresh", action="store_true",
                    help="ignore existing checkpoints for these arms")
+    p.add_argument("--no-warm-start", action="store_true",
+                   help="cold-start every arm instead of warm-starting from "
+                        "DEFAULT_WARM_START_CKPT. Recommended for any sweep "
+                        "meant as a controlled comparison BETWEEN arms -- "
+                        "without this, every arm silently warm-starts from "
+                        "the same external checkpoint (if it exists), which "
+                        "biases the comparison rather than testing each "
+                        "arm's mechanism from a clean baseline. Also avoids "
+                        "a hard failure when that default checkpoint isn't "
+                        "present on this box at all.")
     p.add_argument("--skip-diagnostics", action="store_true")
     p.add_argument("--diagnostics-only", action="store_true")
     p.add_argument("--smoke", action="store_true",

@@ -439,9 +439,18 @@ class BaseTransformer(nn.Module):
         """
         k = self.num_x - 1
         T = raw_lat.shape[1]
-        if T <= k:
-            return raw_lat
-        return torch.cat([raw_lat[:, :k], raw_lat[:, :T - k]], dim=1)
+        # Trace-safe equivalent of `if T <= k: return raw_lat else: ...`.
+        # A Python `if` on a shape-derived value trips torch.jit.trace's
+        # "Converting a tensor to a Python boolean" TracerWarning AND bakes
+        # in whichever branch was taken at trace time -- any later input
+        # whose T falls on the other side of the threshold (e.g. the first
+        # few tokens of an AR rollout) would then silently get the wrong
+        # branch. Clamping k to T instead is a single unconditional
+        # expression, correct for every T: when T <= k it degenerates to
+        # `raw_lat[:, :T]` concatenated with an empty slice, i.e. `raw_lat`
+        # unchanged; when T > k it's exactly the original shifted-concat.
+        k_eff = min(k, T)
+        return torch.cat([raw_lat[:, :k_eff], raw_lat[:, :T - k_eff]], dim=1)
 
     def forward(self, x):
         B, T, C = x.shape

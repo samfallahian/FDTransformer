@@ -224,9 +224,12 @@ that was replaced carries a comment block beginning with the sentinel
 `# LATENT-SPACE ERROR RETIRED`. Grep for that string to find every disabled
 call site. The informational latent floor from `null_baselines()` and the
 `linear_frame_baseline()` diagnostic still use `l2_loss` / `mse_loss` /
-`base_loss` -- they are LATENT-space sanity anchors, not the training
-target. See `transformer_neurIPS/OVERVIEW.md` §10.9.7 for the rationale,
-centroid-index derivation, and the console/wandb schema changes.
+`F.huber_loss` -- they are LATENT-space sanity anchors, not the training
+target (`null_baselines()` also reports a `centroid_l2` key per candidate,
+which IS in the training's metric space and is what `train()` actually
+gates its floor/anchor checks on). See `transformer_neurIPS/OVERVIEW.md`
+§10.9.7 for the rationale, centroid-index derivation, and the console/wandb
+schema changes.
 """
 
 import argparse
@@ -892,23 +895,6 @@ def l2_loss(pred, target):
     return torch.mean(torch.norm(pred - target, dim=-1))
 
 
-def base_loss(pred, target, cfg=Config):
-    """LATENT-space error kernel selected by `cfg.LOSS`.
-
-    Retained for informational latent-space baselines only (`null_baselines()`
-    reporting and the previous-frame anchor floor in `train()`). The training
-    loss is now `centroid_velocity_loss` and does not read `cfg.LOSS`.
-    """
-    kind = getattr(cfg, 'LOSS', 'l2norm')
-    if kind == 'l2norm':
-        return l2_loss(pred, target)
-    if kind == 'mse':
-        return mse_loss(pred, target)
-    if kind == 'huber':
-        return F.huber_loss(pred, target, delta=getattr(cfg, 'HUBER_DELTA', 0.01))
-    raise ValueError(f"Unknown LOSS {kind!r}; expected 'l2norm', 'mse' or 'huber'")
-
-
 # --------------------------------------------------------------------------- #
 # Decoded-centroid training loss
 # --------------------------------------------------------------------------- #
@@ -985,6 +971,20 @@ def decode_centroid(latent, cfg=Config):
     dec = _load_decoder(latent.device, cfg)
     v = dec(latent)                                      # (..., 375)
     return v[..., CENTROID_SLICE]                         # (..., 3)
+
+
+def to_per_token_latent(t, cfg=Config):
+    """Reshape a possibly frame-flattened latent tensor to trailing
+    dim=LATENT_DIM before it hits `decode_centroid`.
+
+    `cfg.TOKENIZATION == 'frame'` models produce/consume tensors with a
+    trailing NUM_X*LATENT_DIM axis (one frame per position); the decoder
+    always expects a trailing LATENT_DIM=47 axis. No-op for 'token'
+    tokenization, where the trailing axis is already LATENT_DIM.
+    """
+    if getattr(cfg, 'TOKENIZATION', 'token') == 'frame':
+        return t.reshape(*t.shape[:-1], cfg.NUM_X, cfg.LATENT_DIM)
+    return t
 
 
 def centroid_velocity_loss(pred_latent, tgt_latent, cfg=Config):
@@ -1246,13 +1246,15 @@ def probe_legacy_attention(cfg, device):
 
 @torch.no_grad()
 def null_baselines(data, cfg, frame_level=False, max_seqs=256):
-    """Informational LATENT-SPACE floor only.
+    """Sanity floor for trivial predictors, in BOTH latent and centroid space.
 
-    The training loss is now the decoded centroid L2 (see
-    `centroid_velocity_loss`); these numbers are retained as a sanity check
-    on data variance and are NOT the target the model is trained against.
-    Kept because the `<-- WORSE THAN PREDICTING ZERO` messaging in `train()`
-    and the diagnostics-only `run_diagnostics` reporting both rely on them.
+    `train()`'s primary loss is `centroid_velocity_loss` (decoded velocity
+    L2), so `out[name]["centroid_l2"]` is the quantity `train_loss` should
+    be compared against for the floor/anchor gates. The latent-space
+    `l2norm`/`mse`/`huber` keys are kept alongside as an informational
+    sanity check on data variance -- they are NOT the target the model is
+    trained against, but the diagnostics-only `run_diagnostics` reporting
+    still reads them.
 
     What trivial predictors score on the TEACHER-FORCED training objective.
 
@@ -1291,15 +1293,22 @@ def null_baselines(data, cfg, frame_level=False, max_seqs=256):
                  "previous token": lat[:, :-1, :],
                  "previous frame": torch.cat([lat[:, :k, :], lat[:, :T - k, :]], 1)}
 
+    def _centroid_score(pred, tgt):
+        with torch.no_grad():
+            return float(centroid_velocity_loss(
+                to_per_token_latent(pred, cfg), to_per_token_latent(tgt, cfg), cfg))
+
     out = {}
     for name, pred in cands.items():
-        # All three objectives, so the comparison against `train_loss` is
-        # like-for-like whichever LOSS the arm is using.
+        # All three latent-space objectives, informational only (see
+        # docstring). `centroid_l2` is the one `train()` actually gates on.
+        centroid_l2 = _centroid_score(pred, tgt)
         out[name] = {
             "l2norm": float(l2_loss(pred, tgt)),
             "mse": float(mse_loss(pred, tgt)),
             "huber": float(F.huber_loss(pred, tgt,
                                         delta=getattr(cfg, 'HUBER_DELTA', 0.01))),
+            "centroid_l2": centroid_l2,
         }
     out["_target_std"] = float(tgt.std())
     out["_sequences"] = n
@@ -1613,7 +1622,12 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         with _autocast():
             pred, tgt = teacher_forced(model, b, cfg)
         pred, tgt = pred.float(), tgt.float()
-        tf_loss += base_loss(pred, tgt, cfg).item() * b.shape[0]
+        # val_tf_loss is the same centroid_velocity_loss quantity train() is
+        # minimised on; val_tf_mse is kept as an informational latent-space
+        # sanity check (see null_baselines docstring), not a training target.
+        tf_loss += centroid_velocity_loss(
+            to_per_token_latent(pred, cfg), to_per_token_latent(tgt, cfg), cfg
+        ).item() * b.shape[0]
         tf_mse += mse_loss(pred, tgt).item() * b.shape[0]
         tf_n += b.shape[0]
 
@@ -1639,10 +1653,18 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         pred_f = pred_f.float()
         k = pred_f.shape[1]
         frames_scored = min(frames_scored, k)
+        # rollout_frames() already normalizes both tokenizations to trailing
+        # (NUM_X, LATENT_DIM) -- no to_per_token_latent() reshape needed here,
+        # unlike the teacher-forced section above. Score in decoded velocity
+        # space (m/s), not raw latent space, so rollout_mse/persistence_mse
+        # below are in the same units _rollout_best.pt is meant to select on.
+        true_v = decode_centroid(true_f, cfg)
+        pers_v = decode_centroid(pers_f, cfg)
+        pred_v = decode_centroid(pred_f, cfg)
         # .cpu() BEFORE .double(): MPS has no float64, so the cast has to happen
         # on the host or it raises.
-        se_model[:k] += ((pred_f - true_f[:, :k]) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
-        se_pers += ((pers_f - true_f) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
+        se_model[:k] += ((pred_v - true_v[:, :k]) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
+        se_pers += ((pers_v - true_v) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
         rolled += B
     roll_secs = time.time() - t0
 
@@ -2191,7 +2213,11 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
                                  log=print):
     """Roll out `n_frames` on a fixed 32-sequence val subset and compare
     MAE / RMSE / L2 against a persistence baseline (last-context-frame held
-    constant). Prints one colored line per metric with the `Δ` in green
+    constant), scored in DECODED CENTROID VELOCITY space (m/s) -- both the
+    model rollout and the persistence baseline are decoded through the
+    frozen GEN3 decoder before the error is computed, matching the training
+    objective (`centroid_velocity_loss`) and OVERVIEW.md's stated metric
+    space. Prints one colored line per metric with the `Δ` in green
     when the model beats persistence and red otherwise; optionally logs
     the numbers to W&B under the ``persistence/*`` namespace.
     """
@@ -2238,8 +2264,16 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
         gt_c = gt_all[start:end, ctx_frames:ctx_frames + k]
         pers_c = gt_all[start:end, ctx_frames - 1:ctx_frames].expand(
             -1, k, -1, -1).contiguous()
-        dm = (pred_c - gt_c).float()
-        dp = (pers_c - gt_c).float()
+        # rollout_frames() normalizes both tokenizations to trailing
+        # (NUM_X, LATENT_DIM), so no to_per_token_latent() reshape is needed
+        # before decoding. Score in decoded velocity space (m/s), matching
+        # OVERVIEW.md's stated "metric space: centroid velocity" -- these
+        # persistence/* numbers were previously raw latent-space MAE/RMSE/L2.
+        gt_v = decode_centroid(gt_c, cfg)
+        pred_v = decode_centroid(pred_c, cfg)
+        pers_v = decode_centroid(pers_c, cfg)
+        dm = (pred_v - gt_v).float()
+        dp = (pers_v - gt_v).float()
         sum_abs_m += dm.abs().sum().item()
         sum_sq_m += dm.pow(2).sum().item()
         sum_l2_m += torch.linalg.vector_norm(dm, dim=-1).sum().item()
@@ -2633,13 +2667,19 @@ def train(args, log=print):
     # Floor = the best CONSTANT predictor, not specifically zeros. Which of the
     # two is lower depends on how far the latents are offset from zero, and using
     # only "zeros" would hand an easy pass to any data with a mean offset.
-    floor = min(nulls["zeros"][Config.LOSS], nulls["mean"][Config.LOSS])
-    anchor = nulls["previous frame"][Config.LOSS]
-    log(f"  [floor] trivial predictors on this objective ({Config.LOSS}): "
-        + "  ".join(f"{k}={v[Config.LOSS]:.6g}"
+    # Gated on `centroid_l2` (decoded velocity L2, m/s) -- the actual quantity
+    # `train_loss` below is minimised on, not the informational latent-space
+    # l2norm/mse/huber keys.
+    floor = min(nulls["zeros"]["centroid_l2"], nulls["mean"]["centroid_l2"])
+    anchor = nulls["previous frame"]["centroid_l2"]
+    log(f"  [floor] trivial predictors on the training objective (centroid velocity L2): "
+        + "  ".join(f"{k}={v['centroid_l2']:.6g}"
                     for k, v in nulls.items() if not k.startswith("_")))
     log(f"  [floor] must beat {floor:.6g} (best constant) to have learned anything, "
         f"and {anchor:.6g} (previous-frame anchor) to have a chance against persistence")
+    log(f"  [floor] informational latent-space ({Config.LOSS}): "
+        + "  ".join(f"{k}={v[Config.LOSS]:.6g}"
+                    for k, v in nulls.items() if not k.startswith("_")))
 
     curves = []
     last_metrics = {}
@@ -2647,7 +2687,8 @@ def train(args, log=print):
         f"micro_batch={micro_batch} x accum={accum_steps} "
         f"= effective {micro_batch * accum_steps}  "
         f"steps_per_epoch~{steps_per_epoch}  "
-        f"amp={amp_dtype}  loss={Config.LOSS}  device={regime.device}")
+        f"amp={amp_dtype}  loss=centroid_l2 (latent-space {Config.LOSS} is "
+        f"informational-only)  device={regime.device}")
 
     stop_reason = "completed"
     # Rate is measured from where this PROCESS started, not from step 0, so an
@@ -2657,7 +2698,8 @@ def train(args, log=print):
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_acc = base_acc = ar_acc = 0.0
+        loss_acc = primary_acc = ar_acc = 0.0
+        last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
                   and step % max(1, int(Config.AR_EVERY_N_STEPS)) == 0)
@@ -2675,8 +2717,11 @@ def train(args, log=print):
             with amp_ctx:
                 pred, tgt = teacher_forced(model, batch, Config,
                                            noise_std=Config.NOISE_STD, generator=dev_gen)
-                loss = base_loss(pred, tgt, Config)
-                base_acc += loss.item()
+                pred_lat = to_per_token_latent(pred, Config)
+                tgt_lat = to_per_token_latent(tgt, Config)
+                loss = centroid_velocity_loss(pred_lat, tgt_lat, Config)
+                primary_acc += loss.item()
+                last_pred, last_tgt = pred_lat.detach(), tgt_lat.detach()
                 # The auxiliary loss is sequential and by far the most expensive
                 # part of a step, so it runs on the first micro-batch only.
                 if run_ar and micro == 0:
@@ -2725,7 +2770,7 @@ def train(args, log=print):
         scheduler.step()
         step += 1
 
-        train_loss = base_acc / accum_steps
+        train_loss = primary_acc / accum_steps
         prev_train_best = best["train_loss"]
         best["train_loss"] = min(best["train_loss"], train_loss)
         # Save a train-best checkpoint on any real improvement so a run that
@@ -2744,8 +2789,19 @@ def train(args, log=print):
         # is alive and give an immediate per-step cost to extrapolate from.
         if step <= 3 or step % Config.LOG_EVERY_STEPS == 0:
             lr = scheduler.get_last_lr()[0]
-            payload = {"step": step, "train_loss": train_loss, "lr": lr,
+            # train_loss IS the centroid velocity L2 (see centroid_velocity_loss
+            # above) -- mirrored here under an explicit key so it isn't
+            # ambiguous with the retired latent-space objective in wandb.
+            payload = {"step": step, "train_loss": train_loss,
+                       "train/centroid_l2": train_loss, "lr": lr,
                        "grad_norm": float(grad_norm), "ar_weight": ar_w}
+            # Per-dim breakdown on the last micro-batch of this virtual batch
+            # (diagnostic only, no_grad -- doesn't affect the gradient just
+            # computed). Bounded to the LOG_EVERY_STEPS cadence, not every step.
+            if last_pred is not None:
+                with torch.no_grad():
+                    dim_err = centroid_per_dim_errors(last_pred, last_tgt, Config)
+                payload.update({f"train/{k}": v for k, v in dim_err.items()})
             if run_ar:
                 payload["ar_loss"] = ar_acc
             if torch.cuda.is_available():
@@ -2767,9 +2823,14 @@ def train(args, log=print):
             if step >= 3:
                 per_step = elapsed / max(1, step - start_step_for_rate)
                 eta = f"  eta~{per_step * (Config.MAX_STEPS - step) / 3600:.1f}h"
-            log(f"  step {step:>6}/{Config.MAX_STEPS}  train={train_loss:.6f}  "
+            log(f"  step {step:>6}/{Config.MAX_STEPS}  train(centroid_l2)={train_loss:.6f}  "
                 f"lr={lr:.2e}  gnorm={float(grad_norm):.3f}  "
                 f"{elapsed / 60:.1f}m{eta}{flag}")
+            if last_pred is not None:
+                log(f"    [centroid] mae_vx={dim_err['mae_vx']:.4g} "
+                    f"mae_vy={dim_err['mae_vy']:.4g} mae_vz={dim_err['mae_vz']:.4g}  "
+                    f"rmse_vx={dim_err['rmse_vx']:.4g} rmse_vy={dim_err['rmse_vy']:.4g} "
+                    f"rmse_vz={dim_err['rmse_vz']:.4g}")
             # Persist train-best on new minima (post-anchor). Placed inside the
             # log cadence so I/O is bounded to at most ~1 write per
             # LOG_EVERY_STEPS optimizer steps, not per step.

@@ -976,7 +976,11 @@ def process_set(param_list, out_name, atlas_yz_by_param, atlas_meta,
         #                  build_wake_atlas.py, and the atlas ALSO drives
         #                  the random-plan exclusion set (probe_yz -
         #                  atlas_yz). Bytes DIFFER from v3.3.
-        f_out.attrs['split_version'] = 'v3.4'
+        #   'v3.5' -> OVERVIEW.md §16: 11p4 moves train -> val, giving val
+        #                  a high-side bracket alongside 3p6 (low) and 6p4
+        #                  (mid). Bytes DIFFER from v3.4 (different
+        #                  train/val param membership -> different plans).
+        f_out.attrs['split_version'] = 'v3.5'
         # v3.4 wake-atlas provenance -- see OVERVIEW.md §15. These attrs
         # let a downstream consumer audit which atlas was used to build
         # this H5. `wake_atlas_source` is the absolute path (or the

@@ -435,7 +435,18 @@ class TestModelVsBaseline(unittest.TestCase):
         val_h5 = os.path.join(PKG_ROOT, "data/val_40.h5")
         if not os.path.exists(val_h5):
             raise unittest.SkipTest("Validation data not found at " + val_h5)
-        cls.dataset = TransformerDataset(val_h5, subset_ratio=SUBSET_RATIO)
+        # val_40.h5 is the frozen v1.0 shape (NUM_TIME=40, NUM_X=26); Config is
+        # process-wide pinned to the current production shape (NUM_TIME=80,
+        # NUM_X=10 as of v3.1), and apply_checkpoint_config() below only fires
+        # per-checkpoint, AFTER this dataset load. Scope the shape locally so
+        # TransformerDataset's reshape matches the file it's actually reading.
+        _saved_shape = (Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN)
+        Config.NUM_TIME, Config.NUM_X = 40, 26
+        Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
+        try:
+            cls.dataset = TransformerDataset(val_h5, subset_ratio=SUBSET_RATIO)
+        finally:
+            Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN = _saved_shape
         n_avail = len(cls.dataset)
         cls.n_single = min(SINGLE_SAMPLES, n_avail)
         cls.n_rollout = min(ROLLOUT_SAMPLES, n_avail)
@@ -996,7 +1007,16 @@ class TestR1A3bDeltaArDeepDive(unittest.TestCase):
 
         cls.ae, cls.ae_path, cls.converter, cls.metric_space = load_autoencoder(cls.device)
 
-        cls.dataset = TransformerDataset(val_h5, subset_ratio=DEEPDIVE_SUBSET_RATIO)
+        # val_40.h5 is the frozen v1.0 shape (NUM_TIME=40, NUM_X=26); see the
+        # matching comment in TestModelVsBaseline.setUpClass for why this
+        # needs a local Config override before TransformerDataset's reshape.
+        _saved_shape = (Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN)
+        Config.NUM_TIME, Config.NUM_X = 40, 26
+        Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
+        try:
+            cls.dataset = TransformerDataset(val_h5, subset_ratio=DEEPDIVE_SUBSET_RATIO)
+        finally:
+            Config.NUM_TIME, Config.NUM_X, Config.SEQ_LEN = _saved_shape
         n_avail = len(cls.dataset)
         cls.n_samples = min(DEEPDIVE_SAMPLES, n_avail)
         cls.samples = [cls.dataset[i].unsqueeze(0) for i in range(cls.n_samples)]
@@ -1030,6 +1050,18 @@ class TestR1A3bDeltaArDeepDive(unittest.TestCase):
         num_x = getattr(Config, "NUM_X", 26)
         latent_dim = getattr(Config, "LATENT_DIM", 47)
         full_horizon = getattr(Config, "VAL_ROLLOUT_STEPS", 28)
+        # val_40.h5 always supplies exactly 40 frames per sequence (see
+        # setUpClass's local NUM_TIME=40 override), independent of whatever
+        # NUM_TIME/VAL_ROLLOUT_STEPS THIS checkpoint's own saved config
+        # claims -- apply_checkpoint_config() above just restored Config to
+        # the checkpoint's shape, which for a checkpoint trained at a
+        # different NUM_TIME (e.g. the transitional 80-frame/NUM_X=26 shape)
+        # can claim a rollout horizon longer than val_40.h5 can supply.
+        # Clamp to what's actually available so this degrades to a partial
+        # rollout instead of crashing on an empty slice downstream.
+        VAL_40_NUM_TIME = 40
+        max_available = max(num_x, (VAL_40_NUM_TIME - context_steps) * num_x)
+        full_horizon = min(full_horizon, max_available)
         capped = full_horizon if DEEPDIVE_ROLLOUT_STEPS <= 0 else min(full_horizon, DEEPDIVE_ROLLOUT_STEPS)
         n_frames = max(1, (capped + num_x - 1) // num_x)
         rollout_steps = n_frames * num_x  # whole frames; a frame-native model can't step partial

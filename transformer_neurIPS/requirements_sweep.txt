@@ -1,0 +1,69 @@
+# Minimal dependency set for running the Round-2 sweep scripts
+# (run_sweep_mac.sh / run_sweep_h200.sh, sweep_deep_dive.py,
+# train_production_transformer_deep_dive.py, model_variants.py) --
+# NOT the full repo's requirements.txt at the project root, which also
+# covers unrelated parts of this monorepo (gym, tensorflow, matplotlib,
+# etc. -- none of that is imported by anything the sweep touches).
+#
+# Verified by grepping every top-level AND lazy (function-body) import in
+# the three files above: the only third-party packages imported anywhere
+# are torch, numpy, h5py, and wandb (wandb is optional at runtime -- pass
+# --no-wandb and it's never imported at all). Everything else used
+# (argparse, json, os, sys, time, copy, shutil, warnings, math,
+# dataclasses, typing, subprocess) is Python stdlib.
+#
+# Versions below are exactly what was validated together on the Mac side
+# this session (see OVERVIEW.md v4.0) -- pinned with `==` where exact
+# reproducibility matters, `>=` where it's safe to float.
+#
+# INSTALL ORDER MATTERS FOR TORCH -- see the note below before running
+# `pip install -r requirements_sweep.txt` naively; a bare pip install will
+# NOT get you a CUDA build.
+
+numpy==2.4.2
+h5py==3.15.1
+wandb>=0.29.0
+
+# --- torch: read this before installing -------------------------------
+#
+# The version validated this session, torch==2.12.0.dev20260312, is a
+# NIGHTLY build, not a PyPI stable release. Two consequences for a rented/
+# wiped H200 box:
+#
+#   1. It is NOT installable via a plain `pip install torch==2.12.0.dev20260312`
+#      -- nightlies live on a separate index, not default PyPI:
+#
+#        pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/<CUDA_TAG>
+#
+#      where <CUDA_TAG> matches the box's CUDA driver (check with
+#      `nvidia-smi` for the driver's max supported CUDA version, then pick
+#      the closest cuXXX tag PyTorch's nightly index offers -- see
+#      https://pytorch.org/get-started/locally/ , "Preview (Nightly)" tab,
+#      for the current tag matrix; this changes over time so don't
+#      hardcode a specific cuXXX tag into automation without checking).
+#
+#   2. Nightlies are PRUNED from the index over time -- the exact
+#      `2.12.0.dev20260312` build is not guaranteed to still be resolvable
+#      weeks/months from now. For a box that gets wiped and re-provisioned
+#      repeatedly, pin the *channel* (nightly, `--pre`) rather than the
+#      exact dev date, and accept a newer nightly -- that's the "or
+#      greater/similar" version of pinning torch specifically, because
+#      exact-pinning a nightly is the more fragile choice here, not the
+#      safer one.
+#
+# Minimum functional requirement (not exact-version-critical): torch with
+# CUDA support, recent enough for `torch.compile`, `torch.amp.autocast`
+# with bfloat16, and `torch.jit.trace`/`torch.jit.script` (both used by
+# save_scripted_model() -- expect the same "not supported in Python 3.14+"
+# deprecation warnings this session hit; harmless on this box if it's on
+# an earlier Python, see the Python version note below).
+torch>=2.11.0
+
+# --- Python version -----------------------------------------------------
+# This session ran on Python 3.14.7, which is NEWER than what torch.jit
+# officially supports (the DeprecationWarnings seen throughout this
+# session -- "torch.jit.script is not supported in Python 3.14+" -- are
+# from running on that edge). If provisioning the H200 box from scratch
+# and there's a choice, Python 3.11 or 3.12 is a more conservative,
+# better-supported target for this exact torch.jit-based scripted-model
+# path; 3.14 works (verified this session) but is bleeding-edge.

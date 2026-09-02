@@ -613,7 +613,12 @@ class Config:
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
-    WANDB_PROJECT = "NI_Review"
+    # Convention (OVERVIEW.md v4.1): WANDB_PROJECT's trailing `_vN` tracks
+    # OVERVIEW.md's latest documented MAJOR version only -- bump it when
+    # OVERVIEW.md crosses a new major boundary (v4.x -> v5.0), not on
+    # every point release. Kept in sync by
+    # tests/test_version_sync.py.
+    WANDB_PROJECT = "NI_Review_v4"
 
 
 # These fields define the v2.0 data/model shape and are deliberately not
@@ -1836,6 +1841,40 @@ class _Telemetry:
         except Exception:
             pass
 
+    def log_artifact(self, name, paths, artifact_type="model", metadata=None, log=print):
+        """Best-effort upload of one or more local files as a versioned
+        wandb Artifact. The LOCAL save (`save_checkpoint`'s `torch.save` /
+        `save_scripted_model`) is always the authoritative one and has
+        already completed by the time this is called -- this is purely
+        additive. `wandb.Artifact.add_file` + `run.log_artifact` queues the
+        upload asynchronously (the SDK uploads in the background / at run
+        finish, not synchronously here), so this returns quickly regardless
+        of upload size.
+
+        Logging the same `name` repeatedly (e.g. every time `_latest.pt` is
+        overwritten) creates a new VERSION each time -- a full checkpoint
+        history in wandb for free, without any extra bookkeeping here.
+
+        No-op if wandb is disabled; never raises, matching every other
+        method on this class -- a failed/slow upload must never interrupt
+        or crash an unattended training run.
+        """
+        if self.run is None:
+            return
+        existing = [p for p in paths if p and os.path.exists(p)]
+        if not existing:
+            return
+        try:
+            art = self.wandb.Artifact(name, type=artifact_type, metadata=metadata or {})
+            for p in existing:
+                art.add_file(p)
+            self.run.log_artifact(art)
+            log(f"  [wandb] queued artifact upload: {name} "
+                f"({len(existing)} file(s), v-next)")
+        except Exception as e:
+            log(f"  [wandb] artifact upload failed for {name} "
+                f"({type(e).__name__}: {e}); local file(s) are unaffected.")
+
 
 # --------------------------------------------------------------------------- #
 # Scheduling
@@ -2201,9 +2240,11 @@ def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
 
 
 def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
-                    save_scripted=None, cfg=Config, log=print):
+                    save_scripted=None, cfg=Config, log=print, tel=None):
     """Write a state-dict checkpoint (atomically) and, if enabled, a
-    TorchScript companion at `<path without .pt>_scripted.pt`.
+    TorchScript companion at `<path without .pt>_scripted.pt`. If `tel` (a
+    `_Telemetry` instance) is given, ALSO attempts to upload both files to
+    wandb as a versioned Artifact once the local writes succeed.
 
     Every completed on-disk write is rainbow-logged with the FULL absolute
     path via `_log_write` so an operator scrolling through a long log can
@@ -2213,6 +2254,13 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
     `save_scripted` overrides `Config.SAVE_SCRIPTED_MODELS` for callers that
     want to force the behaviour one way or the other (e.g. the unit test);
     default None means 'obey the config flag'.
+
+    The wandb upload is purely additive and best-effort: the local `.pt`
+    (written above, unconditionally) is always the authoritative artifact.
+    `tel.log_artifact` never raises and never blocks on the actual network
+    transfer (wandb queues it), so passing `tel=None` (the default) or
+    having wandb disabled/unreachable changes nothing about this
+    function's local-disk behavior.
     """
     payload = {
         'step': step,
@@ -2228,13 +2276,12 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
     os.replace(tmp, path)       # atomic: a killed run never leaves a half file
     _log_write(path, log=log, kind="state_dict")
 
+    script_path = None
     do_scripted = (bool(cfg.SAVE_SCRIPTED_MODELS)
                    if save_scripted is None else bool(save_scripted))
     if do_scripted:
-        if path.endswith(".pt"):
-            script_path = path[:-3] + "_scripted.pt"
-        else:
-            script_path = path + "_scripted.pt"
+        script_path = path[:-3] + "_scripted.pt" if path.endswith(".pt") \
+            else path + "_scripted.pt"
         try:
             save_scripted_model(script_path, model, cfg=cfg, log=log)
         except Exception as e:
@@ -2242,6 +2289,13 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
                 f"  [scripted] save failed for {os.path.basename(script_path)}"
                 f" ({type(e).__name__}: {e}); state-dict `.pt` was still "
                 f"written and is authoritative.", "yellow"))
+            script_path = None   # don't try to upload a file that doesn't exist
+
+    if tel is not None:
+        artifact_name = os.path.splitext(os.path.basename(path))[0]
+        meta = {"step": step, **{k: v for k, v in extra.items()
+                                 if isinstance(v, (int, float, str, bool))}}
+        tel.log_artifact(artifact_name, [path, script_path], metadata=meta, log=log)
 
 
 # --------------------------------------------------------------------------- #
@@ -2577,6 +2631,27 @@ def train(args, log=print):
     frame_level = Config.TOKENIZATION == 'frame'
 
     # -- data ---------------------------------------------------------------
+    # If TRAIN_H5 is itself a pre-sampled file (see
+    # make_sweep_sample_data.py -- e.g. for uploading a smaller file to a
+    # bandwidth-throttled rented box), warn loudly when TRAIN_SUBSET_RATIO
+    # would ALSO subset it, since the two fractions compound silently
+    # (0.3 pre-sampled * 0.3 --subset-ratio = 0.09 of the original data,
+    # not the 0.3 either number alone would suggest).
+    try:
+        with h5py.File(Config.TRAIN_H5, 'r') as _f:
+            _sampled_frac = _f.attrs.get('sampled_fraction')
+    except Exception:
+        _sampled_frac = None
+    if _sampled_frac is not None and float(Config.TRAIN_SUBSET_RATIO) < 1.0:
+        log(_c(
+            f"  [data] WARNING: {os.path.basename(Config.TRAIN_H5)} is already a "
+            f"{float(_sampled_frac):.0%} random sample (see its 'sampled_fraction' "
+            f"attr) AND --subset-ratio={Config.TRAIN_SUBSET_RATIO} is set -- these "
+            f"compound to {float(_sampled_frac) * float(Config.TRAIN_SUBSET_RATIO):.1%} "
+            f"of the original dataset, not {float(Config.TRAIN_SUBSET_RATIO):.0%}. "
+            f"Pass --subset-ratio 1.0 if the pre-sampled fraction is already what "
+            f"you intended.", "yellow"))
+
     train_ds = TransformerDataset(Config.TRAIN_H5, subset_ratio=Config.TRAIN_SUBSET_RATIO)
     val_ds = TransformerDataset(Config.VAL_H5, subset_ratio=1.0)
     log(f"  [data] train={len(train_ds):,}/{train_ds.total_available:,} sequences  "
@@ -3083,7 +3158,7 @@ def train(args, log=print):
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_train_best.pt"),
                     model, optimizer, step,
                     {'train_l2': train_loss, 'best': dict(best)},
-                    scheduler=scheduler)
+                    scheduler=scheduler, tel=tel)
                 tel.set_summary("best_train_loss", best["train_loss"])
 
         hit_budget = step >= Config.MAX_STEPS
@@ -3154,7 +3229,7 @@ def train(args, log=print):
                     {'rollout_mse': m['rollout_mse'], 'val_l2': m['val_tf_loss'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
                      'best': dict(best)},
-                    scheduler=scheduler)
+                    scheduler=scheduler, tel=tel)
                 log(f"  --> new best rollout ({m['rollout_mse']:.6f}, "
                     f"{m['improvement_pct']:+.2f}% vs persistence)")
             elif found_new_low and not promotable:
@@ -3193,7 +3268,7 @@ def train(args, log=print):
                     {'val_l2': m['val_tf_loss'], 'rollout_mse': m['rollout_mse'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
                      'best': dict(best)},
-                    scheduler=scheduler)
+                    scheduler=scheduler, tel=tel)
             tel.set_summary("best_rollout_mse", best["rollout_mse"])
             tel.set_summary("best_improvement_pct", best["improvement_pct"])
 
@@ -3203,7 +3278,7 @@ def train(args, log=print):
                              'val_l2': best['val_tf_mse'],
                              'rollout_mse': best['rollout_mse'],
                              'improvement': best['improvement_pct']},
-                            scheduler=scheduler)
+                            scheduler=scheduler, tel=tel)
             archive_latest_checkpoint(Config, run_name, latest_path, step, log=log)
             write_status_json(Config, run_name, step, train_loss, best,
                               last_metrics, t_start, log=log)

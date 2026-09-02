@@ -113,13 +113,31 @@ if [[ "$missing" -ne 0 ]]; then
 fi
 echo ""
 echo "Checking interpreter has the required packages (torch+cuda, h5py, numpy)..."
-if ! "$PYTHON_BIN" -c "import torch, h5py, numpy; assert torch.cuda.is_available()" >/dev/null 2>&1; then
-  echo "  [MISSING] $PYTHON_BIN cannot import torch/h5py/numpy, or torch.cuda.is_available()"
-  echo "  is False. Set PYTHON_BIN to the CUDA-enabled venv on this box, e.g.:"
+set +e
+VERSION_CHECK="$("$PYTHON_BIN" -c "
+import torch, h5py, numpy
+print('torch', torch.__version__, 'cuda_available=' + str(torch.cuda.is_available()))
+print('numpy', numpy.__version__)
+print('h5py', h5py.__version__)
+try:
+    import wandb
+    print('wandb', wandb.__version__)
+except ImportError:
+    print('wandb NOT INSTALLED (fine if you pass --no-wandb / set NO_WANDB=1)')
+assert torch.cuda.is_available(), 'torch.cuda.is_available() is False'
+" 2>&1)"
+VERSION_CHECK_RC=$?
+set -e
+if [[ "$VERSION_CHECK_RC" -ne 0 ]]; then
+  echo "  [MISSING] $PYTHON_BIN failed the import/CUDA check:"
+  echo "$VERSION_CHECK" | sed 's/^/    /'
+  echo "  Set PYTHON_BIN to the CUDA-enabled venv on this box, e.g.:"
   echo "    PYTHON_BIN=/path/to/venv/bin/python bash $0"
+  echo "  See transformer_neurIPS/requirements_sweep.txt for the exact"
+  echo "  install command (torch nightly builds need a non-default index-url)."
   exit 1
 fi
-echo "  [OK]"
+echo "$VERSION_CHECK" | sed 's/^/  [OK]     /'
 echo ""
 
 GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"

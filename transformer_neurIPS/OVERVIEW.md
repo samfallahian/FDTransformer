@@ -2051,3 +2051,336 @@ Smoke-tested both new arms end-to-end via `sweep_deep_dive.py --smoke
 - `_best.pt`'s gate, the AR-horizon mismatch's actual numeric fix
   (`AR_FRAMES`'s production value), and the archived `saved_models/old/`
   checkpoints are all exactly as `§18.5` left them.
+
+---
+
+## 20. v4.0 -- Mac shallow-sweep results locked in; H200 setup manifest
+
+**Status:** shipped this pass. Locks in the Mac-side (`run_sweep_mac.sh`)
+shallow sweep as a completed, interpreted result, fixes a second bug found
+while actually running it for real, and specifies everything needed to
+set up the CUDA (`run_sweep_h200.sh`) side on a rented/ephemeral box from
+nothing.
+
+### 20.1 A second bug, found only by running the real sweep (not the smoke test)
+
+`--no-warm-start` (§19.6) got the real `run_sweep_mac.sh` launch past the
+warm-start crash, but the FIRST real attempt (`round2_20260901_160201`)
+still failed: `run_sweep_mac.sh`'s default `PYTHON_BIN` resolution
+(`${PYTHON_BIN:-python3}`) picked up `/opt/homebrew/bin/python3` -- the
+system/Homebrew interpreter, which does not have `h5py`/`torch` installed
+-- rather than this project's venv. `sweep_deep_dive.py` crashed on import
+before doing anything. Fixed the resolution order in both launcher scripts
+to: explicit `PYTHON_BIN` env override > this project's known sibling venv
+(`$(dirname REPO_ROOT)/cgan_last_venv_ever/bin/python`) > `python3` from
+`PATH` as a last resort; also added an explicit `import torch, h5py,
+numpy` (and, on the H200 script, `torch.cuda.is_available()`) check with a
+clear failure message, so a wrong interpreter is a one-line diagnosis
+instead of a traceback three minutes into a run.
+
+Separately, the operator Ctrl-C'd a stray, still-running instance of the
+EARLIER smoke test (two orphaned processes from before the
+`--no-warm-start` fix, which had never actually exited and were silently
+contending for the same MPS device this whole time) after spotting the
+`run_diagnostics()` crash in the log -- confirmed as a deliberate stop, not
+a bug, and the orphaned PIDs were killed before relaunching cleanly.
+
+### 20.2 Mac shallow-sweep result: `round2_20260901_162228` -- read the numbers, not the auto-verdict
+
+Both arms completed cleanly this time (`e6_sched_noise` rc=0 in 56.1 min,
+`a5b_wd_heavy` rc=0 in 92.9 min). Report:
+`transformer_neurIPS/sweep_logs/round2_20260901_162228/UPLOAD_ME.md`
+(also copied to `sweep_logs/LATEST_UPLOAD_ME.md`).
+
+**The auto-classifier's verdict should be IGNORED for this run.**
+`sweep_deep_dive.py`'s `classify()` returned branch `N` ("Models are far
+below a trivial baseline -- fix conditioning before anything else"),
+because neither arm beat the previous-frame anchor in-sample. That
+threshold logic assumes the ~6000-step budget `sweep_deep_dive.py` was
+originally built around; this shallow sweep intentionally used only 400
+steps for turnaround. At 400 steps, best train loss was 0.0119-0.0126,
+CLOSE to but not yet past the anchor floor (0.0074) -- and the
+already-known real run (§18, ~10,000+ steps) converges to 0.0012-0.0016,
+well past it. This is "not done training yet," not "broken," and
+`classify()` has no way to distinguish those from the numbers alone at a
+budget this short. Do NOT run the branch-N arms (`n1_delta_mse` etc.) off
+the back of this verdict.
+
+**The actual useful signal is the head-to-head comparison at equal, short
+budget** (same steps, same seed, same cold-start, only the arm differs):
+
+| | `e6_sched_noise` | `a5b_wd_heavy` |
+|---|---|---|
+| train loss | **0.0119** | 0.0126 |
+| val loss | **0.0103** | 0.0109 |
+| rollout MSE | **0.115** | 0.183 |
+| improvement vs. persistence | **-3455%** | -5573% |
+| last-frame improvement | **-2787%** | -5087% |
+
+`e6_sched_noise` wins every metric. Neither is close to converged, but as
+a relative read at equal budget it's consistent with §19.2's bias-dominated
+diagnostic verdict: scheduled sampling actually exposes the model to (and
+lets gradient correct) its own one-step error, which is a more plausible
+lever against a systematic-drift failure mode than weight decay/dropout
+alone. This is a secondary, supporting data point -- the CUDA-only horizon
+arms (`a4b_ar_very_long`, `e3_ar_long`) remain the primary hypothesis this
+whole sweep infrastructure exists to test, and nothing on the Mac side can
+test them (§19.3).
+
+One anomaly, flagged rather than explained away: `a5b_wd_heavy` took
+LONGER (92.9 min) than `e6_sched_noise` (56.1 min) despite doing strictly
+less work per step (no second forward pass). Backwards from what the
+mechanisms should cost -- most likely MPS throughput variability (already
+observed swinging 3x+ under similar conditions earlier this session), not
+a real property of either arm. Don't read the timing column as signal here.
+
+### 20.3 Exact file manifest -- Mac side (already run, recorded for the record)
+
+Everything `run_sweep_mac.sh` actually touched this session, so the exact
+inputs behind §20.2's numbers are reproducible:
+
+```
+transformer_neurIPS/train_production_transformer_deep_dive.py
+transformer_neurIPS/model_variants.py
+transformer_neurIPS/sweep_deep_dive.py
+transformer_neurIPS/run_sweep_mac.sh
+transformer_neurIPS/data/train_80.h5              (7.9 GB)
+transformer_neurIPS/data/val_80.h5                (3.4 GB)
+encoder/autoencoderGEN3/saved_models_production/
+    Model_GEN3_05_AttentionSE_absolute_best_scripted.pt   (2.8 MB)
+```
+
+Interpreter: `/Users/kkreth/PycharmProjects/cgan_last_venv_ever/bin/python`
+(Python 3.14.7) -- see §20.4 for the exact package versions, now captured
+in `transformer_neurIPS/requirements_sweep.txt`.
+
+**No checkpoint files were needed** -- `--fresh --no-warm-start` means
+every arm cold-starts from nothing. This matters for the H200 side too
+(§20.5): a wiped box needs zero checkpoint transfer to run a sweep.
+
+### 20.4 `requirements_sweep.txt` -- minimal, scoped, verified by grep not guesswork
+
+New file: `transformer_neurIPS/requirements_sweep.txt`. Deliberately
+NOT the repo-root `requirements.txt` (~120 packages covering unrelated
+parts of this monorepo -- gym, tensorflow, matplotlib, pysindy, etc.,
+none of it imported by anything the sweep touches). Verified by grepping
+every top-level AND lazy (function-body) import in
+`train_production_transformer_deep_dive.py`, `model_variants.py`, and
+`sweep_deep_dive.py`: the entire third-party surface is `torch`, `numpy`,
+`h5py`, and `wandb` (lazy-imported inside `_Telemetry.__init__`, and
+entirely skippable with `--no-wandb`/`NO_WANDB=1`). Everything else used
+is Python stdlib.
+
+Versions pinned to what was validated together this session:
+
+| package | version | pin style | why |
+|---|---|---|---|
+| numpy | 2.4.2 | `==` | validated together |
+| h5py | 3.15.1 | `==` | validated together; also matches root `requirements.txt` exactly |
+| wandb | 0.29.0 | `>=` | not version-sensitive for this use |
+| torch | 2.12.0.dev20260312 | `>=2.11.0` (see caveat) | **nightly build -- see below** |
+
+**The root `requirements.txt`'s relevant entries are already up to date**
+(`h5py==3.15.1` matches exactly; `numpy>=1.26.0` and `wandb>=0.17.0` are
+satisfied by what's installed) -- no change needed there. The new scoped
+file exists for the H200 box specifically, not as a replacement.
+
+**Torch caveat, important for a rented/wiped box:** the validated build
+(`2.12.0.dev20260312`) is a NIGHTLY, not a PyPI stable release --
+`pip install torch==2.12.0.dev20260312` will fail against default PyPI; it
+needs `pip install --pre torch --index-url
+https://download.pytorch.org/whl/nightly/<CUDA_TAG>` (tag matched to the
+box's CUDA driver -- check `nvidia-smi` and
+https://pytorch.org/get-started/locally/'s Nightly tab, since the tag
+matrix moves over time). Nightlies are also PRUNED from the index
+eventually, so for a box that gets wiped and re-provisioned repeatedly,
+pinning the *channel* (`--pre`, nightly) rather than the exact dev date is
+the more robust choice -- accept whatever current nightly resolves rather
+than chasing an exact build that may no longer exist. `requirements_sweep.txt`
+documents this inline.
+
+Also noted: this session ran on Python 3.14.7, newer than what `torch.jit`
+officially supports (source of the DeprecationWarnings suppressed in
+§17.2 -- `torch.jit.script is not supported in Python 3.14+`). It works
+(verified all session), but Python 3.11/3.12 is the more conservative
+choice if provisioning the H200 box's Python version from scratch.
+
+### 20.5 Exact file manifest -- H200 side (what to upload before running)
+
+`run_sweep_h200.sh` checks all of these on startup and refuses to proceed
+if any are missing, printing `[OK]`/`[MISSING]` per file:
+
+```
+transformer_neurIPS/train_production_transformer_deep_dive.py
+transformer_neurIPS/model_variants.py
+transformer_neurIPS/sweep_deep_dive.py
+transformer_neurIPS/run_sweep_h200.sh
+transformer_neurIPS/requirements_sweep.txt        (new -- for env setup, not checked by the script itself)
+transformer_neurIPS/data/train_80.h5              (7.9 GB)
+transformer_neurIPS/data/val_80.h5                (3.4 GB)
+encoder/autoencoderGEN3/saved_models_production/
+    Model_GEN3_05_AttentionSE_absolute_best_scripted.pt   (2.8 MB)
+```
+
+**Not needed:** any file under `saved_models/` (no checkpoints -- §20.3),
+`prepare_data.py`/`build_wake_atlas.py`/wake-atlas artifacts (data is
+already built, not regenerated on the H200 box), `enrich_h5_with_velocity.py`,
+`TransformLatent.py`, `tests/`, or `OVERVIEW.md` itself (useful as
+reference, not required to run).
+
+**Practical setup sequence for a box that gets wiped between runs:**
+
+```bash
+# 1. Create/activate a venv, then install deps (see §20.4's torch caveat
+#    for the correct nightly index-url):
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/<CUDA_TAG>
+pip install numpy==2.4.2 h5py==3.15.1 wandb
+
+# 2. Copy over the file manifest above (data files are the only large
+#    transfer -- ~11.3 GB combined; everything else is well under 1 MB)
+
+# 3. Verify before committing to a real run:
+bash transformer_neurIPS/run_sweep_h200.sh   # checks files + packages + GPU,
+                                              # then launches for real
+```
+
+There is deliberately no smaller "smoke" step suggested here beyond what
+`run_sweep_h200.sh` itself already does (file check, package/CUDA check,
+GPU count) -- `sweep_deep_dive.py --smoke` remains available directly if a
+tinier sanity pass is wanted before the real 2000-step budget.
+
+### 20.6 `make_sweep_sample_data.py` -- pre-sampled data for throttled uploads
+
+The rented-box workflow turned out to be RunPod: every rental is a fresh
+box (new SSH key, PyCharm re-targeted, Python sometimes needs a manual
+upgrade), and upload bandwidth to it is heavily throttled. That combination
+means the `rsync`-delta idea discussed earlier doesn't apply -- there is no
+persistent prior copy on the far end to diff against, so every transfer is
+effectively a full one regardless of tooling. The lever that actually helps
+is transferring fewer bytes in the first place.
+
+New script: `transformer_neurIPS/make_sweep_sample_data.py`. Draws a
+uniform random sample (without replacement, `numpy.random.default_rng`,
+explicit `--seed`, default 1337) of `--fraction` (default 0.30) of the
+sequences from `train_80.h5` / `val_80.h5`, writing
+`train_80_sample30.h5` / `val_80_sample30.h5` alongside the originals --
+same shape/dtype/gzip compression, every source file-level attribute
+carried over verbatim, plus new provenance attrs (`sampled_from`,
+`sampled_fraction`, `sampled_seed`, `sampled_n`, `sampled_total_source_n`,
+`sampled_at`) so a sample file can never be mistaken for the real dataset.
+
+Run once at 30%, verified end-to-end (structural check + an actual
+`TransformerDataset` load + `centroid_velocity_loss` forward pass, not
+just "the file exists"):
+
+```
+train_80_sample30.h5: 59,280 -> 17,784 sequences, 8.53 GB -> 2.56 GB (30.0%)
+val_80_sample30.h5:   25,410 ->  7,623 sequences, 3.66 GB -> 1.10 GB (30.0%)
+combined: 12.19 GB -> 3.66 GB (~70% reduction)
+```
+
+**Two things to get right when actually using these, both documented in
+the script's own docstring:**
+
+1. `Config.TRAIN_H5` / `VAL_H5` are hard-coded to `data/train_80.h5` /
+   `data/val_80.h5` and are in `PINNED_CONFIG_FIELDS` -- no `--set`
+   override exists. The sample files must be uploaded AS those exact
+   filenames on the remote box (rename on upload, or `scp` directly to
+   the target name), not left as `train_80_sample30.h5`.
+2. `run_sweep_h200.sh` defaults `--subset-ratio` to `0.3`. Pointing it at
+   an already-30%-sampled train file without also setting
+   `SUBSET_RATIO=1.0` compounds to 9% of the original data, silently.
+   **Now defended in code, not just documentation:** `train()` reads the
+   train file's `sampled_fraction` attr (if present) at startup and logs
+   a loud yellow warning with the exact compounded percentage whenever
+   `TRAIN_SUBSET_RATIO < 1.0` is also in effect -- verified this fires
+   correctly against `train_80_sample30.h5` (reports "compounds to 9.0%").
+   val is unaffected either way -- the trainer always loads `VAL_H5` at
+   `subset_ratio=1.0`, so a pre-sampled val file is automatically "the
+   whole validation set" with no flag needed.
+
+### 20.7 Checkpoints now ALSO upload to wandb as versioned Artifacts (best-effort)
+
+New `_Telemetry.log_artifact(name, paths, ...)`, threaded through
+`save_checkpoint()` via a new optional `tel=` parameter (default `None` --
+every existing caller that doesn't pass it, e.g. `run_diagnostics()`'s
+checkpoint probing, is unaffected). All four call sites inside `train()`
+(`_train_best.pt`, `_rollout_best.pt`, `_best.pt`, `_latest.pt`) now pass
+`tel=tel`.
+
+**The local disk write is unconditionally still the authoritative one** --
+`log_artifact` only runs AFTER `torch.save`/`os.replace` and (if enabled)
+`save_scripted_model` have already completed. wandb's `Artifact.add_file`
++ `run.log_artifact` queues the upload asynchronously (the SDK transfers
+in the background, not synchronously in this call), so this doesn't add
+meaningful wall-clock to the checkpoint-write cadence. Matches
+`_Telemetry`'s existing philosophy (class docstring: "wandb that cannot
+kill a 12-hour unattended run") -- no-ops cleanly if wandb is disabled,
+and a failed/slow upload is caught and logged, never raised.
+
+Artifact name is the checkpoint's own filename minus `.pt`
+(e.g. `r2_e6_sched_noise_latest`) -- logging the same name repeatedly (as
+`_latest.pt` does every `CHECKPOINT_EVERY_STEPS`) creates a new wandb
+Artifact VERSION each time, giving a full checkpoint history in the wandb
+UI for free, with no extra bookkeeping. Relevant given §OVERVIEW's own
+questioning of wandb storage limits: `Config.SAVE_SCRIPTED_MODELS`
+checkpoints run ~76 MB per set (57 MB state-dict + 19 MB scripted); a full
+run's four checkpoint kinds plus the local-only 5-deep archive (§19's
+`archive_latest_checkpoint`, NOT uploaded to wandb -- only `save_checkpoint`'s
+four call sites are) stays well inside typical free-tier quotas for a
+single run, but will accumulate faster across many sweep arms if the
+`_latest.pt` version history isn't periodically pruned on the wandb side.
+
+Verified: `py_compile`, `--smoke-test`, the full test suite (41 passed / 3
+skipped, unchanged), and three direct exercises of `save_checkpoint(...,
+tel=...)` -- wandb disabled (clean no-op), `tel=None` (legacy behavior,
+unchanged), and a REAL `wandb.Artifact`/`add_file`/`log_artifact` call
+sequence against an offline-mode run (no network/auth required, confirms
+the API calls are structurally correct, not just that they're skipped).
+
+---
+
+## 21. v4.1 -- wandb project name now tracks OVERVIEW.md's major version
+
+**Status:** shipped this pass. `Config.WANDB_PROJECT` changed from
+`"NI_Review"` to `"NI_Review_v4"` -- and, going forward, is a live-tested
+invariant rather than a one-off rename.
+
+### 21.1 The convention
+
+`WANDB_PROJECT`'s trailing `_vN` suffix tracks this file's latest
+documented **major** version only. Concretely: this file is currently at
+v4.1 (this section) -- major version 4 -- so `WANDB_PROJECT = "NI_Review_v4"`.
+The suffix does NOT change on every point release (v4.1, v4.2, ... all
+still map to `_v4`); it only needs to change when OVERVIEW.md crosses a
+new major boundary (the next bump would be triggered by a `v5.0` section
+heading, at which point `WANDB_PROJECT` becomes `"NI_Review_v5"`).
+
+Rationale for major-only tracking: a wandb *project* is a fairly durable
+container -- renaming it on every point release would fragment run history
+across many near-identical project names for no real benefit. Major
+version bumps in this file have so far corresponded to genuinely distinct
+phases of work (v2.0 pinning, v3.x data-pipeline evolution, v4.x sweep
+infrastructure) that plausibly deserve their own wandb project each; point
+releases within a phase don't.
+
+### 21.2 `tests/test_version_sync.py` -- the convention is now enforced, not just documented
+
+New test: parses every `## N. vX.Y ...` heading in `OVERVIEW.md` via
+regex, takes the max `(major, minor)` tuple as "the latest documented
+version" (robust to headings being added out of strict file order),
+extracts the trailing `_v<N>` integer from `Config.WANDB_PROJECT`, and
+asserts the two major versions match. Fails loudly with both values and a
+pointer back to this section if someone bumps one without the other --
+e.g. lands a `## 22. v5.0` heading without updating `WANDB_PROJECT`, or
+vice versa.
+
+This section (v4.1) IS the first live test of the convention it
+describes: `WANDB_PROJECT="NI_Review_v4"` and this file's latest heading
+is `v4.1` (major 4) -- they match, so `test_version_sync.py` passes as
+written. The next real test of the invariant is whatever change lands the
+first `v5.0` heading.
+
+Verified: `py_compile`, the new test passing in isolation, and the full
+suite (42 tests: the 41 from §20.7 plus this one; still 3 skipped,
+unrelated to this change).

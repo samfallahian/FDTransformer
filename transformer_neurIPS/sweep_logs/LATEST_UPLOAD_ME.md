@@ -1,53 +1,50 @@
-# Deep-dive sweep report -- round 2  (`round2_20260901_162228`)
+# Deep-dive sweep report -- round 2  (`round2_20260902_220830`)
 
 ## VERDICT
 
-**Branch `N`: Models are far below a trivial baseline -- fix conditioning before anything else**
+**Branch `R`: A linear map beats the transformer -- the model or the framing is broken**
 
-- best arm = e6_sched_noise at -3454.62% vs persistence
+- best arm = r5_mse_nonorm at -8.53% vs persistence
 - ridge linear frame-map baseline = +60.64%
-- beat the previous-frame anchor on the training objective: 0/2
-- No arm beat the previous-frame anchor even in-sample, and the best rollout is -3454.6% (far below parity). The models are broken, not the task.
-- e6_sched_noise: best train 0.01172 vs anchor floor 0.0074004
-- a5b_wd_heavy: best train 0.012531 vs anchor floor 0.0074004
+- beat the previous-frame anchor on the training objective: 4/5
+- A ridge regression beats the transformer by 2x. The model or the framing is broken, not the task.
 
 Recommended next command:
 
 ```
-python sweep_deep_dive.py --round 2 --branch N --max-parallel 1 --max-steps 400
+python sweep_deep_dive.py --round 2 --branch R --max-parallel 1 --max-steps 2000
 ```
 
 which runs:
 
-- `n1_delta_mse` -- Delta + MSE + LR 2e-3: the combination that removes both the output-scale and the objective-geometry problems.
-- `n2_meta_off` -- Zero the (x, y, z, t, param) input columns entirely -- position still arrives via the embeddings.
-- `n3_lr_low` -- LR 1e-4: rule out silent divergence at 1e-3.
-- `n4_frame_delta` -- Frame tokenisation + delta + MSE: the smallest, most directly supervised version of the problem.
-- `n5_tiny` -- E128/L2 + delta + MSE: if a tiny model works and a big one does not, this is an optimisation failure, not capacity.
+- `r1_frame` -- Frame tokenisation: match the linear baseline's own factorisation.
+- `r2_frame_delta_mse` -- Frame + delta + MSE -- as close to the linear baseline as a net gets.
+- `r3_tiny` -- Deliberately tiny (E128/L2): if small beats large, this is an optimisation failure.
+- `r4_lr_sweep` -- Peak LR 3e-3 with a long warmup.
+- `r5_mse_nonorm` -- MSE objective, feature normalisation OFF -- isolates the normalisation change.
 
 ## Run settings
 
 ```
-run_id             = round2_20260901_162228
+run_id             = round2_20260902_220830
 round              = 2
 max_parallel       = 1
-max_steps          = 400
+max_steps          = 2000
 max_hours          = 12.0
 seed               = 1337
-subset_ratio       = 0.3
-rollout_seqs       = 16
+subset_ratio       = 1.0
+rollout_seqs       = 64
 gpus               = 0
-started            = 2026-09-01 16:22:28
-finished           = 2026-09-01 18:52:14
-trainer_git_head   = 27ffbb2
+started            = 2026-09-02 22:08:30
+finished           = 2026-09-02 22:30:35
 ```
 
 ## Diagnostics (run once, before any training)
 
 ```
-torch            = 2.12.0.dev20260312
-device           = mps  gpu = None xNone  bf16 = None
-train sequences  = 17784
+torch            = 2.14.0+cu130
+device           = cuda  gpu = NVIDIA B300 SXM6 AC x1  bf16 = True
+train sequences  = 59280
 val sequences    = 25410
 ```
 
@@ -64,7 +61,7 @@ val sequences    = 25410
 ### 2. The old ConvBlock padding
 
 ```
-symmetric_padding_1 (old)    max change in PAST outputs from a FUTURE perturbation = 2.527e+00
+symmetric_padding_1 (old)    max change in PAST outputs from a FUTURE perturbation = 1.457e+00
 left_padding_2 (fixed)       max change in PAST outputs from a FUTURE perturbation = 0.000e+00
 ```
 Non-zero for `symmetric_padding_1 (old)` confirms `padding=1` with `kernel_size=3` let every token see t+1, once per block.
@@ -72,11 +69,11 @@ Non-zero for `symmetric_padding_1 (old)` confirms `padding=1` with `kernel_size=
 ### 3. Causality of each configuration we are about to train
 
 ```
-a0_control       causal=True  before_cut=0.000e+00 after_cut=3.064e+00
-a1_nonorm        causal=True  before_cut=0.000e+00 after_cut=1.913e+00
-a2_mse           causal=True  before_cut=0.000e+00 after_cut=2.730e+00
+a0_control       causal=True  before_cut=0.000e+00 after_cut=2.098e+00
+a1_nonorm        causal=True  before_cut=0.000e+00 after_cut=2.266e+00
+a2_mse           causal=True  before_cut=0.000e+00 after_cut=2.635e+00
 a3_delta         causal=True  before_cut=0.000e+00 after_cut=7.000e+00
-a4_frame         causal=True  before_cut=0.000e+00 after_cut=2.706e+00
+a4_frame         causal=True  before_cut=0.000e+00 after_cut=2.972e+00
 ```
 
 ### 4. Sanity floor: what trivial predictors score on the training objective
@@ -103,8 +100,8 @@ Compare each arm's `train` column against these. A train loss ABOVE the zero-pre
 ### 5. Is there learnable temporal structure beyond persistence?
 
 ```
-persistence MSE                = 0.0003455801863559845
-ridge linear frame-map MSE     = 0.00013600662014857449
+persistence MSE                = 0.00034558018635598447
+ridge linear frame-map MSE     = 0.00013600662014857495
 linear improvement             = +60.64%
 linear improvement, 1 frame    = +12.93%
 fit on                         = 323584 frame transitions
@@ -125,8 +122,11 @@ Those columns (x, y, z, t, param) went through the same `nn.Linear` as the laten
 ```
 arm            status      steps   mins  params     IMPROV%     frame1%       last%    roll MSE    pers MSE     val tf      train  >const?  >anch?
 --------------------------------------------------------------------------------------------------------------------------------------------------
-e6_sched_noise ok            400   56.1    4.79    -3454.62   -2.82e+05    -2787.47    0.114964    0.003234   0.010321   0.011916      yes      NO
-a5b_wd_heavy   ok            400   92.9    4.79    -5572.84   -3.61e+05    -5087.33    0.183472    0.003234   0.010904   0.012647      yes      NO
+r5_mse_nonorm  ok           2000    4.6    4.79       -8.53    -9452.28      +28.66    0.003086    0.002844   0.050896   0.046826      yes      NO
+r4_lr_sweep    ok           2000    4.1    4.79    -1608.63   -1.19e+05    -1250.96    0.048590    0.002844   0.004455   0.004487      yes     yes
+r1_frame       ok           2000    3.6    5.00   -2.90e+04       +8.66   -2.32e+04    0.827749    0.002844   0.007382   0.007197      yes     yes
+r3_tiny        ok           2000    3.5    0.42   -4.01e+04   -9.21e+05   -3.50e+04    1.141897    0.002844   0.004673   0.004632      yes     yes
+r2_frame_delta_mse ok           2000    3.6    5.00   -1.00e+07      +17.31   -2.21e+07  284.768732    0.002844   0.006699   0.006459      yes     yes
 ```
 
 `IMPROV%` is the headline: rollout MSE vs the persistence baseline over the full 28-frame horizon, with model and baseline scored on the SAME validation rows. Positive means better than doing nothing.
@@ -140,46 +140,127 @@ Note: `train` and `val tf` are not comparable between token-level and frame-leve
 One row per arm, 68 predicted time frames left to right. This is the shape that tells you whether the model predicts well and then drifts, or never predicted well.
 
 ```
-scale: '.' = -361088.3%   '@' = -2200.6%
+scale: '.' = -22107539.7%   '@' = +28.8%
 
-e6_sched_noise |_+##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@%%%%%%%%%%%%%%%%%%|  f1=-2.82e+05  f28=-2787.47
-a5b_wd_heavy   |.=*##%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%|  f1=-3.61e+05  f28=-5087.33
+r5_mse_nonorm  |%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%@%%%|  f1=-9452.28  f28=+28.66
+r4_lr_sweep    |%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%|  f1=-1.19e+05  f28=-1250.96
+r1_frame       |%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%|  f1=+8.66  f28=-2.32e+04
+r3_tiny        |%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%|  f1=-9.21e+05  f28=-3.50e+04
+r2_frame_delta_mse |%%%%%%%%%%%%%%%%%###############************++++++++=====---____....|  f1=+17.31  f28=-2.21e+07
 ```
 
-- `e6_sched_noise`: -281981.6, -146488.2, -82933.3, -52783.7, -46009.1, -34980.3, -25149.7, -21616.6, -17714.5, -14776.6, -13883.1, -12417.4, -10330.5, -8811.5, -8022.8, -7309.0, -6966.4, -6650.9, -6137.8, -5488.3, -5326.2, -4527.9, -4353.0, -3997.1, -3838.4, -3719.2, -3385.2, -3445.7, -3266.2, -3426.7, -2944.7, -2892.3, -2892.5, -2579.7, -2720.0, -2549.8, -2625.0, -2377.3, -2579.9, -2483.3, -2431.7, -2380.5, -2308.2, -2339.1, -2328.5, -2322.3, -2374.9, -2300.6, -2324.7, -2200.6, -2250.6, -2374.4, -2334.6, -2424.8, -2424.2, -2358.2, -2465.0, -2567.1, -2568.9, -2591.4, -2601.1, -2702.9, -2765.4, -2801.3, -2836.8, -2848.7, -2808.5, -2787.5
-- `a5b_wd_heavy`: -361088.3, -189431.4, -107240.4, -72250.2, -61207.3, -46286.8, -35140.3, -30293.2, -25244.7, -20958.3, -19344.7, -17669.4, -15799.8, -13872.5, -11961.4, -10940.7, -10999.4, -10015.5, -9405.9, -8186.6, -7516.8, -7300.2, -6761.6, -6215.1, -5877.6, -5773.5, -5479.6, -5317.5, -5161.1, -5108.5, -4838.3, -4701.5, -4649.7, -4387.0, -4339.4, -4299.5, -4337.3, -4213.5, -4177.7, -4139.8, -4099.4, -3909.8, -3871.5, -3906.5, -3930.6, -3998.8, -4110.7, -4033.4, -3932.4, -4127.8, -4010.0, -3973.5, -4038.8, -4002.6, -4148.2, -4148.6, -4291.8, -4350.9, -4332.5, -4616.6, -4806.6, -4953.4, -5018.0, -4930.3, -4897.0, -4976.8, -5091.9, -5087.3
+- `r5_mse_nonorm`: -9452.3, -3980.9, -2088.1, -1392.8, -1046.3, -847.0, -664.3, -534.3, -429.7, -339.4, -298.5, -240.5, -210.2, -165.3, -139.6, -121.5, -100.1, -90.2, -83.8, -74.3, -59.9, -51.0, -44.8, -37.9, -28.1, -21.2, -18.3, -12.6, -9.8, -7.1, -5.0, -2.7, +1.1, +2.5, +4.5, +7.6, +11.3, +13.1, +12.7, +12.7, +12.9, +15.6, +18.8, +19.4, +18.5, +22.0, +21.5, +21.1, +21.9, +23.3, +23.4, +23.9, +25.7, +22.1, +25.4, +25.4, +22.9, +23.6, +23.9, +24.3, +24.8, +27.1, +28.5, +28.5, +28.8, +28.7, +27.7, +28.7
+- `r4_lr_sweep`: -119383.4, -59891.0, -33427.4, -22610.0, -17955.0, -14619.9, -11684.2, -9453.2, -8055.5, -6872.7, -6107.8, -5159.0, -4726.7, -4088.5, -3724.3, -3430.8, -3149.6, -2970.6, -2732.0, -2482.3, -2378.9, -2220.1, -2122.0, -2013.2, -1906.3, -1857.0, -1806.8, -1747.0, -1670.8, -1609.0, -1549.6, -1497.2, -1454.7, -1409.2, -1390.3, -1355.8, -1275.4, -1253.3, -1220.9, -1211.8, -1179.7, -1131.9, -1130.3, -1107.7, -1118.0, -1101.8, -1081.9, -1085.6, -1067.6, -1062.3, -1065.2, -1042.7, -1048.4, -1049.5, -1070.4, -1062.9, -1072.7, -1098.5, -1115.1, -1153.4, -1177.5, -1191.7, -1199.2, -1201.2, -1222.1, -1237.7, -1238.5, -1251.0
+- `r1_frame`: +8.7, -443226.1, -352077.0, -313719.6, -270383.4, -232314.2, -191271.5, -158996.2, -136749.8, -115642.7, -105195.0, -90786.0, -82772.1, -73724.0, -66779.0, -61676.8, -56235.1, -53228.8, -49435.4, -45928.2, -43641.3, -41336.6, -39669.5, -37280.1, -35614.9, -34733.5, -33385.2, -32717.6, -31335.2, -30488.0, -28988.0, -28446.2, -27530.3, -26522.4, -26269.2, -25518.7, -24469.2, -23904.8, -23652.9, -23289.8, -22403.7, -21798.5, -21761.6, -21608.1, -21264.3, -21176.9, -20982.6, -20587.2, -20565.3, -20208.1, -20023.6, -20135.4, -19935.9, -19825.2, -20167.0, -20194.3, -20505.0, -20806.6, -21257.0, -21575.6, -21894.0, -22370.6, -22512.3, -22347.4, -22574.1, -22636.4, -22894.5, -23233.4
+- `r3_tiny`: -920605.8, -468052.6, -322273.0, -216231.0, -153898.3, -178134.7, -207095.7, -194969.5, -171277.5, -182277.9, -155213.6, -136402.9, -122728.2, -108558.4, -99382.6, -85695.4, -81460.6, -79240.1, -65112.4, -59418.6, -62049.1, -58585.2, -57987.5, -52776.7, -52515.6, -46894.6, -46606.9, -47058.3, -42313.5, -40375.8, -37138.2, -35324.8, -39196.2, -38442.9, -34993.7, -34058.9, -32858.3, -32999.6, -33027.8, -33583.1, -31432.7, -29313.2, -31066.5, -30234.7, -30374.0, -28485.9, -29983.0, -28630.8, -28772.6, -28300.7, -29369.2, -28444.6, -29168.2, -28700.4, -28831.3, -27256.5, -28397.6, -30936.6, -30330.0, -32709.3, -32011.1, -32809.4, -32501.9, -30878.9, -31764.7, -31391.1, -34104.7, -34956.3
+- `r2_frame_delta_mse`: +17.3, -2075.6, -463629.1, -820572.3, -869433.0, -987350.8, -1093166.3, -1222433.9, -1381051.2, -1515302.8, -1723274.3, -1839430.8, -2043387.0, -2176295.7, -2337024.6, -2509228.1, -2659828.2, -2873937.2, -3015717.4, -3140059.4, -3337672.8, -3479668.3, -3724219.1, -3854061.6, -4025058.8, -4287552.5, -4456592.9, -4701623.3, -4859298.6, -5096517.7, -5250477.7, -5512758.1, -5701877.5, -5878670.2, -6178980.3, -6391747.4, -6476203.6, -6656711.8, -6984030.9, -7302421.5, -7458276.4, -7612045.7, -7916751.5, -8268686.7, -8561785.0, -8902060.9, -9263788.5, -9538314.6, -9894917.4, -10223904.4, -10557072.3, -10928805.4, -11383008.1, -11813887.0, -12429018.3, -12957064.9, -13535925.4, -14323610.5, -15033131.2, -15914455.5, -16693346.9, -17513684.0, -18215987.2, -18832373.1, -19610215.1, -20321002.8, -21175594.9, -22107539.7
 
 ## Training curves (subsampled)
 
-### `e6_sched_noise`
+### `r5_mse_nonorm`
 
 ```
    step      train     val_tf    roll MSE   IMPROV%        lr    min
-    100   0.104213   0.132878    0.143863  -4348.18  8.81e-04   16.2
-    200   0.030133   0.042843    0.095057  -2839.11  5.34e-04   32.3
-    300   0.017294   0.018467    0.135586  -4092.24  1.72e-04   43.4
-    400   0.011916   0.010321    0.114964  -3454.62  2.00e-05   56.1
+    200   0.104615   0.104764    0.002702     +4.98  9.87e-04    2.6
+    400   0.086522   0.088947    0.002679     +5.81  9.28e-04    2.8
+    600   0.059963   0.075344    0.002094    +26.37  8.24e-04    3.0
+    800   0.063131   0.066850    0.003627    -27.53  6.88e-04    3.2
+   1000   0.067798   0.055702    0.002360    +17.00  5.34e-04    3.3
+   1200   0.053134   0.058714    0.002179    +23.38  3.77e-04    3.5
+   1400   0.051265   0.052682    0.002884     -1.42  2.34e-04    3.7
+   1600   0.045522   0.051894    0.002832     +0.40  1.19e-04    3.9
+   1800   0.045562   0.050923    0.002906     -2.20  4.55e-05    4.1
+   2000   0.046826   0.050896    0.003086     -8.53  2.00e-05    4.6
 ```
 
-### `a5b_wd_heavy`
+### `r4_lr_sweep`
 
 ```
    step      train     val_tf    roll MSE   IMPROV%        lr    min
-    100   0.072958   0.056826    0.178376  -5415.29  8.81e-04   21.1
-    200   0.041651   0.053934    0.136724  -4127.43  5.34e-04   37.1
-    300   0.028205   0.018338    0.169054  -5127.06  1.72e-04   64.8
-    400   0.012647   0.010904    0.183472  -5572.84  2.00e-05   92.9
+    200   0.145758   0.218926    0.123151  -4230.52  3.00e-03    2.3
+    400   0.050805   0.046942    0.052885  -1759.67  2.91e-03    2.5
+    600   0.030712   0.038463    0.036182  -1172.32  2.66e-03    2.7
+    800   0.028461   0.039010    0.033446  -1076.10  2.27e-03    2.9
+   1000   0.019657   0.021571    0.023902   -740.48  1.79e-03    3.0
+   1200   0.016139   0.017238    0.033346  -1072.59  1.27e-03    3.2
+   1400   0.016728   0.015429    0.033372  -1073.51  7.95e-04    3.4
+   1600   0.011703   0.008689    0.039140  -1276.34  4.04e-04    3.6
+   1800   0.004816   0.005481    0.043798  -1440.14  1.49e-04    3.8
+   2000   0.004487   0.004455    0.048590  -1608.63  6.00e-05    4.1
+```
+
+### `r1_frame`
+
+```
+   step      train     val_tf    roll MSE   IMPROV%        lr    min
+    200   0.055762   0.054992    0.471750 -16488.82  9.87e-04    2.2
+    400   0.047915   0.039003    0.570584 -19964.25  9.28e-04    2.4
+    600   0.030050   0.029666    0.544695 -19053.89  8.24e-04    2.5
+    800   0.020917   0.022707    0.567719 -19863.52  6.88e-04    2.6
+   1000   0.020951   0.014629    0.697120 -24413.81  5.34e-04    2.8
+   1200   0.014179   0.013787    0.701749 -24576.60  3.77e-04    2.9
+   1400   0.008601   0.010362    0.759619 -26611.57  2.34e-04    3.0
+   1600   0.007815   0.008288    0.778237 -27266.26  1.19e-04    3.2
+   1800   0.007529   0.007517    0.819871 -28730.29  4.55e-05    3.3
+   2000   0.007197   0.007382    0.827749 -29007.32  2.00e-05    3.6
+```
+
+### `r3_tiny`
+
+```
+   step      train     val_tf    roll MSE   IMPROV%        lr    min
+    200   0.039360   0.038294    1.116929 -39176.16  9.87e-04    2.5
+    400   0.052186   0.055776    0.789331 -27656.38  9.28e-04    2.6
+    600   0.024868   0.021918    0.638550 -22354.26  8.24e-04    2.7
+    800   0.026594   0.017413    1.116602 -39164.68  6.88e-04    2.8
+   1000   0.021279   0.025186    1.210763 -42475.77  5.34e-04    2.9
+   1200   0.008984   0.006975    1.166004 -40901.87  3.77e-04    3.0
+   1400   0.005981   0.007410    1.164870 -40861.98  2.34e-04    3.1
+   1600   0.005844   0.005625    1.162947 -40794.36  1.19e-04    3.2
+   1800   0.004862   0.004795    1.157949 -40618.61  4.55e-05    3.3
+   2000   0.004632   0.004673    1.141897 -40054.16  2.00e-05    3.5
+```
+
+### `r2_frame_delta_mse`
+
+```
+   step      train     val_tf    roll MSE   IMPROV%        lr    min
+    200   0.016437   0.016047   52.033219 -1829618.19  1.97e-03    2.2
+    400   0.011779   0.010688  205.259380 -7217727.90  1.86e-03    2.4
+    600   0.009714   0.010069  361.951615 -12727720.12  1.65e-03    2.5
+    800   0.008190   0.009037  252.796019 -8889326.44  1.38e-03    2.6
+   1000   0.007818   0.007347  191.160820 -6721960.16  1.07e-03    2.8
+   1200   0.007294   0.007051  199.618659 -7019375.19  7.54e-04    2.9
+   1400   0.006859   0.007114  244.412213 -8594514.73  4.67e-04    3.0
+   1600   0.006615   0.006799  257.307227 -9047960.47  2.39e-04    3.2
+   1800   0.006724   0.006727  278.926559 -9808191.82  9.10e-05    3.3
+   2000   0.006459   0.006699  284.768732 -10013628.49  4.00e-05    3.6
 ```
 
 ## What each arm was
 
-### `e6_sched_noise`
+### `r5_mse_nonorm`
 
-- **what**: Scheduled sampling + noise on the fed-back prediction itself (not ground truth): simulates 'the thing you're about to condition on is already wrong', not just generic input noise. sched's 2-forward cost (no sequential chain) makes this the only AR-family arm that runs on MPS/CPU unmodified -- see resolve_train_regime().
-- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'token', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'sched', 'AR_LOSS_WEIGHT': 1.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.005, 'LOSS': 'l2norm', 'LEARNING_RATE': 0.001, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 4}`
+- **what**: MSE objective, feature normalisation OFF -- isolates the normalisation change.
+- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'token', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': False, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'mse', 'LEARNING_RATE': 0.001, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 8}`
 
-### `a5b_wd_heavy`
+### `r4_lr_sweep`
 
-- **what**: Weight decay 0.1 + dropout 0.1: damp the amplifying modes.
-- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'token', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'l2norm', 'LEARNING_RATE': 0.001, 'DROPOUT': 0.1, 'WEIGHT_DECAY': 0.1, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 4}`
+- **what**: Peak LR 3e-3 with a long warmup.
+- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'token', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'l2norm', 'LEARNING_RATE': 0.003, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 8}`
+
+### `r1_frame`
+
+- **what**: Frame tokenisation: match the linear baseline's own factorisation.
+- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'frame', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'l2norm', 'LEARNING_RATE': 0.001, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 8}`
+
+### `r3_tiny`
+
+- **what**: Deliberately tiny (E128/L2): if small beats large, this is an optimisation failure.
+- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'token', 'EMBED_SIZE': 128, 'N_LAYERS': 2, 'N_HEADS': 4, 'PREDICT_DELTA': False, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'l2norm', 'LEARNING_RATE': 0.001, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 8}`
+
+### `r2_frame_delta_mse`
+
+- **what**: Frame + delta + MSE -- as close to the linear baseline as a net gets.
+- **config**: `{'VARIANT': 'base', 'TOKENIZATION': 'frame', 'EMBED_SIZE': 256, 'N_LAYERS': 6, 'N_HEADS': 8, 'PREDICT_DELTA': True, 'NORMALIZE_FEATURES': True, 'USE_ROPE': False, 'NOISE_STD': 0.0005, 'AR_MODE': 'none', 'AR_LOSS_WEIGHT': 0.0, 'AR_FRAMES': 2, 'AR_FEEDBACK_NOISE_STD': 0.0, 'LOSS': 'mse', 'LEARNING_RATE': 0.002, 'DROPOUT': 0.01, 'WEIGHT_DECAY': 0.01, 'BATCH_SIZE': 64, 'ACCUMULATION_STEPS': 8}`
 

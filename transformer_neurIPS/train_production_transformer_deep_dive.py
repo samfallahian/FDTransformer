@@ -706,6 +706,21 @@ ROUND2_ARMS = {
                           "overrides": {"LEARNING_RATE": 5e-4, "WARMUP_FRAC": 0.08}},
             "s5_bigbatch": {"desc": "Effective batch 2048 with LR scaled up.",
                             "overrides": {"ACCUMULATION_STEPS": 32, "LEARNING_RATE": 2e-3}},
+            "s6_e3_scaled": {"desc": "e3_ar_long's EXACT winning config (OVERVIEW.md v4.2's "
+                                     "H200 shallow sweep, +30.77% vs persistence, the first "
+                                     "arm in this whole investigation to post a positive "
+                                     "average improvement) at a production-scale step budget "
+                                     "instead of the shallow sweep's 2000. NOT one of the "
+                                     "generic s1-s5 scaling knobs -- those apply to the "
+                                     "CONTROL config's settings, not to the AR mechanism that "
+                                     "actually won this round, so running them as suggested "
+                                     "would scale the wrong starting point. MAX_STEPS baked in "
+                                     "here (matches s2_steps_3x's convention) but a launcher's "
+                                     "--max-steps still wins if passed, per apply_arm()'s "
+                                     "'CLI beats the arm' rule.",
+                             "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                           "AR_FRAMES": 8, "AR_SEQS": 2,
+                                           "AR_EVERY_N_STEPS": 8, "MAX_STEPS": 12000}},
         },
     },
     # ---------------------------------------------------------------- branch D
@@ -1023,9 +1038,26 @@ def decode_centroid(latent, cfg=Config):
     Assumes the decoder is already loadable onto `latent.device`. Preserves
     all leading dimensions (batch, time, etc.) and returns the central
     velocity triplet `(vx, vy, vz)` at index 62 of 125 spatial points.
+
+    Forces float32 + disables CUDA autocast for just this call. This
+    function is called from inside train()'s per-step `with amp_ctx:`
+    block (a `torch.autocast('cuda', dtype=torch.bfloat16)` region), so by
+    the time the primary model's output reaches here it may already be
+    bf16 -- but the frozen decoder's weights (loaded via `torch.jit.load`,
+    never cast) are float32. Confirmed on H200/CUDA: without this guard,
+    `mod.decode(z_flat)` raises "mat1 and mat2 must have the same dtype,
+    but got BFloat16 and Float" on literally the first training step of
+    every CUDA arm. `device_type='cpu'` would NOT fix this -- autocast
+    state is tracked independently per device_type, so disabling only the
+    (inactive) cpu autocast leaves the ambient cuda autocast untouched;
+    the disable has to target 'cuda' specifically to actually override the
+    enclosing context. The decoder is frozen and never trained, so it
+    loses nothing by always running in full precision regardless of what
+    precision the rest of the step runs in.
     """
     dec = _load_decoder(latent.device, cfg)
-    v = dec(latent)                                      # (..., 375)
+    with torch.autocast(device_type='cuda', enabled=False):
+        v = dec(latent.float())                          # (..., 375)
     return v[..., CENTROID_SLICE]                         # (..., 3)
 
 
@@ -1398,6 +1430,25 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
     Solved on the normal equations in float64. D = NX*LATENT_DIM = 10*47 = 470
     (post-v3.1; was 26*47=1222), so X'X is 471x471 -- trivial regardless of
     how many transitions are accumulated.
+
+    Returns TWO improvement figures, and they are NOT the same comparison:
+
+      * `improvement_pct` / `linear_mse` / `persistence_mse` -- raw LATENT
+        space (470-dim), the space the ridge map is actually fit in. This is
+        the number `run_diagnostics()` originally printed, and it is what a
+        sweep arm's `IMPROV%`/`roll MSE`/`pers MSE` are NOT measured in --
+        `evaluate()` decodes through the frozen GEN3 decoder into centroid
+        VELOCITY space (m/s) before scoring (see its comment: "space (m/s),
+        not raw latent space"). Comparing the two directly is apples-to-
+        oranges: the decoder is a nonlinear map, so an improvement in raw
+        latent error does not have to correspond to the same improvement (or
+        even the same SIGN) in decoded velocity error.
+      * `improvement_pct_centroid` / `linear_mse_centroid` /
+        `persistence_mse_centroid` -- the SAME autoregressive rollout,
+        additionally decoded through `decode_centroid()` exactly like
+        `evaluate()` does, so this is the one that is actually comparable to
+        an arm's `IMPROV%`. `sweep_deep_dive.py`'s Branch-R classifier uses
+        this field, not the raw-latent one.
     """
     NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
     D = NX * LD
@@ -1431,6 +1482,8 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
     n_frames = NT - ctx
     se_lin = torch.zeros(n_frames, dtype=torch.float64)
     se_pers = torch.zeros(n_frames, dtype=torch.float64)
+    se_lin_c = torch.zeros(n_frames, dtype=torch.float64)
+    se_pers_c = torch.zeros(n_frames, dtype=torch.float64)
     count = 0
     for start in range(0, val_data.shape[0], chunk):
         b = val_data[start:start + chunk].to(solve_device, non_blocking=True)
@@ -1448,11 +1501,25 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
         pers = anchor.unsqueeze(1).expand(-1, n_frames, -1)
         se_lin += ((preds - true) ** 2).mean(-1).sum(0).cpu()
         se_pers += ((pers - true) ** 2).mean(-1).sum(0).cpu()
+
+        # Apples-to-apples with evaluate()'s rollout_mse/persistence_mse: decode
+        # through the frozen GEN3 decoder into centroid velocity (m/s) space
+        # before scoring, rather than comparing raw 470-dim latent MSE. See the
+        # docstring -- these two metric spaces are not interchangeable.
+        preds_v = decode_centroid(preds.reshape(B, n_frames, NX, LD).float(), cfg)
+        true_v = decode_centroid(true.reshape(B, n_frames, NX, LD).float(), cfg)
+        pers_v = decode_centroid(pers.reshape(B, n_frames, NX, LD).float(), cfg)
+        se_lin_c += ((preds_v - true_v) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
+        se_pers_c += ((pers_v - true_v) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
         count += B
 
     mse_lin = (se_lin / count)
     mse_pers = (se_pers / count)
     imp = ((mse_pers - mse_lin) / (mse_pers + 1e-12) * 100)
+
+    mse_lin_c = (se_lin_c / count)
+    mse_pers_c = (se_pers_c / count)
+    imp_c = ((mse_pers_c - mse_lin_c) / (mse_pers_c + 1e-12) * 100)
     return {
         "fit_transitions": rows,
         "val_sequences": count,
@@ -1461,6 +1528,12 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
         "improvement_pct": float((mse_pers.mean() - mse_lin.mean()) / (mse_pers.mean() + 1e-12) * 100),
         "improvement_pct_frame1": float(imp[0]),
         "improvement_pct_per_frame": [round(float(v), 3) for v in imp],
+        "linear_mse_centroid": float(mse_lin_c.mean()),
+        "persistence_mse_centroid": float(mse_pers_c.mean()),
+        "improvement_pct_centroid": float((mse_pers_c.mean() - mse_lin_c.mean())
+                                           / (mse_pers_c.mean() + 1e-12) * 100),
+        "improvement_pct_frame1_centroid": float(imp_c[0]),
+        "improvement_pct_per_frame_centroid": [round(float(v), 3) for v in imp_c],
     }
 
 
@@ -2115,25 +2188,41 @@ def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
               "script_error": None, "trace_error": None,
               "roundtrip_ok": False}
     scripted = None
-    # torch.jit.{script,trace,save,load} are explicitly unsupported on
-    # Python 3.14+ ("may break; switch to torch.compile/torch.export") --
-    # confirmed empirically (see OVERVIEW.md) that on this interpreter they
-    # emit: torch.jit's own DeprecationWarning at every entry point, a
-    # TracerWarning from tracing any data-shape-derived Python control flow
-    # (unavoidable in general, since trace's whole model is "record one
-    # concrete execution"), and dozens of repeated "`.grad` attribute of a
-    # Tensor that is not a leaf Tensor" UserWarnings from trace's own
-    # internal parameter handling -- NOT from any `.to()` call in this
-    # function (verified: still fires with every `.to()` call in this
-    # function guarded/removed). All three are noise from a deprecated API
-    # on this Python version, not actionable signal, and were flooding
-    # multi-hour training logs on every periodic scripted-checkpoint write.
-    # Scoped to just this block so a genuinely new/unexpected warning
-    # elsewhere in the program is never silently swallowed.
+    # torch.jit.{script,trace,save,load} is a deprecated API across torch
+    # versions generally -- confirmed empirically on TWO different
+    # Python/torch combinations, each wording and categorizing it
+    # differently (worth recording exactly, since the first fix here only
+    # covered the first one and silently missed the second on a real H200
+    # run -- see OVERVIEW.md):
+    #   - Python 3.14.7 / torch 2.12.0.dev20260312 (this Mac): DeprecationWarning,
+    #     "`torch.jit.X` is not supported in Python 3.14+ and may break.
+    #     Please switch to torch.compile or torch.export."
+    #   - Python 3.12 / torch 2.14.0+cu130 (H200 box): FutureWarning,
+    #     "`torch.jit.X` is deprecated. Please switch to `torch.compile`
+    #     or `torch.export`."
+    # Both are the same underlying deprecation notice with different
+    # wording AND different categories -- filtering on one specific
+    # (category, message) pair misses the other entirely, which is
+    # exactly what happened. The filter below matches on the message
+    # alone (torch.jit.<name> + one of the two known phrasings) under the
+    # base `Warning` class, so it catches either category without needing
+    # to enumerate every wording torch has used or might use next. Also
+    # filtered: a TracerWarning from tracing any data-shape-derived Python
+    # control flow (unavoidable in general, since trace's whole model is
+    # "record one concrete execution"), and dozens of repeated "`.grad`
+    # attribute of a Tensor that is not a leaf Tensor" UserWarnings from
+    # trace's own internal parameter handling -- NOT from any `.to()` call
+    # in this function (verified: still fires with every `.to()` call in
+    # this function guarded/removed). All are noise from a deprecated API,
+    # not actionable signal, and were flooding multi-hour training logs on
+    # every periodic scripted-checkpoint write. Scoped to just this block
+    # so a genuinely new/unexpected warning elsewhere in the program is
+    # never silently swallowed.
     with warnings.catch_warnings():
         warnings.filterwarnings(
-            "ignore", category=DeprecationWarning,
-            message=r".*torch\.jit\..*is not supported in Python 3\.14\+.*")
+            "ignore", category=Warning,
+            message=r"^`torch\.jit\.\w+` (is not supported in Python 3\.\d+\+"
+                    r"|is deprecated\.).*")
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
         warnings.filterwarnings(
             "ignore", category=UserWarning,
@@ -3397,14 +3486,21 @@ def run_diagnostics(args, log=print):
     log("\n[diag] --- is there learnable temporal structure beyond persistence? ---")
     lin = linear_frame_baseline(train_ds.data, val_ds.data, Config, device, log=log)
     out["linear_baseline"] = lin
+    log(f"  [raw latent space, 470-dim -- NOT comparable to an arm's IMPROV%]")
     log(f"  persistence MSE   = {lin['persistence_mse']:.8f}")
     log(f"  linear-map MSE    = {lin['linear_mse']:.8f}")
     log(f"  linear IMPROVEMENT over persistence = {lin['improvement_pct']:+.2f}% "
         f"(1 frame ahead: {lin['improvement_pct_frame1']:+.2f}%)")
-    log("  Read this as the floor a competent model must clear. If the sweep's best "
-        "arm cannot beat a ridge regression, the model is the problem; if the linear "
-        "map is also ~0%, persistence is genuinely strong at this dt and the framing "
-        "must change.")
+    log(f"  [decoded centroid velocity space, m/s -- apples-to-apples with an "
+        f"arm's IMPROV%/roll MSE/pers MSE]")
+    log(f"  persistence MSE   = {lin['persistence_mse_centroid']:.8f}")
+    log(f"  linear-map MSE    = {lin['linear_mse_centroid']:.8f}")
+    log(f"  linear IMPROVEMENT over persistence = {lin['improvement_pct_centroid']:+.2f}% "
+        f"(1 frame ahead: {lin['improvement_pct_frame1_centroid']:+.2f}%)")
+    log("  Read the CENTROID figure as the floor a competent model must clear -- it is "
+        "in the same units evaluate() scores arms in. If the sweep's best arm cannot "
+        "beat it, the model is the problem; if the linear map is also ~0%, persistence "
+        "is genuinely strong at this dt and the framing must change.")
 
     # Statistics that decide the over- vs under-fitting question for free.
     mean, std = compute_feature_stats(train_ds.data, Config, frame_level=False)

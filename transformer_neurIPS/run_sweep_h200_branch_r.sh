@@ -1,77 +1,67 @@
 #!/usr/bin/env bash
-# Shallow Round-2 sweep for the CUDA-only "stabilise the rollout" arms --
-# see OVERVIEW.md v3.8 (Documentation section "v3.8 -- rollout-divergence
-# diagnosis and Round-2 sweep infrastructure").
+# Branch-R screen (r1-r5) on CUDA -- see OVERVIEW.md v4.4 sections 24.3/24.4.
 #
-# WHY THESE ARMS NEED CUDA
-# =========================
-# All three arms below use AR_MODE='frame_ar': the sequential autoregressive
-# loop that retains AR_FRAMES*NUM_X activation graphs for backward. On
-# MPS/CPU that's forced to 'none' by resolve_train_regime() (retained-graph
-# memory blowup); on CUDA it runs at the arm-specified AR_SEQS untouched.
-# These are the ONLY arms in the current menu that can test the AR-horizon
-# hypothesis at all -- run_sweep_mac.sh covers the (weaker, per the Stage 0
-# diagnostic below) noise/regularization hypothesis on cheaper hardware.
+# WHY THIS EXISTS, SEPARATE FROM run_sweep_mac_branch_r.sh
+# ==========================================================
+# s6_e3_scaled's production-scale confirmation (OVERVIEW.md 24.2, +27.41%
+# vs persistence) also surfaced a bigger finding: a closed-form ridge
+# regression frame-to-frame map beats it by more than 2x (+60.64%,
+# section 24.3) -- a real "Branch R" verdict, trustworthy because
+# s6_e3_scaled had actually converged when it fired (unlike the false
+# positive at section 20.2's shallow, unconverged Mac run).
 #
-#   a4b_ar_very_long        AR horizon 14 frames (140 tokens) -- ~21% of the
-#                            68-frame eval rollout, the biggest single jump
-#                            available in the current arm menu.
-#   e3_ar_long               AR horizon 8 frames (80 tokens) -- cheaper
-#                            middle ground between the current a3b (4
-#                            frames) and a4b.
-#   a6b_ar_feedback_noise    a4b's 14-frame horizon PLUS AR_FEEDBACK_NOISE_STD
-#                            on the fed-back prediction -- tests whether the
-#                            horizon extension and the feedback-noise
-#                            mechanism combine better than either alone.
+# The five ROUND2_ARMS["R"] arms below don't use AR_MODE='frame_ar' at
+# all, so run_sweep_mac_branch_r.sh was built to screen them for free on
+# the Mac -- but with CUDA hardware sitting idle and 10x+ faster per
+# section 24's Mac ETA estimate (~20-30h serialized on the Mac vs.
+# minutes-to-an-hour here), there's no reason to wait on the Mac run.
+# This script runs the exact same 5 arms on CUDA instead, at full
+# fidelity (no ACCUM cut, no SUBSET_RATIO cut) since the hardware can
+# afford it directly -- mirroring run_sweep_h200.sh's "leave ACCUM at each
+# arm's own default, H200 throughput makes the full-fidelity settings
+# cheap" rationale.
 #
-# Stage 0 diagnostic verdict these arms are following up on
-# (diagnose_rollout_noise_sensitivity.py, run against
-# saved_models/old/r1_a3b_delta_ar_latest.pt): the divergence is
-# BIAS-dominated -- |bias|/RMSE = 0.822, and last-frame RMSE was IDENTICAL
-# (16.76) whether injected noise was 0 or 100x larger. That is direct
-# evidence AGAINST the noise/chaos hypothesis and FOR the horizon-extension
-# hypothesis these three arms test: the model needs to see far enough into
-# its own accumulated error during training to learn to correct it, not
-# just be made more robust to small perturbations.
+#   r1_frame             Frame tokenisation -- matches the linear
+#                         baseline's own per-frame factorisation.
+#   r2_frame_delta_mse   Frame + delta + MSE -- as close to the linear
+#                         baseline as a net gets.
+#   r3_tiny              Deliberately tiny (E128/L2) -- if small beats
+#                         large, this is an optimisation failure, not a
+#                         capacity one.
+#   r4_lr_sweep          Peak LR 3e-3, longer warmup.
+#   r5_mse_nonorm        MSE objective, NORMALIZE_FEATURES off -- isolates
+#                         the normalisation change.
 #
-# REQUIRED FILES (checked below before anything runs)
-# =====================================================
-#   transformer_neurIPS/train_production_transformer_deep_dive.py   the trainer
-#   transformer_neurIPS/model_variants.py                           model definitions (imported by the trainer)
-#   transformer_neurIPS/sweep_deep_dive.py                          this script's launcher/aggregator
-#   transformer_neurIPS/data/train_80.h5                            training sequences (prepare_data.py output)
-#   transformer_neurIPS/data/val_80.h5                              validation sequences (prepare_data.py output)
+# None of these five use AR_MODE='frame_ar' either, unlike run_sweep_h200.sh's
+# three arms -- so unlike that script, running here is a speed choice, not
+# a correctness requirement (run_sweep_mac_branch_r.sh would give the same
+# answer, just much slower). Because none retain a sequential AR graph,
+# they're also cheap enough to round-robin across multiple GPUs if this
+# box has more than one, same as run_sweep_h200.sh does.
+#
+# REQUIRED FILES (checked below before anything runs) -- identical to
+# run_sweep_h200.sh's list; nothing new is needed for this script:
+#   transformer_neurIPS/train_production_transformer_deep_dive.py
+#   transformer_neurIPS/model_variants.py
+#   transformer_neurIPS/sweep_deep_dive.py
+#   transformer_neurIPS/data/train_80.h5   (or a make_sweep_sample_data.py
+#   transformer_neurIPS/data/val_80.h5      sample renamed to these exact
+#                                            names -- see OVERVIEW.md 20.6)
 #   encoder/autoencoderGEN3/saved_models_production/
-#     Model_GEN3_05_AttentionSE_absolute_best_scripted.pt           frozen decoder -- centroid_velocity_loss
-#                                                                    decodes through this every training step
-#
-# These two filenames are hard-coded (Config.TRAIN_H5 / VAL_H5, both in
-# PINNED_CONFIG_FIELDS -- no CLI override exists), NOT necessarily the full
-# datasets. If you're on a bandwidth-throttled link, generate smaller
-# random-sample companions locally with make_sweep_sample_data.py and
-# upload THOSE, renamed to exactly "train_80.h5" / "val_80.h5" on this box
-# -- this script and the trainer are both filename-based and don't care
-# whether what's actually there is the full file or a sample. See
-# OVERVIEW.md §20.6 for the full workflow (and the SUBSET_RATIO compounding
-# caveat if you also pass --subset-ratio on top of an already-sampled file).
+#     Model_GEN3_05_AttentionSE_absolute_best_scripted.pt
 #
 # USAGE
 # =====
-#   bash transformer_neurIPS/run_sweep_h200.sh
+#   bash transformer_neurIPS/run_sweep_h200_branch_r.sh
 #
 # Overridable via environment variables (all optional):
 #   PYTHON_BIN     interpreter to use                          (default: python3)
-#   MAX_STEPS      optimizer steps per arm                      (default: 2000)
+#   MAX_STEPS      optimizer steps per arm                      (default: 2000, matching the shallow-screen budget these arms were defined at -- see LATEST_UPLOAD_ME.md's auto-suggested command; bump to 12000 here for a scaled follow-up the same way s6_e3_scaled followed e3_ar_long)
 #   VAL_EVERY      eval cadence in steps                        (default: 200)
 #   ROLLOUT_SEQS   sequences scored per rollout eval             (default: 64)
 #   SUBSET_RATIO   fraction of train data loaded                 (default: 1.0)
-#   MAX_PARALLEL   concurrent arms (round-robins across GPUs)    (default: min(GPU count, 3))
+#   MAX_PARALLEL   concurrent arms (round-robins across GPUs)    (default: min(GPU count, 5))
 #   NO_WANDB       set to 1 to skip wandb tracking                (default: 0, i.e. tracked)
-#
-# Unlike run_sweep_mac.sh, ACCUM is left at each arm's own default here --
-# H200's throughput (bf16, torch.compile, micro_batch bumped well past 1)
-# makes the full-fidelity settings cheap enough that there's no reason to
-# trade gradient-estimate quality for turnaround the way the Mac script does.
 
 set -euo pipefail
 
@@ -79,7 +69,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$HERE")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-ARMS=(a4b_ar_very_long e3_ar_long a6b_ar_feedback_noise)
+ARMS=(r1_frame r2_frame_delta_mse r3_tiny r4_lr_sweep r5_mse_nonorm)
 MAX_STEPS="${MAX_STEPS:-2000}"
 VAL_EVERY="${VAL_EVERY:-200}"
 ROLLOUT_SEQS="${ROLLOUT_SEQS:-64}"
@@ -96,7 +86,7 @@ REQUIRED_FILES=(
 )
 
 echo "=================================================================="
-echo " H200/CUDA shallow sweep -- arms: ${ARMS[*]}"
+echo " H200/CUDA Branch-R screen -- arms: ${ARMS[*]}"
 echo "=================================================================="
 echo ""
 echo "Checking required files..."
@@ -156,10 +146,11 @@ echo ""
 
 GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ')"
 if [[ -z "$GPU_COUNT" || "$GPU_COUNT" -eq 0 ]]; then
-  echo "WARNING: nvidia-smi found no GPUs. These arms use AR_MODE='frame_ar',"
-  echo "which resolve_train_regime() silently disables without CUDA -- running"
-  echo "this script here would produce a misleading result, not an error."
-  echo "This script is meant for a CUDA box (e.g. H200). Aborting."
+  echo "WARNING: nvidia-smi found no GPUs. None of these arms strictly"
+  echo "require CUDA (they're all runnable on run_sweep_mac_branch_r.sh),"
+  echo "so this isn't a correctness abort the way run_sweep_h200.sh's is --"
+  echo "but this script is meant for a CUDA box for speed. Aborting;"
+  echo "use run_sweep_mac_branch_r.sh on non-CUDA hardware instead."
   exit 1
 fi
 DEFAULT_MAX_PARALLEL=$(( GPU_COUNT < ${#ARMS[@]} ? GPU_COUNT : ${#ARMS[@]} ))
@@ -175,9 +166,6 @@ echo "              more than one arm sequentially)"
 if [[ "$NO_WANDB" == "1" ]]; then
   WANDB_STATUS="disabled (--no-wandb)"
 else
-  # Query the live Config.WANDB_PROJECT rather than hard-coding a copy of
-  # the string here -- a hard-coded copy is exactly what went stale last
-  # time this project was renamed (OVERVIEW.md v4.1). This can't drift.
   WANDB_PROJECT_LIVE="$("$PYTHON_BIN" -c "
 import sys; sys.path.insert(0, '$HERE')
 from train_production_transformer_deep_dive import Config

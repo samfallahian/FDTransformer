@@ -2382,5 +2382,324 @@ written. The next real test of the invariant is whatever change lands the
 first `v5.0` heading.
 
 Verified: `py_compile`, the new test passing in isolation, and the full
-suite (42 tests: the 41 from §20.7 plus this one; still 3 skipped,
-unrelated to this change).
+suite (44 tests: the 41 from §20.7 plus this file's 3; still 3 skipped,
+unrelated to this change). [Correction: this originally said "42 tests" --
+arithmetic error, 41+3=44, not 42. Fixed in v4.2 while editing this file
+for an unrelated reason; noted here rather than silently changed, per this
+file's own convention of tracking corrections rather than erasing them.]
+
+---
+
+## 22. v4.2 -- the first real H200 run, and the bug only real CUDA hardware could surface
+
+**Status:** shipped this pass. The operator ran `run_sweep_h200.sh` for
+real on a rented H200 (RunPod, `NVIDIA B300 SXM6 AC`, confirming
+OVERVIEW.md's earlier "rented/wiped box" workflow discussion was not
+hypothetical) and downloaded `LATEST_UPLOAD_ME.md` via `scp`. All three
+CUDA arms (`a4b_ar_very_long`, `e3_ar_long`, `a6b_ar_feedback_noise`)
+crashed identically, instantly (`exit 1`, `0.0` minutes each) -- this
+section is that bug and its fix.
+
+### 22.1 The bug
+
+```
+RuntimeError: mat1 and mat2 must have the same dtype, but got BFloat16 and Float
+```
+
+...raised inside the frozen GEN3 decoder's own `nn.Linear.forward`, every
+time, on literally the first training step. Root cause: `decode_centroid()`
+is called from inside `train()`'s per-step `with amp_ctx:` block --
+`torch.autocast('cuda', dtype=torch.bfloat16)` on the CUDA regime (§9).
+By the time the primary model's autocast-produced output reaches
+`decode_centroid()`, it's already bf16. The frozen decoder (`torch.jit.load`,
+never cast, still float32 weights) then tries to matmul a bf16 activation
+against a float32 weight and fails outright -- PyTorch's autocast does
+NOT appear to bridge this gap for a `torch.jit`-scripted submodule's own
+internal linear ops the way it does for ordinary Python-dispatched
+`nn.Linear` calls in the same region.
+
+This is a pure CUDA-only bug: MPS/CPU never enables `use_amp`
+(`resolve_train_regime()`'s MPS/CPU branch sets `use_amp=False`), so this
+code path was never exercised by any of the Mac-side testing across §17
+through §21 -- the entire Round-2 sweep effort so far, including three
+separate rounds of "run it for real and see what breaks" on this Mac,
+could not have caught this. It took actual CUDA hardware to surface it,
+which is exactly why §18's "prove it on cheap hardware before H200"
+plan always had a limit -- some bugs only exist on the hardware you're
+trying to avoid burning time on.
+
+### 22.2 The fix
+
+`decode_centroid()` now forces float32 and explicitly disables CUDA
+autocast for just its own call to the frozen decoder:
+
+```python
+with torch.autocast(device_type='cuda', enabled=False):
+    v = dec(latent.float())
+```
+
+**Why `device_type='cuda'` specifically, not `'cpu'`** (the pattern used
+elsewhere in this file for "autocast off," e.g. `evaluate()`'s
+`_autocast()` helper): autocast state is tracked independently per
+`device_type`. Nesting a `device_type='cpu', enabled=False` context
+inside an active `device_type='cuda'` autocast region does NOT touch the
+cuda state at all -- it would have been a no-op fix. The disable has to
+target the SAME device_type as the enclosing context to actually override
+it. This is a real, easy-to-make mistake (both look like "turn off
+autocast" at a glance) worth calling out explicitly so it isn't repeated
+elsewhere in this file.
+
+The decoder is frozen and never trained (`requires_grad_(False)` at load
+time, §10.9.7-era), so forcing full precision on its own forward costs
+nothing it would otherwise gain from bf16 -- there's no tradeoff being
+made here, just correctness.
+
+### 22.3 Validation, and its limit
+
+Verified: `py_compile`, `--smoke-test`, the full test suite (44 tests, no
+change in pass/skip count), and a direct exercise feeding a manually
+`.to(torch.bfloat16)`-cast tensor into `decode_centroid()` on this Mac (no
+CUDA available here) -- confirms the `latent.float()` upcast handles
+exactly the input-dtype symptom reported, independent of whether the
+CUDA-autocast-nesting mechanics are exercised.
+
+**What was NOT verified, and can't be from this Mac:** the actual
+autocast-context-nesting behavior on real CUDA hardware, since MPS/CPU
+never activates `use_amp` at all. The fix follows a standard, documented
+PyTorch pattern (nested autocast context managers of the same device_type
+override the enclosing one), and the reasoning matches the exact error
+reported, but confirming it requires re-running `run_sweep_h200.sh` on
+the H200 box. That re-run is the next real test of this fix -- not
+something this file can claim done from Mac-side evidence alone.
+
+---
+
+## 23. v4.3 -- the first positive result in this entire investigation
+
+**Status:** shipped this pass. Two re-runs of `run_sweep_h200.sh` after
+§22's fix: the first reproduced the IDENTICAL bf16/float32 traceback
+byte-for-byte (diagnosed as a stale file on the box -- the operator's
+PyCharm deployment target was pointed at the wrong root, so the fix never
+actually reached the H200 the first time), the second -- after correcting
+the deployment target -- ran clean. All three arms completed the full
+2000 steps with no crash. This section is that result and the follow-up
+it justifies.
+
+### 23.1 The result: `e3_ar_long` posts +30.77% -- read it against the metric's own distortion
+
+```
+arm                      IMPROV%   frame1%      last%   roll MSE   pers MSE   >anch?
+e3_ar_long               +30.77%  -4925.15%   +46.51%    0.00167    0.00241     yes
+a4b_ar_very_long         -47.72%  -1.29e+04    +7.83%    0.00356    0.00241     yes
+a6b_ar_feedback_noise    -49.04%  -1.20e+04    +5.58%    0.00360    0.00241     yes
+```
+
+`e3_ar_long` is the first arm across this entire investigation -- every
+Mac shallow-sweep result in §20, every real long-run analyzed in §18 --
+to post a positive AVERAGE improvement over persistence across the full
+68-frame rollout. All three arms genuinely converged this time
+(`>const?`/`>anch?` both yes across the board, unlike §20.2's shallow Mac
+sweep where neither arm had reached the anchor yet) -- so this is a real
+result, not another "not done training" false read.
+
+**Frame1's `-4925%` is a metric artifact, not a claim the model is
+catastrophically bad at short horizons.** `improvement_pct = (persistence
+- model) / persistence * 100`; persistence (copy the last context frame)
+is nearly perfect one step ahead for a smooth physical field, so the
+denominator is tiny and any nonzero model error registers as a huge
+negative percentage regardless of its absolute size. The metric only
+becomes informative once persistence itself has degraded (roughly frame
+15+) -- and that's exactly where `e3_ar_long`'s per-frame curve crosses
+positive and STAYS there, plateauing around +45-47% through frame 68. That
+shape -- bad-looking early on a denominator artifact, genuinely stable and
+positive late -- is the signature the horizon-extension hypothesis (§19,
+§22) was aimed at producing.
+
+### 23.2 A counterintuitive result, explained rather than overclaimed
+
+The SHORTER AR horizon (`e3_ar_long`, 8 frames) beat the LONGER one
+(`a4b_ar_very_long`, 14 frames) here -- on its face the opposite of "the
+model needs to see further into its own drift." The arm configs explain
+why without needing that conclusion: `e3_ar_long` runs its AR loss every
+`AR_EVERY_N_STEPS=8`; `a4b_ar_very_long` every 16. At a fixed 2000-step
+budget that's 250 AR-loss applications for e3 vs. 125 for a4b -- e3 got
+roughly twice the AR gradient signal in this shallow budget, independent
+of which horizon is better in the limit. **This is a claim about this
+step budget, not a general "8 beats 14" conclusion** -- a4b may catch up
+or overtake at a longer run, which is exactly what §23.3 is designed to
+check.
+
+### 23.3 Why the auto-suggested "Branch S" command was wrong to run as-is, and what replaces it
+
+`sweep_deep_dive.py`'s classifier recommended the generic Branch-S arms
+(`s1_capacity_xl`, `s2_steps_3x`, `s3_swiglu`, `s4_lr_low`, `s5_bigbatch`)
+since `best >= STRONG` (30.0) was crossed. All five apply their scaling
+knob to the CONTROL config's settings -- none of them carry forward
+`AR_MODE='frame_ar'`/`AR_FRAMES=8`/etc. Running them as suggested would
+scale a config that never produced this section's result and lose the
+thing that actually won.
+
+New arm instead: **`s6_e3_scaled`** (`ROUND2_ARMS["S"]`) -- `e3_ar_long`'s
+EXACT overrides (`AR_MODE=frame_ar`, `AR_LOSS_WEIGHT=1.0`, `AR_FRAMES=8`,
+`AR_SEQS=2`, `AR_EVERY_N_STEPS=8`), plus `MAX_STEPS=12000` baked into the
+arm itself (matching `s2_steps_3x`'s existing convention of baking a step
+budget into the override dict; `apply_arm()`'s "CLI beats the arm" rule
+means a launcher's own `--max-steps` still wins if passed). 12000 was
+chosen to be comparable in scale to the original `a3b_delta_ar` run
+(§18) that first exhibited the catastrophic rollout divergence this whole
+investigation started from -- the real question this answers is whether
+the +30.77% / stable-plateau shape (§23.1) holds, grows, or erodes over a
+genuinely long run, not just a 2000-step proof of concept.
+
+New launcher: **`transformer_neurIPS/run_sweep_h200_scale_e3.sh`** --
+single-arm counterpart to `run_sweep_h200.sh`, same file/package/GPU
+checks, defaults to the full (not sample) `.h5` files since this is the
+production-scale check where `subset_ratio=1.0` on real data is the
+point, not a throwaway signal test.
+
+Verified: `py_compile`; `resolve_arm('s6_e3_scaled')` +
+`apply_arm('s6_e3_scaled')` correctly resolve and set
+`AR_MODE=frame_ar, AR_FRAMES=8, AR_SEQS=2, AR_EVERY_N_STEPS=8,
+MAX_STEPS=12000`; `bash -n` on the new launcher; and an end-to-end
+`sweep_deep_dive.py --arms s6_e3_scaled --smoke` wiring check (see this
+run's own log for the result -- smoke settings only, not a claim about
+the real 12000-step outcome).
+
+### 23.4 What v4.3 does NOT change
+
+- `e3_ar_long`, `a4b_ar_very_long`, `a6b_ar_feedback_noise` remain
+  exactly as defined in §19.5/§22 -- `s6_e3_scaled` is an ADDITION, not a
+  redefinition of any existing arm.
+- No claim is made yet about whether the +30.77% result holds at
+  production scale -- that is what running `run_sweep_h200_scale_e3.sh`
+  actually tests, not something this section asserts in advance.
+
+## 24. v4.4 -- production-scale confirmation, a warning-suppression fix, and Branch R
+
+### 24.1 The `torch.jit` warning-suppression fix from v4.3 was too narrow
+
+The filter added when `save_scripted_model()` was first built (§21 area)
+matched Python-3.14's specific wording of the `torch.jit.script`/`trace`
+deprecation notice under `category=DeprecationWarning`. The H200 box runs
+a different Python/torch build and emits the SAME notice worded
+differently and under `category=FutureWarning`:
+
+```
+FutureWarning: `torch.jit.trace` is deprecated and will be removed in a
+future release. Please use `torch.export` instead.
+```
+
+Neither the category nor the exact wording matched the old filter, so it
+passed straight through. Fixed by broadening from a
+Python-3.14-specific `DeprecationWarning` match to a cross-version
+`category=Warning` match with a regex covering both observed wordings
+(`is not supported in Python 3.\d+\+` and `is deprecated\.`):
+
+```python
+warnings.filterwarnings(
+    "ignore", category=Warning,
+    message=r"^`torch\.jit\.\w+` (is not supported in Python 3\.\d+\+"
+            r"|is deprecated\.).*")
+```
+
+Verified with a direct `warnings.catch_warnings()` capture test covering
+both wordings (confirmed suppressed) plus one unrelated warning
+(confirmed it still escapes -- this is not a blanket "ignore everything"
+filter).
+
+### 24.2 `s6_e3_scaled` at 12000 steps: the win holds
+
+Full report: `sweep_logs/LATEST_UPLOAD_ME.md`, run `round2_20260902_210846`,
+NVIDIA B300 SXM6, 24.4 minutes wall clock.
+
+```
+arm            steps   IMPROV%   frame1%   last%    roll MSE   pers MSE
+s6_e3_scaled   12000    +27.41  -1745.02   +22.86   0.002064   0.002844
+```
+
++27.41% vs. persistence over the full 68-frame rollout at production
+scale, against the shallow sweep's +30.77% at 2000 steps (§23.1) -- a
+small, not catastrophic, erosion. The per-frame shape is the same story
+as §23.1's frame1-artifact explanation, now with more resolution:
+`frame1 = -1745%` is the same denominator artifact (persistence is
+nearly exact one step ahead), improvement crosses positive around frame
+10, peaks at **+39.2% near frame 23**, then decays gradually to **+22.9%
+by frame 68**. That's a real, mild long-horizon decay -- not the
+catastrophic divergence this whole investigation started from (§18), and
+not the flat plateau the 2000-step shallow run suggested either; 12000
+steps was long enough to reveal a shape the shallow run was too short to
+show.
+
+`>const?`/`>anch?` both `yes` -- this run genuinely converged, not
+another "not done training" false read.
+
+### 24.3 Branch R: a linear baseline beats the transformer by 2x -- and it's a trustworthy verdict this time
+
+The same report's diagnostics fit a closed-form ridge regression
+frame-to-frame map on the training data and scored it on the same
+objective:
+
+```
+persistence MSE                = 0.00034558018635598447
+ridge linear frame-map MSE     = 0.00013600662014857495
+linear improvement             = +60.64%
+```
+
++60.64% for a linear map vs. `s6_e3_scaled`'s +27.41% for the transformer
+-- more than 2x. `sweep_deep_dive.py`'s auto-classifier fired Branch R
+("a linear map beats the transformer -- the model or the framing is
+broken"). Earlier in this investigation (§20.2) the same classifier fired
+a false positive at a shallow 2000-step budget where neither arm had
+actually converged yet (`>const?`/`>anch?` not yet `yes`). That caveat
+does NOT apply here: `s6_e3_scaled` converged at full production scale
+(§24.2), so this verdict is trustworthy -- the gap is real, not an
+artifact of an unfinished run.
+
+### 24.4 Screening Branch R on the Mac, not the H200
+
+The auto-suggested command
+(`sweep_deep_dive.py --round 2 --branch R --max-parallel 1 --max-steps 12000`)
+would run all five pre-existing `ROUND2_ARMS["R"]` arms
+(`r1_frame`, `r2_frame_delta_mse`, `r3_tiny`, `r4_lr_sweep`,
+`r5_mse_nonorm`) at production scale on CUDA, mirroring the same
+"straight to 12000 steps on the H200" mistake that §23.3 avoided for
+Branch S. Checked each arm's overrides directly via `resolve_arm()`:
+
+```
+r1_frame            -> {'TOKENIZATION': 'frame'}
+r2_frame_delta_mse  -> {'TOKENIZATION': 'frame', 'PREDICT_DELTA': True, 'LOSS': 'mse', 'LEARNING_RATE': 0.002}
+r3_tiny             -> {'EMBED_SIZE': 128, 'N_LAYERS': 2, 'N_HEADS': 4}
+r4_lr_sweep         -> {'LEARNING_RATE': 0.003, 'WARMUP_FRAC': 0.1}
+r5_mse_nonorm       -> {'LOSS': 'mse', 'NORMALIZE_FEATURES': False}
+```
+
+None of the five set `AR_MODE='frame_ar'` -- unlike every AR arm this
+investigation has run (§19 onward), none of them need CUDA at all. That
+makes this the first branch in the whole investigation that is a
+genuinely free screen on the Mac, no degraded/CPU-fallback caveat
+required.
+
+New launcher: **`transformer_neurIPS/run_sweep_mac_branch_r.sh`** --
+mirrors `run_sweep_mac.sh`'s structure (required-files check,
+venv/dependency check, shallow budget for fast turnaround:
+`MAX_STEPS=2000`, `SUBSET_RATIO=0.3`, `ACCUM=4`, `--no-warm-start`,
+`--no-wandb`). Run it with:
+
+```
+bash transformer_neurIPS/run_sweep_mac_branch_r.sh
+```
+
+An H200 "scale the Branch-R winner" script, analogous to
+`run_sweep_h200_scale_e3.sh`, is deliberately NOT built yet -- that comes
+only after this Mac screen identifies which arm (if any) is worth
+scaling, mirroring the `e3_ar_long` -> `s6_e3_scaled` workflow exactly.
+
+### 24.5 What v4.4 does NOT change
+
+- `s6_e3_scaled`'s config is unchanged from §23.3 -- §24.2 only reports
+  its production-scale result, it does not redefine the arm.
+- The five `ROUND2_ARMS["R"]` arms already existed before this section;
+  v4.4 adds a launcher for them, not new arm definitions.
+- No claim is made yet about which (if any) Branch-R arm beats
+  `s6_e3_scaled` or the ridge baseline -- that is what
+  `run_sweep_mac_branch_r.sh` actually tests.

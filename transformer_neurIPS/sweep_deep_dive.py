@@ -94,9 +94,12 @@ def classify(diag, results):
     reasons.append(f"best arm = {best_arm} at {best:+.2f}% vs persistence"
                    + (f"; control = {control:+.2f}%" if control is not None else ""))
 
-    lin = (diag or {}).get("linear_baseline", {}).get("improvement_pct")
+    # centroid-space (decoded m/s), NOT raw-latent -- this is the field that's
+    # apples-to-apples with `best`/`imp`, which are also centroid-space (see
+    # evaluate()'s IMPROV%). See linear_frame_baseline()'s docstring.
+    lin = (diag or {}).get("linear_baseline", {}).get("improvement_pct_centroid")
     if lin is not None:
-        reasons.append(f"ridge linear frame-map baseline = {lin:+.2f}%")
+        reasons.append(f"ridge linear frame-map baseline = {lin:+.2f}% (centroid space)")
 
     # THE SANITY FLOORS, checked before anything else is interpreted. A model that
     # cannot beat the best CONSTANT on its own training objective has learned
@@ -344,16 +347,25 @@ def render_report(run_dir, meta, diag, results, statuses):
         add("")
         lin = diag.get("linear_baseline", {})
         add("```")
+        add(f"[raw latent space, 470-dim -- NOT comparable to an arm's IMPROV%]")
         add(f"persistence MSE                = {lin.get('persistence_mse')}")
         add(f"ridge linear frame-map MSE     = {lin.get('linear_mse')}")
         add(f"linear improvement             = {_fmt(lin.get('improvement_pct'))}%")
         add(f"linear improvement, 1 frame    = {_fmt(lin.get('improvement_pct_frame1'))}%")
+        add("")
+        add(f"[decoded centroid velocity space, m/s -- apples-to-apples with IMPROV%]")
+        add(f"persistence MSE                = {lin.get('persistence_mse_centroid')}")
+        add(f"ridge linear frame-map MSE     = {lin.get('linear_mse_centroid')}")
+        add(f"linear improvement             = {_fmt(lin.get('improvement_pct_centroid'))}%")
+        add(f"linear improvement, 1 frame    = {_fmt(lin.get('improvement_pct_frame1_centroid'))}%")
         add(f"fit on                         = {lin.get('fit_transitions')} frame transitions")
         add("```")
-        add("This is the floor a competent model must clear. A ridge regression that "
-            "beats persistence while the transformer does not means the transformer is "
-            "broken. A ridge regression that also gets ~0% means persistence is simply "
-            "strong at this dt.")
+        add("The CENTROID figure is the floor a competent model must clear -- it is in "
+            "the same units evaluate() scores arms in (see `IMPROV%`/`roll MSE`/`pers "
+            "MSE` below). A ridge regression that beats persistence there while the "
+            "transformer does not means the transformer is broken. The raw-latent figure "
+            "above it is informational only: the decoder is a nonlinear map, so a raw-"
+            "latent improvement is not the same claim as a decoded-velocity improvement.")
         add("")
         fs = diag.get("feature_stats", {})
         if fs:
@@ -760,7 +772,9 @@ def main(argv=None):
                 diag = json.load(f)
             lin = diag.get("linear_baseline", {})
             log(f"diagnostics ok: linear baseline beats persistence by "
-                f"{lin.get('improvement_pct', float('nan')):+.2f}%")
+                f"{lin.get('improvement_pct_centroid', float('nan')):+.2f}% "
+                f"(centroid space; raw-latent was "
+                f"{lin.get('improvement_pct', float('nan')):+.2f}%)")
             bad = [n for n, p in (diag.get("model_probes") or {}).items()
                    if p.get("causal") is False]
             if bad:

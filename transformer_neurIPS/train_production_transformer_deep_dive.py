@@ -628,7 +628,12 @@ class Config:
     # OVERVIEW.md crosses a new major boundary (v4.x -> v5.0), not on
     # every point release. Kept in sync by
     # tests/test_version_sync.py.
-    WANDB_PROJECT = "NI_Review_v4"
+    WANDB_PROJECT = "NI_Review_v5"
+    # Set to a short label (e.g. "v5_stability") to have wandb group several
+    # concurrently-launched runs together in its UI (native multi-run
+    # comparison view) -- see OVERVIEW.md v5.0. None (default) omits the
+    # `group` kwarg entirely, unchanged single-run behaviour.
+    WANDB_GROUP = None
 
 
 # These fields define the v2.0 data/model shape and are deliberately not
@@ -937,6 +942,56 @@ ROUND2_ARMS = {
                                                  "AR_FRAMES": 8, "AR_SEQS": 2,
                                                  "AR_EVERY_N_STEPS": 2,
                                                  "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
+        },
+    },
+    # ---------------------------------------------------------------- branch V
+    "V": {
+        "title": "v5.0: is our best hope (h9_ar_freq1) actually stable, not just lucky",
+        "arms": {
+            # h9_ar_freq1 (h1_ar_freq2's config with AR-loss on EVERY step)
+            # is the best result in this whole investigation (+43.78% at
+            # 400 steps). Before scaling it further, each arm here changes
+            # exactly ONE stability-relevant knob against its exact config,
+            # so a failure pattern identifies WHICH axis is fragile, the
+            # same one-variable-at-a-time discipline as ROUND1_ARMS.
+            #
+            # NOTE ON SEED: a per-arm SEED override was deliberately NOT
+            # used here. `apply_arm()` runs before sweep_deep_dive.py's own
+            # CLI-args loop, which unconditionally does
+            # `setattr(Config, "SEED", args.seed)` whenever `--seed` is
+            # passed (always, for every sweep launch) -- so a SEED baked
+            # into an arm's `overrides` dict is silently clobbered back to
+            # the launcher's shared `--seed` value every time. A real seed-
+            # robustness check needs its own separate `--seed` launcher
+            # invocation, not a same-invocation arm override.
+            "v1_h9_wd": {"desc": "h9's exact config with weight decay 0.01 -> 0.05 -- an independent "
+                                 "regularisation axis from gradient clipping (v2), testing whether "
+                                 "damping weight growth improves consistency under AR-loss-every-step.",
+                         "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                       "AR_FRAMES": 8, "AR_SEQS": 2,
+                                       "AR_EVERY_N_STEPS": 1, "WEIGHT_DECAY": 0.05}},
+            "v2_h9_clip": {"desc": "h9's exact config with tighter gradient clipping (0.5 vs the "
+                                   "default 1.0) -- AR-loss every step means far more frequent "
+                                   "backprop through the AR loop than any prior arm; checks whether "
+                                   "a tighter clip damps any resulting instability without costing "
+                                   "the improvement.",
+                           "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                         "AR_FRAMES": 8, "AR_SEQS": 2,
+                                         "AR_EVERY_N_STEPS": 1, "GRAD_CLIP": 0.5}},
+            "v3_h9_moreseqs": {"desc": "h9's exact config with AR_SEQS 2->4 -- less gradient noise "
+                                       "per AR-loss application, same horizon/frequency. h5_ar_moreseqs "
+                                       "tested this at freq=8 without a clear benefit; worth "
+                                       "re-checking at freq=1 where AR gradient variance matters more.",
+                              "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                            "AR_FRAMES": 8, "AR_SEQS": 4,
+                                            "AR_EVERY_N_STEPS": 1}},
+            "v4_h9_lrlow": {"desc": "h9's exact config at half the peak LR (5e-4 vs 1e-3) -- gentler "
+                                    "optimisation under the most AR-gradient-dense regime tried yet; "
+                                    "checks whether consistency improves at the cost of some peak "
+                                    "improvement, the classic stability/speed tradeoff.",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 1, "LEARNING_RATE": 5e-4}},
         },
     },
     # ---------------------------------------------------------------- branch R
@@ -2016,7 +2071,7 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
 class _Telemetry:
     """wandb that cannot kill a 12-hour unattended run."""
 
-    def __init__(self, enabled, **kwargs):
+    def __init__(self, enabled, log=print, **kwargs):
         self.wandb = None
         self.run = None
         if not enabled:
@@ -2025,6 +2080,18 @@ class _Telemetry:
             import wandb
             self.wandb = wandb
             self.run = wandb.init(**kwargs)
+            url = None
+            try:
+                url = self.run.get_url()
+            except Exception:
+                pass
+            if url:
+                log(_bold(f"  [wandb] run: {url}", "cyan"))
+            else:
+                # Most commonly an offline run (WANDB_MODE=offline) or a
+                # backend that hasn't assigned a URL yet -- not an error,
+                # just nothing clickable to print.
+                log("  [wandb] run started (no URL available -- offline mode?)")
         except Exception as e:
             print(f"  [wandb] disabled ({type(e).__name__}: {e})", flush=True)
             self.run = None
@@ -3134,10 +3201,11 @@ def train(args, log=print):
         "regime.cudnn_benchmark": regime.cudnn_benchmark,
         "warm_started": warm_started,
     })
-    tel = _Telemetry(
-        not args.no_wandb, project=Config.WANDB_PROJECT,
-        name=wandb_run_name, id=run_name,
-        resume="allow", config=wandb_config)
+    _tel_kwargs = dict(project=Config.WANDB_PROJECT, name=wandb_run_name,
+                       id=run_name, resume="allow", config=wandb_config)
+    if getattr(Config, 'WANDB_GROUP', None):
+        _tel_kwargs["group"] = Config.WANDB_GROUP
+    tel = _Telemetry(not args.no_wandb, log=log, **_tel_kwargs)
 
     # Disable the SEQUENTIAL AR aux loss on MPS/CPU. Even at AR_SEQS=1, the
     # frame_ar loop under token tokenization does `AR_FRAMES * NUM_X`
@@ -3440,7 +3508,19 @@ def train(args, log=print):
                 "step", "train_loss", "val_tf_loss", "val_tf_mse", "rollout_mse",
                 "persistence_mse", "improvement_pct", "improvement_pct_frame1",
                 "improvement_pct_frame_last", "lr", "wall_seconds")})
-            tel.log({k: v for k, v in m.items() if not isinstance(v, list)})
+            # `improvement_pct_per_frame`/`rollout_mse_per_frame` are lists,
+            # so the scalar-only filter below drops them -- meaning wandb
+            # never saw the actual rollout SHAPE, only 3 fixed points
+            # (frame1/half/last). Sample every 8th frame as its own scalar
+            # key so wandb renders the curve as one line per sampled frame,
+            # growing over training -- this is what actually shows whether
+            # a run is stabilising or drifting, not just its final number.
+            wandb_payload = {k: v for k, v in m.items() if not isinstance(v, list)}
+            pf = m.get("improvement_pct_per_frame") or []
+            for i in range(0, len(pf), 8):
+                wandb_payload[f"frame_improvement/f{i:02d}"] = pf[i]
+            wandb_payload["rollout_rmse_mps"] = m["rollout_mse"] ** 0.5
+            tel.log(wandb_payload)
 
             log(f"  [eval] step {step}: val_tf={m['val_tf_loss']:.6f} "
                 f"rollout_mse={m['rollout_mse']:.6f} pers_mse={m['persistence_mse']:.6f} "

@@ -8,6 +8,67 @@ decode path is repointed at the scripted `autoencoderGEN3` model (see §Versioni
 
 ---
 
+## 0. Environment & replication quickstart
+
+Every `run_sweep_*.sh` launcher prints a startup check like this before
+training anything (captured verbatim from a real H300/CUDA run,
+`round2_20260903_013205`):
+
+```
+Checking required files...
+  [OK]      /workspace/cgan/transformer_neurIPS/train_production_transformer_deep_dive.py                   (204K)
+  [OK]      /workspace/cgan/transformer_neurIPS/model_variants.py                                           (36K)
+  [OK]      /workspace/cgan/transformer_neurIPS/sweep_deep_dive.py                                          (44K)
+  [OK]      /workspace/cgan/transformer_neurIPS/data/train_80.h5                                            (8.0G)
+  [OK]      /workspace/cgan/transformer_neurIPS/data/val_80.h5                                              (3.5G)
+  [OK]      /workspace/cgan/encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt (2.8M)
+
+Checking interpreter has the required packages (torch+cuda, h5py, numpy)...
+  [OK]     torch 2.14.0+cu130 cuda_available=True
+  [OK]     numpy 2.4.2
+  [OK]     h5py 3.15.1
+  [OK]     wandb 0.29.0
+```
+
+**This is illustrative, not a pin.** File sizes/byte counts drift as the
+code changes; exact torch/numpy/h5py/wandb versions depend on whatever the
+rented box's image shipped with (see `requirements_sweep.txt` for the
+minimal install list, not exact pins). The launcher checks *presence* and
+*CUDA availability*, not these specific version numbers.
+
+**Replicating in PyCharm**: if you're pointing PyCharm's remote deployment/
+interpreter at a box like this instead of running the launcher scripts by
+hand over SSH, the same six files above need to exist at those paths on
+the remote target, and PyCharm's configured remote Python interpreter
+needs `torch` (CUDA build), `h5py`, `numpy`, and (optionally)
+`wandb` importable -- `Settings > Project > Python Interpreter`, pointed
+at the remote venv shown in each launcher's own startup line (e.g.
+`/root/.virtualenvs/cgan/bin/python3` in the run above), not a local one.
+
+**Pulling results back**: every launcher writes into `sweep_logs/<run_id>/`
+(one folder per invocation: `UPLOAD_ME.md`, one `.log`/`.json` pair per
+arm) and `saved_models/` (checkpoints, `_status.json`, `_alerts.jsonl`).
+The `rsync` actually used throughout this investigation to pull both back
+at once, mid-run or after (harmless to run against a still-running sweep --
+see OVERVIEW.md §26.4's note on `_latest.pt` behaviour under a wall-clock-
+bounded run):
+
+```
+rsync -avP -e "ssh -p 11791 -i ~/.ssh/id_ed25519" \
+  root@195.26.233.156:/workspace/cgan/transformer_neurIPS/sweep_logs \
+  root@195.26.233.156:/workspace/cgan/transformer_neurIPS/saved_models \
+  /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/
+```
+
+The host, port, key path, and remote paths are specific to whichever box
+happens to be rented at the time -- copy the shape, not the literal
+values, for a different box. `-avP` (archive, verbose, partial/progress)
+makes repeated pulls of a growing/still-updating directory cheap: only
+changed or new bytes transfer each time, and an interrupted pull resumes
+rather than restarting.
+
+---
+
 ## 1. Layout
 
 Top-level files under `transformer_neurIPS/`:
@@ -3014,3 +3075,280 @@ the full 44-test suite.
 - The `DELTA_ANCHOR='ridge'` code path itself is not removed or reverted --
   it is a correct, tested, but empirically unproductive option, kept for
   the record (§26.2) rather than deleted.
+
+## 27. v4.7 -- explained the periodic CPU/GPU stalls, and made the fix the default for every sweep arm going forward
+
+### 27.1 Diagnosis: `torch.jit.script` + roundtrip verification, every 25 steps, unconditionally
+
+Observed on `s7_h9_scaled`'s run: long periods where both CPU and GPU sit
+idle, on hardware where "everything should be in memory." Traced to
+`save_checkpoint()` (train_production_transformer_deep_dive.py): every
+call also runs `save_scripted_model()` -- a real `torch.jit.script()`
+compile plus a full reload-and-forward-pass roundtrip verification,
+CPU-bound and single-threaded, with the GPU idle throughout. The trigger
+is `Config.CHECKPOINT_EVERY_STEPS = 25`, which is a SEPARATE cadence from
+`--val-every` (that only controls the expensive rollout eval) and was
+never exposed as a CLI flag at all -- it fires every 25 steps regardless
+of any launcher's settings. At `MAX_STEPS=2000` that's 80
+compile-plus-verify pauses over one run, on top of any `_train_best.pt`
+saves whenever train loss improves. Reasonable for a long overnight
+production run where checkpoint durability matters; a poor default for
+the shallow, throwaway screens this whole sweep-arm investigation runs.
+
+### 27.2 Fix: made the default going forward, in `sweep_deep_dive.py` itself, not per-launcher
+
+Rather than editing every `run_sweep_*.sh` script individually,
+`arm_command()` (the single place that builds every sweep arm's command
+line, used by every launcher) now always prepends two `--set` overrides:
+
+```
+SAVE_SCRIPTED_MODELS=False
+CHECKPOINT_EVERY_STEPS=<that run's --max-steps>
+```
+
+`SAVE_SCRIPTED_MODELS=False` skips the expensive compile+verify path
+entirely (the state-dict `.pt`, written unconditionally, is unaffected --
+still the authoritative artifact). `CHECKPOINT_EVERY_STEPS=<max_steps>`
+means the "latest" checkpoint only saves once, at the end (`hit_budget`
+still forces a final save regardless of the exact modulo alignment), not
+every 25 steps -- a short sweep arm doesn't need 80 intermediate
+checkpoints. An explicit `--set SAVE_SCRIPTED_MODELS=True` still wins if a
+caller genuinely wants a deployable scripted checkpoint from a specific
+sweep run: `arm_command()` puts the new defaults FIRST in the `--set`
+list, and the trainer's own `--set` loop applies overrides in order
+(last value for a given key wins), so anything a caller passes explicitly
+is guaranteed to be listed after these defaults and therefore takes
+precedence.
+
+**Also fixed while in this code, a real latent bug the above change would
+otherwise have collided with**: `arm_command()` was emitting one `--set`
+flag PER override item (`--set A=1 --set B=2`), but the trainer's
+`--set` uses `nargs="*"` without `action="append"` -- repeated
+occurrences of the same flag on one command line each RESET the parsed
+list rather than accumulate, so only the LAST `--set` survived. Any
+previous sweep invocation with more than one `--set` override in play
+would have silently dropped all but the last one. Fixed by emitting a
+SINGLE `--set` flag followed by every value, space-separated, matching
+`nargs="*"`'s actual contract.
+
+### 27.3 Wall-clock kill-switch tightened to 15 minutes by default
+
+`sweep_deep_dive.py --max-hours` (a stuck-job safety net, separate from
+`--max-steps`/`--val-every` -- not a duration estimate) defaulted to 12.0
+hours, appropriate for a long unattended production run but needlessly
+loose for the shallow, time-boxed screens this tool is actually used for
+now. Default changed to 0.25 (15 minutes). `run_sweep_h300_scale_h9.sh`'s
+own `MAX_HOURS` default updated to match (0.25, was 0.75) rather than
+relying on the central default implicitly drifting out of sync with what
+the launcher prints.
+
+Verified: `arm_command()` exercised directly -- confirms exactly one
+`--set` flag is emitted, the two new defaults appear in it, and an
+explicit user override placed after them in `args.set` correctly appears
+last in the emitted command (confirming last-value-wins precedence holds
+end to end, not just in isolation); the trainer's own `build_parser()`
+correctly parses that combined multi-value `--set` flag; `bash -n` on the
+updated launcher; and the full 44-test suite.
+
+### 27.4 What v4.7 does NOT change
+
+- No arm definitions changed -- this is infrastructure only.
+- `SAVE_SCRIPTED_MODELS`/`CHECKPOINT_EVERY_STEPS` defaults in `Config`
+  itself (`True`/`25`) are unchanged -- the override happens at the
+  sweep-launch layer (`arm_command()`), not in `Config`, so a direct
+  invocation of the trainer outside `sweep_deep_dive.py` (e.g. a real
+  production run) keeps its original durability behaviour untouched.
+
+## 28. v5.0 -- major version bump: is our best hope (h9_ar_freq1) actually stable?
+
+Crossing a major version boundary (v4.x -> v5.0) per the WANDB_PROJECT
+convention (OVERVIEW.md §21.1) -- `Config.WANDB_PROJECT` renamed
+`NI_Review_v4` -> `NI_Review_v5`, kept in sync by `test_version_sync.py`.
+
+### 28.1 Why now: h9_ar_freq1 is the best result so far, but "best" isn't the same claim as "stable"
+
+Every prior round asked "does this arm beat persistence." This round asks
+a different question: does the BEST arm found so far (`h9_ar_freq1`,
++43.78% at 400 steps, §26.1) hold up under small, independent
+perturbations, or is it a narrow, fragile optimum that a slightly
+different regularisation/LR/batch setting would break? Four arms, each
+changing exactly one stability-relevant axis against `h9`'s exact
+config, same one-variable-at-a-time discipline as `ROUND1_ARMS`:
+
+```
+v1_h9_wd         weight decay 0.01 -> 0.05   (regularisation)
+v2_h9_clip       gradient clip 1.0 -> 0.5    (backprop magnitude control)
+v3_h9_moreseqs   AR_SEQS 2 -> 4              (AR-gradient noise reduction)
+v4_h9_lrlow      LR 1e-3 -> 5e-4             (optimisation aggressiveness)
+```
+
+A per-arm SEED override was deliberately NOT used as a 5th/replacement
+axis: `apply_arm()` runs before `sweep_deep_dive.py`'s own CLI-args loop,
+which unconditionally does `setattr(Config, "SEED", args.seed)` whenever
+`--seed` is passed (always, for every sweep launch) -- a `SEED` baked
+into an arm's `overrides` dict would be silently clobbered back to the
+launcher's shared `--seed` value every time. A real seed-robustness check
+needs its own separate `--seed` launcher invocation, not a same-invocation
+arm override; not attempted this round given the time budget.
+
+### 28.2 Wall-clock IS the real budget mechanism, not step count
+
+Confirmed directly in the trainer's own training loop:
+`if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS: ... break` --
+`--max-hours` is a real, enforced stop condition checked every step, not
+just an external supervisory kill-switch. New launcher
+**`run_sweep_h300_v5_stability.sh`** uses this as the ACTUAL budget:
+`--max-steps 100000` (high enough to never bind first) with `--max-hours`
+set from measured GPU count:
+
+```
+4+ GPUs  -> --max-parallel 4 --max-hours 0.25     (15 min, all 4 truly simultaneous)
+<4 GPUs  -> --max-parallel 1 --max-hours 0.0833   (5 min each, sequential, ~20 min total)
+```
+
+One side effect worth knowing: with `CHECKPOINT_EVERY_STEPS` defaulted to
+`--max-steps` (v4.7's fix) and a wall-clock-bounded run stopping at a step
+count far below that, the generic "_latest.pt" snapshot never actually
+saves (its modulo condition is never hit, and `hit_budget` -- gated on
+`step >= MAX_STEPS` -- never fires either). `_best.pt`/`_rollout_best.pt`
+still save normally, since those are gated on `VAL_EVERY_STEPS`, not
+`CHECKPOINT_EVERY_STEPS`. The run's numbers and per-frame curves are
+unaffected either way -- `curves`/`results.json`/`UPLOAD_ME.md` are built
+from in-memory eval history and wandb telemetry, not from re-reading a
+saved checkpoint.
+
+### 28.3 Richer wandb telemetry: the rollout SHAPE, not just 3 fixed points
+
+`evaluate()` has always computed the full per-frame improvement curve
+(`improvement_pct_per_frame`, up to 68 values), but the eval-time wandb
+log call explicitly filtered out list-typed values -- so only
+`improvement_pct_frame1`/`_frame_half`/`_frame_last` (3 fixed points) ever
+reached wandb; the actual curve shape was invisible there, even though
+every printed `UPLOAD_ME.md` report has shown it all along. Fixed: every
+8th frame is now also logged as its own scalar key
+(`frame_improvement/f00`, `f08`, `f16`, ...), plus `rollout_rmse_mps`
+(the same quantity the promotion gate's sanity ceiling checks). Each
+becomes its own line in wandb, growing over training -- this is what
+actually shows whether a run's rollout is stabilising toward a shape like
+`h9`'s (positive from frame ~17, plateauing ~55-59%) or drifting/oscillating,
+not just its final aggregate number.
+
+### 28.4 `WANDB_GROUP`: four runs, one coloured comparison view
+
+New `Config.WANDB_GROUP` (default `None`, no behaviour change unless
+set) is passed to `wandb.init(group=...)` when set. The launcher sets it
+to `"v5_stability"`, so wandb's native multi-run comparison view groups
+all four arms together -- each gets its own auto-assigned colour across
+every shared chart (loss curves, rollout MSE, the new per-frame lines,
+grad norm), rather than needing to be found and manually overlaid as four
+separate runs.
+
+### 28.4a Console convenience: the run's wandb URL is now printed at start
+
+`_Telemetry.__init__` now calls `self.run.get_url()` right after
+`wandb.init()` succeeds and prints it (bold cyan, via the file's existing
+`_bold`/color helpers) as `[wandb] run: <url>` -- one line per arm, so
+each of the 4 concurrent (or sequential) runs' dashboard link is visible
+directly in that arm's own console/log output instead of having to hunt
+for it in the wandb UI. Falls back to a plain "no URL available (offline
+mode?)" message if `get_url()` raises or returns nothing, rather than
+erroring -- purely a convenience addition, no change to whether/how
+tracking happens.
+
+**File upload check for this run** -- if data/the scripted decoder are
+already on the box, only these need re-syncing:
+- `transformer_neurIPS/train_production_transformer_deep_dive.py` (new `V` branch arms, `WANDB_PROJECT`/`WANDB_GROUP`, richer wandb payload, printed run URL)
+- `transformer_neurIPS/sweep_deep_dive.py` (if v4.7's `--max-hours`/`--set` fix isn't already synced)
+- `transformer_neurIPS/run_sweep_h300_v5_stability.sh` (new file)
+
+`model_variants.py` is unchanged for this round.
+
+Verified: `resolve_arm()` on all four new arms; a `_Telemetry` smoke test
+with a mocked `wandb` module confirming the URL prints correctly and the
+offline/no-URL fallback doesn't raise; `py_compile` on all three
+touched Python files; `bash -n` on the new launcher; the full 44-test
+suite, including `test_version_sync.py` against this section's own
+heading.
+
+### 28.5 What v5.0 does NOT change
+
+- `h1_ar_freq2` through `s7_h9_scaled` are unchanged -- Branch V is an
+  addition.
+- No claim is made yet about which (if any) of the four stability arms
+  actually helps -- that's what `run_sweep_h300_v5_stability.sh` tests.
+- `SAVE_SCRIPTED_MODELS=False`/`CHECKPOINT_EVERY_STEPS=<max_steps>` (v4.7)
+  still apply here via `arm_command()`'s defaults, on top of
+  `--skip-diagnostics` (this round doesn't need the ridge map) and the new
+  `--max-hours`-as-real-budget usage -- all compounding to keep these four
+  short, wall-clock-bounded runs as cheap and fast as possible.
+
+### 28.6 First launch invalidated: `--max-steps 100000` broke the LR warmup schedule
+
+The first real launch of `run_sweep_h300_v5_stability.sh` (`round2_20260903_011512`)
+produced results that had to be discarded. `v1_h9_wd` and `v2_h9_clip`
+both showed catastrophic, much-worse-than-`h9`-ever-showed numbers (train
+loss above the zero-predictor floor for ~100 steps, rollout `IMPROVEMENT`
+still deeply negative -- -649% and -3321% respectively -- when the 5-minute
+wall-clock cutoff hit at step ~325-350). Root cause, confirmed by
+comparing LR values step-by-step against `h9_ar_freq1`'s own successful
+log: `Config.WARMUP_FRAC = 0.03` sizes the LR warmup as a fraction of
+`Config.MAX_STEPS`. `h9`'s own run used `MAX_STEPS=400` -> a 12-step
+warmup, reaching peak LR (~1e-3) by step ~25. This launcher's first
+version set `--max-steps 100000` (meant to guarantee `--max-hours` was the
+binding constraint) -> a 3000-step warmup. A 5-minute wall-clock budget
+only completes ~300-350 steps at this arm family's throughput, so every
+arm spent its entire budget at roughly 1/10th peak LR, still deep in
+warmup -- the catastrophic numbers were an LR-schedule artifact, not a
+real stability signal. The run was killed before `v3`/`v4` could hit the
+same bug, and all four arms' results from this run are discarded, not
+interpreted.
+
+Fixed: `--max-steps` is now sized realistically (360 for the sequential/
+5-min-each path, 1090 for the 4+-GPU/15-min-simultaneous path) from
+`h9_ar_freq1`'s own measured throughput, so `WARMUP_FRAC` produces a
+warmup length matched to a run actually expected to finish near that
+budget. `--max-hours` is kept as what it was always meant to be -- a
+safety net for an individual arm's throughput running slower than
+estimated (e.g. `v3_h9_moreseqs`'s `AR_SEQS=4` costs more per step than
+the other three) -- not the primary pacing mechanism.
+
+**Also discovered from the same run's logs**: `wandb` was disabled the
+entire time (`UsageError: No API key configured`) -- none of §28.3/28.4's
+richer telemetry or grouped comparison view was actually recorded for
+this run. Run `wandb login` (or set `WANDB_API_KEY`) on the box before
+the next launch, or the coloured multi-run comparison this section was
+built for won't have any data to show.
+
+Verified: `bash -n` on the corrected launcher; the full 44-test suite
+(unaffected -- this was a launcher-level pacing bug, not a change to
+`Config` defaults or arm definitions).
+
+### 28.7 Real results: `h9_ar_freq1` is stable, not fragile
+
+The corrected launch (`round2_20260903_013205`, ~5 minutes/arm, GPU
+uncontended after §28.6's kill/cleanup) completed cleanly:
+
+```
+v3_h9_moreseqs (AR_SEQS 2->4)      +46.49%   <- best, beats h9 itself
+v2_h9_clip     (clip 1.0->0.5)     +42.45%
+v1_h9_wd       (WEIGHT_DECAY 0.01->0.05)  +42.14%
+v4_h9_lrlow    (LR 1e-3->5e-4)     +41.52%
+                             h9_ar_freq1 baseline (400 steps): +43.78%
+```
+
+All four land within a ~5-point band of baseline across four independent
+perturbations (5x weight decay, halved gradient clip, doubled AR
+sequences, halved LR) -- exactly the signature of a real, robust result
+rather than a fragile optimum. Per-frame shapes are consistent across all
+four too: crossing positive around frame 14-17, plateauing in the
+mid-to-high 50s% by frame 40+. `v3_h9_moreseqs` (more AR sequences per
+AR-loss application, reducing gradient variance) not only held up but
+edged out `h9` itself -- the same hypothesis `h5_ar_moreseqs` tested at
+`freq=8` without a clear benefit (§25.4) now shows a real, if modest,
+gain at `freq=1`, where AR-gradient variance matters more.
+
+**Conclusion**: `h9_ar_freq1`'s win is real and stable, not a fragile
+optimum sensitive to nearby hyperparameter choices. The natural next step
+is scaling the best-of-the-stable-set (`v3_h9_moreseqs`'s config) to
+production, the same pattern as `e3_ar_long -> s6_e3_scaled` and
+`h1_ar_freq2 -> h9_ar_freq1 -> s7_h9_scaled`.

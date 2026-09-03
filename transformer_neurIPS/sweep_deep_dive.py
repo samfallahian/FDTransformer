@@ -32,6 +32,7 @@ wall time is recorded as an observation rather than used as the budget.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -605,6 +606,32 @@ def run_concurrent(arms, args, run_dir, round_no, gpus, log):
     running = {}          # arm -> (Popen, file handle, gpu, t0)
     statuses = {}
     launched = 0
+    # Each arm's wandb URL only exists in its own per-arm log file
+    # (subprocess stdout, redirected via `fh` above) -- surface it up to
+    # THIS supervisor's console too, once each, so it's visible without
+    # having to separately open every arm's log file.
+    wandb_reported = set()
+
+    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+
+    def _surface_wandb_url(arm, path):
+        if arm in wandb_reported:
+            return
+        try:
+            with open(path) as f:
+                for line in f:
+                    if "[wandb] run:" in line:
+                        # The arm's own line is colour-wrapped for its
+                        # per-arm log file -- strip that before re-printing
+                        # it here, so THIS console's own colouring (if any)
+                        # isn't fighting embedded ANSI codes from the
+                        # child's output.
+                        url = ansi_re.sub("", line.split("[wandb] run:", 1)[1]).strip()
+                        log(f"[wandb] {arm}: {url}")
+                        wandb_reported.add(arm)
+                        return
+        except OSError:
+            pass
 
     while pending or running:
         while pending and len(running) < args.max_parallel:
@@ -629,6 +656,7 @@ def run_concurrent(arms, args, run_dir, round_no, gpus, log):
 
         for arm in list(running):
             proc, fh, gpu, t0 = running[arm]
+            _surface_wandb_url(arm, fh.name)
             rc = proc.poll()
             if rc is None:
                 continue

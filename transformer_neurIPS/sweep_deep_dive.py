@@ -570,8 +570,32 @@ def arm_command(arm, args, run_dir, round_no):
         cmd += ["--batch-size", str(args.batch_size)]
     if args.accum:
         cmd += ["--accum", str(args.accum)]
-    for s in args.set:
-        cmd += ["--set", s]
+    # Default overrides for every sweep arm, going forward (OVERVIEW.md
+    # v4.6/v4.7): scripted-model export (torch.jit.script + a full reload +
+    # forward-pass roundtrip verification) and the "latest" checkpoint both
+    # fire every Config.CHECKPOINT_EVERY_STEPS=25 steps by default -- fine
+    # for a long overnight run where durability matters, but on a short
+    # shallow screen it means dozens of multi-second CPU-bound compile+
+    # verify pauses (GPU idle throughout) eating into the wall-clock budget
+    # for no benefit this tool needs. Disabled here; a caller that actually
+    # wants a deployable scripted checkpoint from a specific run can still
+    # get one by passing an explicit --set SAVE_SCRIPTED_MODELS=True (listed
+    # after these defaults below, so it wins -- the trainer's --set loop is
+    # last-value-wins).
+    #
+    # These are passed as ONE --set flag with all values space-separated,
+    # not one --set flag per item: the trainer's `--set` uses
+    # `nargs="*"` (not `action="append"`), so repeated --set flags on one
+    # command line each RESET the list rather than accumulate -- passing
+    # them separately would have silently dropped everything but the last
+    # override every time more than one was in play.
+    default_overrides = [
+        "SAVE_SCRIPTED_MODELS=False",
+        f"CHECKPOINT_EVERY_STEPS={args.max_steps}",
+    ]
+    all_overrides = default_overrides + list(args.set)
+    if all_overrides:
+        cmd += ["--set"] + all_overrides
     return cmd
 
 
@@ -652,7 +676,11 @@ def build_parser():
                    help="explicit arm list, overriding --round/--branch")
     p.add_argument("--max-parallel", type=int, default=5)
     p.add_argument("--max-steps", type=int, default=6000)
-    p.add_argument("--max-hours", type=float, default=12.0)
+    # Was 12.0 -- a needlessly loose stuck-job safety net for the shallow,
+    # time-boxed screens this tool is actually used for (see OVERVIEW.md
+    # v4.6/v4.7). Still just a kill-switch, not an expected duration -- a
+    # healthy arm finishes its --max-steps budget long before this fires.
+    p.add_argument("--max-hours", type=float, default=0.25)
     p.add_argument("--val-every", type=int, default=400)
     p.add_argument("--rollout-seqs", type=int, default=64)
     p.add_argument("--subset-ratio", type=float, default=1.0)

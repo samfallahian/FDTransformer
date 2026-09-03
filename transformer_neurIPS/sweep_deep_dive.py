@@ -495,9 +495,9 @@ def render_report(run_dir, meta, diag, results, statuses):
         if cfg:
             shown = {k: cfg.get(k) for k in (
                 "VARIANT", "TOKENIZATION", "EMBED_SIZE", "N_LAYERS", "N_HEADS",
-                "PREDICT_DELTA", "NORMALIZE_FEATURES", "USE_ROPE", "NOISE_STD",
-                "AR_MODE", "AR_LOSS_WEIGHT", "AR_FRAMES", "AR_FEEDBACK_NOISE_STD",
-                "LOSS", "LEARNING_RATE",
+                "PREDICT_DELTA", "DELTA_ANCHOR", "NORMALIZE_FEATURES", "USE_ROPE",
+                "NOISE_STD", "AR_MODE", "AR_LOSS_WEIGHT", "AR_FRAMES",
+                "AR_FEEDBACK_NOISE_STD", "LOSS", "LEARNING_RATE",
                 "DROPOUT", "WEIGHT_DECAY", "BATCH_SIZE", "ACCUMULATION_STEPS")}
             add(f"- **config**: `{shown}`")
         st = statuses.get(name)

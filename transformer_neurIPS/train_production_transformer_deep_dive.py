@@ -517,6 +517,16 @@ class Config:
     ATTN_IMPL = 'sdpa'         # sdpa (causal by construction) | mha_hint (old, leaky)
     USE_ROPE = False
     PREDICT_DELTA = False
+    # 'persistence' (default): the network's residual anchor is the previous
+    # frame's same-x value, i.e. _delta_anchor(). 'ridge': the anchor is the
+    # fitted ridge frame-map's prediction instead (see linear_frame_baseline()
+    # and BaseTransformer._ridge_anchor()) -- a strictly stronger baseline
+    # (+69% vs persistence in the same decoded-velocity space, OVERVIEW.md
+    # v4.5), tested on the theory that predicting the residual on top of an
+    # already-good linear predictor needs less capacity than rediscovering it
+    # from scratch. Only takes effect when PREDICT_DELTA is also True.
+    DELTA_ANCHOR = 'persistence'
+    RIDGE_MAP_PATH = os.path.join(CHECKPOINT_DIR, "ridge_frame_map.pt")
     NORMALIZE_FEATURES = True
     USE_META_COLS = True       # False zeroes the (x, y, z, t, param) input columns
 
@@ -721,6 +731,22 @@ ROUND2_ARMS = {
                              "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
                                            "AR_FRAMES": 8, "AR_SEQS": 2,
                                            "AR_EVERY_N_STEPS": 8, "MAX_STEPS": 12000}},
+            "s7_h9_scaled": {"desc": "h9_ar_freq1's EXACT winning config (OVERVIEW.md v4.6, "
+                                     "+43.78% vs persistence at 400 steps, beating both "
+                                     "e3_ar_long and s6_e3_scaled) at a longer step budget. "
+                                     "h9 is h1_ar_freq2's config (AR horizon 8, AR_SEQS 2) with "
+                                     "AR-loss applied on EVERY step (AR_EVERY_N_STEPS=1) -- the "
+                                     "most expensive AR frequency tried, so unlike s6_e3_scaled "
+                                     "no MAX_STEPS is baked in here: the right budget depends on "
+                                     "how much wall-clock is actually available on the box "
+                                     "running it, so run_sweep_h300_scale_h9.sh's own default "
+                                     "(sized for a real time budget, not a fixed convention) "
+                                     "controls it -- a launcher's --max-steps always wins over "
+                                     "an arm's own value regardless, per apply_arm()'s 'CLI "
+                                     "beats the arm' rule.",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 1}},
         },
     },
     # ---------------------------------------------------------------- branch D
@@ -815,6 +841,102 @@ ROUND2_ARMS = {
                                                    "AR_FRAMES": 14, "AR_SEQS": 2,
                                                    "AR_EVERY_N_STEPS": 16,
                                                    "AR_FEEDBACK_NOISE_STD": 5e-3}},
+        },
+    },
+    # ---------------------------------------------------------------- branch H
+    "H": {
+        "title": "AR-mode is the only mechanism that has ever won -- search around it wide, in parallel",
+        "arms": {
+            # e3_ar_long (AR_FRAMES=8, AR_SEQS=2, AR_EVERY_N_STEPS=8) is the
+            # only arm in this whole investigation to post a positive rollout
+            # improvement, and it beat the longer-horizon a4b_ar_very_long
+            # (14 frames) at a shallow 2000-step budget purely because it got
+            # AR-loss applied twice as often (every 8 steps vs every 16) --
+            # see OVERVIEW.md 23.2. Every arm here is a variation ON e3's
+            # config, not a fresh hypothesis -- this is a wide, one-shot,
+            # highly parallel search around the one mechanism that has
+            # actually worked, meant to run in a single sweep invocation on
+            # a fast box (H100/H200/B200/H300-class) rather than one arm at
+            # a time.
+            "h1_ar_freq2": {"desc": "e3's 8-frame horizon at 4x its AR-loss frequency (every 2 steps).",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 2}},
+            "h2_ar_freq4": {"desc": "e3's 8-frame horizon at 2x its AR-loss frequency (every 4 steps).",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 4}},
+            "h3_ar_short_freq4": {"desc": "Shorter horizon (4 frames) at high frequency (every 4 steps) -- "
+                                          "brackets e3 from below.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                "AR_FRAMES": 4, "AR_SEQS": 2,
+                                                "AR_EVERY_N_STEPS": 4}},
+            "h4_ar_long_freq4": {"desc": "a4b_ar_very_long's 14-frame horizon, but at e3's proven-better "
+                                         "frequency band instead of a4b's every-16-steps -- tests "
+                                         "whether a4b only lost because it was under-applied, per "
+                                         "OVERVIEW.md 23.2's explanation, not because 14 frames is worse.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                "AR_FRAMES": 14, "AR_SEQS": 2,
+                                                "AR_EVERY_N_STEPS": 4}},
+            "h5_ar_moreseqs": {"desc": "e3's config with AR_SEQS=8 instead of 2 -- less gradient noise per "
+                                       "AR-loss application, same horizon/frequency.",
+                               "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                             "AR_FRAMES": 8, "AR_SEQS": 8,
+                                             "AR_EVERY_N_STEPS": 8}},
+            "h6_ar_fbnoise": {"desc": "e3's config plus noise on the fed-back prediction during the AR loop "
+                                      "-- practice on a noisy version of its own errors, not just the "
+                                      "clean rollout.",
+                              "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                            "AR_FRAMES": 8, "AR_SEQS": 2,
+                                            "AR_EVERY_N_STEPS": 8,
+                                            "AR_FEEDBACK_NOISE_STD": 5e-3}},
+            "h7_ar_wd": {"desc": "e3's config plus heavier regularisation (weight decay 0.1, dropout "
+                                 "0.05) -- damp amplifying modes on top of AR training instead of "
+                                 "instead of it.",
+                         "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                       "AR_FRAMES": 8, "AR_SEQS": 2,
+                                       "AR_EVERY_N_STEPS": 8,
+                                       "WEIGHT_DECAY": 0.1, "DROPOUT": 0.05}},
+            "h8_ar_lrlow": {"desc": "e3's config at half the peak LR -- r4_lr_sweep (Branch R) showed "
+                                    "aggressive LR causes catastrophic rollout divergence WITHOUT AR "
+                                    "training; checks whether AR training is more or less LR-sensitive.",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 8,
+                                          "LEARNING_RATE": 5e-4}},
+            # h1_ar_freq2 (AR_EVERY_N_STEPS=2) beat every other arm in this
+            # branch outright (+41.90% at only 400 steps, still climbing) --
+            # frequency was the single dominant lever across the whole grid,
+            # monotonically: freq8 arms all negative, freq4 arms near
+            # breakeven, freq2 the clear winner. h9 is the direct
+            # extrapolation of that trend to its limit (AR loss every step);
+            # h10 tests an orthogonal idea on top of h1's exact config: the
+            # ridge regression beats persistence by +69% (OVERVIEW.md v4.5) in
+            # the same units the model is scored in, so predicting the
+            # RESIDUAL on top of that map instead of on top of raw
+            # persistence should need less capacity spent re-deriving
+            # something already solved in closed form. Needs diagnostics to
+            # have run first in this sweep invocation (writes
+            # Config.RIDGE_MAP_PATH) -- do not pass --skip-diagnostics on a
+            # run that includes h10.
+            "h9_ar_freq1": {"desc": "h1_ar_freq2's winning config (AR horizon 8, AR_SEQS 2) taken to "
+                                    "AR-loss EVERY step -- the direct extrapolation of the "
+                                    "freq8->freq4->freq2 trend, all of which favoured more frequent "
+                                    "application.",
+                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                          "AR_FRAMES": 8, "AR_SEQS": 2,
+                                          "AR_EVERY_N_STEPS": 1}},
+            "h10_ridge_residual": {"desc": "h1_ar_freq2's exact config plus PREDICT_DELTA with "
+                                           "DELTA_ANCHOR='ridge': the network predicts the residual on "
+                                           "top of the fitted ridge frame-map's prediction instead of on "
+                                           "top of raw persistence -- an architectural change, not a "
+                                           "hyperparameter tweak. Requires this sweep's diagnostics step "
+                                           "to have run (fits and saves the ridge map to "
+                                           "Config.RIDGE_MAP_PATH before any arm trains).",
+                                   "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                 "AR_FRAMES": 8, "AR_SEQS": 2,
+                                                 "AR_EVERY_N_STEPS": 2,
+                                                 "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
         },
     },
     # ---------------------------------------------------------------- branch R
@@ -1416,7 +1538,8 @@ def null_baselines(data, cfg, frame_level=False, max_seqs=256):
 
 @torch.no_grad()
 def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
-                          max_train_seqs=4000, chunk=128, log=print):
+                          max_train_seqs=4000, max_val_seqs=2500, chunk=128,
+                          val_chunk=None, log=print):
     """Ridge-fit frame(t) -> frame(t+1) linear map, rolled out like the model.
 
     This is the anchor that tells you whether the TASK has learnable temporal
@@ -1449,6 +1572,28 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
         `evaluate()` does, so this is the one that is actually comparable to
         an arm's `IMPROV%`. `sweep_deep_dive.py`'s Branch-R classifier uses
         this field, not the raw-latent one.
+
+    `max_val_seqs` caps how many validation sequences the ROLLOUT (not the
+    ridge fit) is scored against -- this is the dominant cost since the
+    centroid decode above runs the frozen decoder 3x per chunk over the full
+    rollout horizon. Scoring against all of val (25k+ sequences here) is
+    overkill for a floor/anchor estimate: an arm's own `IMPROV%` is scored
+    against only `cfg.VAL_ROLLOUT_SEQS` (64 by default) sequences, so 2500 is
+    already ~40x more than that while still being ~1/10th of the full
+    validation set's cost.
+
+    `val_chunk` (default: `max_val_seqs`, i.e. one single batch) controls
+    how the capped validation population is split for the rollout loop.
+    The rollout's inner loop over `n_frames` (~68) is inherently sequential
+    Python, so chunking here multiplies that loop's CPU-dispatch overhead
+    by the chunk count for no benefit once the total population is already
+    small -- with `max_val_seqs=2500` and the old default `chunk=128` this
+    meant ~20 chunks x 68 sequential steps = ~1360 tiny GPU calls, which
+    shows up as CPU pegged and GPU mostly idle (real GPU work, but each
+    call too small to amortise its own dispatch cost). Defaulting to one
+    big batch collapses that to a single chunk's worth of overhead. Pass a
+    smaller `val_chunk` explicitly only if `max_val_seqs` is raised high
+    enough to risk an out-of-memory error in one batch.
     """
     NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
     D = NX * LD
@@ -1478,6 +1623,14 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
     A = torch.linalg.solve(XtX + reg, XtY)     # (D+1, D)
     log(f"  [linear] fit on {rows:,} frame transitions from {n_fit:,} sequences")
 
+    save_path = getattr(cfg, 'RIDGE_MAP_PATH', None)
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save({"A": A.float().cpu(), "D": D, "NX": NX, "LD": LD,
+                    "ridge": ridge, "fit_transitions": rows}, save_path)
+        log(f"  [linear] ridge map saved -> {save_path} "
+            f"(for DELTA_ANCHOR='ridge' arms)")
+
     ctx = cfg.VAL_CONTEXT_STEPS
     n_frames = NT - ctx
     se_lin = torch.zeros(n_frames, dtype=torch.float64)
@@ -1485,8 +1638,10 @@ def linear_frame_baseline(train_data, val_data, cfg, device, ridge=1e-3,
     se_lin_c = torch.zeros(n_frames, dtype=torch.float64)
     se_pers_c = torch.zeros(n_frames, dtype=torch.float64)
     count = 0
-    for start in range(0, val_data.shape[0], chunk):
-        b = val_data[start:start + chunk].to(solve_device, non_blocking=True)
+    n_val = min(val_data.shape[0], max_val_seqs)
+    vchunk = n_val if val_chunk is None else val_chunk
+    for start in range(0, n_val, vchunk):
+        b = val_data[start:start + vchunk].to(solve_device, non_blocking=True)
         B = b.shape[0]
         f = b[..., :LD].reshape(B, NT, D).double()
         cur = f[:, ctx - 1]                                   # last context frame

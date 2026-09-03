@@ -2703,3 +2703,314 @@ scaling, mirroring the `e3_ar_long` -> `s6_e3_scaled` workflow exactly.
 - No claim is made yet about which (if any) Branch-R arm beats
   `s6_e3_scaled` or the ridge baseline -- that is what
   `run_sweep_mac_branch_r.sh` actually tests.
+
+## 25. v4.5 -- the ridge-baseline metric was apples-to-oranges, Branch R reconfirmed exposure bias, and a real winner emerged
+
+### 25.1 The ridge baseline's "+60.64%" was measured in the wrong metric space
+
+`linear_frame_baseline()`'s rollout was already correctly autoregressive
+(it feeds its own prediction back in for the full horizon, exactly like an
+arm's rollout eval) -- but it scored that rollout in raw 470-dim LATENT
+space, while every arm's `IMPROV%`/`roll MSE`/`pers MSE` are scored in
+DECODED CENTROID VELOCITY space (m/s), per `evaluate()`'s own comment
+("space (m/s), not raw latent space"). The persistence-MSE figures from
+the two code paths differed by ~8x (0.00035 raw-latent vs 0.0028
+decoded-centroid) confirming they were never comparable numbers.
+
+Fixed by adding a second computation inside the same rollout loop: decode
+predictions, ground truth, and the persistence anchor through
+`decode_centroid()` before scoring, exactly mirroring `evaluate()`.
+`linear_frame_baseline()` now returns both `improvement_pct` (raw latent,
+informational only) and `improvement_pct_centroid` (apples-to-apples with
+every arm's `IMPROV%`). `sweep_deep_dive.py`'s Branch-R classifier and
+report now both use the centroid figure.
+
+**Fixing the metric made the gap WORSE, not better**: the corrected ridge
+improvement is **+69.49%**, higher than the uncorrected +60.64%. The
+original Branch-R concern was not a measurement artifact -- it understated
+the problem.
+
+### 25.2 Branch R, run for real: exposure bias reconfirmed a 9th time, one new failure mode found
+
+`run_sweep_mac_branch_r.sh`'s 5 arms (`r1_frame`, `r2_frame_delta_mse`,
+`r3_tiny`, `r4_lr_sweep`, `r5_mse_nonorm`) ran on H200-class CUDA hardware
+(not the Mac -- box availability changed the plan, no correctness impact
+since none use `AR_MODE='frame_ar'`), 2000 steps, full data:
+
+```
+arm                 IMPROV%        train beats anchor?
+r5_mse_nonorm         -8.53%        NO   (close to persistence in aggregate;
+                                          genuinely +20 to +29% from frame ~33 on)
+r4_lr_sweep         -1608.63%       yes  (near-zero train loss, catastrophic rollout)
+r1_frame           -29,007.32%      yes
+r3_tiny            -40,054.16%      yes
+r2_frame_delta_mse -10,013,628.49%  yes  (literal explosion: roll MSE=284,
+                                          target std~0.017, never recovers)
+```
+
+4 of 5 arms beat the training-objective anchor (one-step prediction) yet
+catastrophically diverge on the real 68-frame rollout -- textbook exposure
+bias, independent of tokenization, model size, learning rate, or
+objective. This is the 9th time in this investigation that a
+non-AR-mode architecture/objective change has failed to fix rollout
+divergence (a1/a2/d1-d5/f1-f5/r1-r5/a3b/etc.) -- see §18-24 for the prior
+8. `e3_ar_long`/`s6_e3_scaled` remain the only arms to ever post a
+positive rollout result, and remain the only ones using `AR_MODE='frame_ar'`.
+
+### 25.3 Two speedups to the diagnostics step
+
+`run_diagnostics()`'s linear-baseline computation got two performance
+fixes after real runs showed it dominating wall-clock time (11-30+ minutes
+on top of the arms themselves):
+
+1. **`max_val_seqs` cap** (default 2500): the rollout was scoring against
+   the FULL validation set (25,410 sequences) with the new centroid decode
+   (§25.1) running 3x per chunk over the full horizon -- ~10x more
+   sequences than an arm's own rollout eval uses (`VAL_ROLLOUT_SEQS=64`).
+   Capped at 2500 -- still ~40x more than an arm gets, at ~1/10th the
+   diagnostics cost.
+2. **`SKIP_DIAGNOSTICS` launcher knob**: the linear baseline doesn't depend
+   on which arms run or their step budget, only on the fixed train/val
+   data -- added to `run_sweep_h300_branch_h.sh` so a rescreen at a
+   different step budget can reuse a prior run's number instead of
+   recomputing it. NOT used for `run_sweep_h300_branch_h_followup.sh`
+   (below), since `h10_ridge_residual` needs the ridge map diagnostics
+   fits and saves.
+
+### 25.4 Branch H (registered in v4.4), run for real: AR-loss frequency dominates every other knob, by a wide and monotonic margin
+
+400-step shallow screen (cut down from the planned 2000 once wall-clock
+became the bottleneck -- see the ETA discussion this section is
+responding to):
+
+```
+arm                 AR_EVERY_N_STEPS   IMPROV%
+h1_ar_freq2                2            +41.90   <- winner, still climbing
+h4_ar_long_freq4           4             +0.92
+h3_ar_short_freq4          4             -0.22
+h2_ar_freq4                4            -22.97
+h6_ar_fbnoise              8            -31.32
+h5_ar_moreseqs             8            -39.53
+h7_ar_wd                   8            -49.88
+h8_ar_lrlow                8            -53.21
+```
+
+The ranking is monotonic in AR-loss frequency alone: every freq=8 arm
+(`e3_ar_long`'s own frequency, each with one extra knob on top -- feedback
+noise, more AR sequences, weight decay, lower LR) is still negative at
+this shallow budget; both freq=4 variants are near breakeven; freq=2 is a
+clear, large win -- **+41.90%, beating `s6_e3_scaled`'s production-scale
++27.41% in 400 steps**, with its per-frame curve already plateauing around
++55-59% by frame ~35. None of the secondary knobs (feedback noise, more AR
+sequences, weight decay, lower LR) helped at freq=8; frequency alone
+dominated everything else tested in this branch.
+
+The auto-classifier again recommended the generic Branch-S arms (the same
+category error as §23.3 and §24 avoided) -- `h1_ar_freq2`'s winning
+config is not what those arms would scale.
+
+### 25.5 Two follow-ups registered: the direct extrapolation, and a real architectural change
+
+**`h9_ar_freq1`** -- `h1_ar_freq2`'s exact config with `AR_EVERY_N_STEPS=1`
+(AR loss every step). Direct extrapolation of §25.4's monotonic
+freq8->freq4->freq2 trend to its limit. Cheap, low-risk: same mechanism,
+no new code path.
+
+**`h10_ridge_residual`** -- `h1_ar_freq2`'s exact config plus a genuine
+architectural change: `PREDICT_DELTA=True` with a new `DELTA_ANCHOR='ridge'`
+option. `PREDICT_DELTA` already made the network predict a residual on top
+of a zero-initialized head plus an anchor (see `model_variants.py`'s
+`_delta_anchor`) -- previously that anchor was always raw persistence
+(same-x, previous frame). `DELTA_ANCHOR='ridge'` swaps the anchor for the
+fitted ridge map's prediction instead, via a new `BaseTransformer._ridge_anchor()`
+method: at any target token whose source frame is fully present in the
+input, it reshapes to full frames, applies the frozen ridge matrix (same
+one `linear_frame_baseline()` fits and now persists to
+`Config.RIDGE_MAP_PATH`), and falls back to `_delta_anchor`'s persistence
+value everywhere a complete source frame isn't available yet (the leading
+`NUM_X-1` positions, and mid-frame during AR rollout, where the context
+grows one token at a time). Rationale: the ridge map beats persistence by
++69.49% in the exact space the model is scored in (§25.1) -- predicting
+the residual on top of an already-strong linear predictor should need less
+of the network's capacity spent re-deriving something a closed-form
+regression already gets mostly right, versus deriving it from scratch
+against a weak (persistence) anchor.
+
+Implementation notes, since this touches model internals rather than just
+a hyperparameter:
+- `linear_frame_baseline()` now saves its fitted matrix to
+  `Config.RIDGE_MAP_PATH` (default `saved_models/ridge_frame_map.pt`)
+  whenever diagnostics run -- `h10_ridge_residual` depends on this file
+  existing, which is why `run_sweep_h300_branch_h_followup.sh` does not
+  skip diagnostics.
+- `_ridge_anchor()` branches on a shape-derived value (how many complete
+  frames are in the input), unlike `_delta_anchor()`'s deliberately
+  branch-free design -- this is only guaranteed correct under
+  `torch.jit.script` (tried first by `save_scripted_model()`, and compiles
+  real control flow). A trace fallback would fix whichever branch was
+  taken at trace time. Accepted for a research sweep arm, not a deployed
+  path.
+- Reuses `decode_centroid()`'s established `torch.autocast(device_type='cuda',
+  enabled=False)` + explicit `.float()` guard for the same reason it was
+  needed there (§22): the ridge matrix is a frozen float32 buffer, applied
+  inside whatever CUDA autocast region the caller is in.
+- Scoped to token tokenization only (`BaseTransformer`, not the frame-
+  native class) -- every current winning arm uses `TOKENIZATION='token'`,
+  and halving the surface area halves the ways this can be subtly wrong.
+- Verified locally (no GPU available in this session) via `py_compile` on
+  all three changed files, the full 44-test suite, `resolve_arm()` on both
+  new arms, and a CPU forward-pass smoke test of `_ridge_anchor()` against
+  a synthetic ridge matrix across both frame-aligned and mid-frame
+  (`T` not a multiple of `NUM_X`) sequence lengths, confirming finite
+  output of the correct shape in both the new ridge path and the
+  unmodified persistence path. Not yet validated against the real trainer,
+  real data, or a real optimizer step -- that is what
+  `run_sweep_h300_branch_h_followup.sh` actually tests.
+
+New launcher: **`transformer_neurIPS/run_sweep_h300_branch_h_followup.sh`**
+-- runs only these two arms (not a re-run of the full 8-arm grid, which
+already produced a clear answer).
+
+### 25.6 On "are we making progress, should we think bigger"
+
+Real progress, not yet a closed case: `e3_ar_long` (+30.77%) ->
+`s6_e3_scaled` (+27.41% at production scale, confirming it) ->
+`h1_ar_freq2` (+41.90% in 400 steps) is a genuine, monotonic improvement
+with an identified, reproducible cause (AR-loss frequency). But the ridge
+regression floor is +69.49% in the same units (§25.1) -- every transformer
+variant tried, including the best one, remains behind a closed-form linear
+map with no learned nonlinearity. `h9`/`h10` are this section's answer to
+"think bigger": `h9` pushes the proven lever to its limit; `h10` is a
+structural bet that stops asking the network to rediscover the ridge map
+from scratch and instead lets it start from it.
+
+### 25.7 What v4.5 does NOT change
+
+- `e3_ar_long`, `s6_e3_scaled`, and `h1_ar_freq2` through `h8_ar_lrlow`
+  are unchanged -- `h9`/`h10` are additions, not redefinitions.
+- `PREDICT_DELTA`'s existing (persistence-anchor) behaviour is byte-for-byte
+  unchanged when `DELTA_ANCHOR` is left at its new default
+  (`'persistence'`) -- confirmed by the smoke test's second model, built
+  with the old code path, producing finite output of the expected shape.
+- No claim is made about whether `h9` or `h10` actually improves on
+  `h1_ar_freq2` -- that's what `run_sweep_h300_branch_h_followup.sh`
+  tests, not something asserted here in advance.
+
+### 25.8 A note on `LATEST_UPLOAD_ME.md` getting overwritten
+
+Each sweep invocation writes its own permanent report to
+`sweep_logs/<run_id>/UPLOAD_ME.md` AND copies it to the top-level
+`sweep_logs/LATEST_UPLOAD_ME.md` for convenience -- only the top-level copy
+is overwritten each run; nothing is lost server-side. Locally, `scp`-ing
+`LATEST_UPLOAD_ME.md` to the same local filename every time overwrites the
+local copy the same way. To keep local history, either `scp` the whole
+`sweep_logs/<run_id>/` directory instead of just the one file, or rename
+each pull (e.g. `LATEST_UPLOAD_ME_<run_id>.md`). This document (OVERVIEW.md)
+is the durable record either way -- every run analyzed in this session has
+its headline numbers transcribed into a dated section here regardless of
+what happens to the local `.md` copies.
+
+## 26. v4.6 -- h9's frequency extrapolation wins, the ridge-residual architecture fails for a real (non-buggy) reason, and a diagnostics performance fix
+
+### 26.1 `run_sweep_h300_branch_h_followup.sh` results
+
+```
+arm                 IMPROV%          train beats anchor?
+h9_ar_freq1          +43.78%         NO
+h10_ridge_residual   -1,503,218.46%  yes
+```
+
+**`h9_ar_freq1` (h1_ar_freq2's config with `AR_EVERY_N_STEPS=1`) is the new
+best result in this entire investigation** -- +43.78% at only 400 steps,
+beating `h1_ar_freq2` (+41.90%), `e3_ar_long` (+30.77%), and
+`s6_e3_scaled` (+27.41% at production scale). Its per-frame curve crosses
+positive by frame ~17 and climbs to a +55-59% plateau by frame ~40,
+similar shape to `h1_ar_freq2` but higher throughout. This is the 3rd
+consecutive confirmation that AR-loss frequency is the dominant lever in
+this whole investigation (freq8 -> freq4 -> freq2 -> freq1, monotonically
+improving every time it's been tested).
+
+### 26.2 `h10_ridge_residual` failed catastrophically -- verified NOT a bug, and the real reason is instructive
+
+Roll MSE hit 42.75 against a 0.0028 persistence floor (~15,000x worse),
+diverging every single frame with no recovery. Before concluding the idea
+doesn't work, the implementation was checked directly: a numerical
+unit test with a hand-checkable ridge matrix (`A = 2 * I`, zero-init head
+so the model's output equals the anchor exactly at construction) confirmed
+`_ridge_anchor()`'s target alignment is correct -- `out[t]` equals the
+ridge map's prediction for target token `t+1`, exactly matching
+`_delta_anchor()`'s convention, with correct fallback behaviour at
+sequence boundaries. The log's separate `torch.jit.script` roundtrip-check
+device-mismatch warning (harmless -- training completed with sane,
+decreasing train/val_tf loss throughout) is unrelated to this failure and
+is a known, unfixed cosmetic issue specific to exporting
+`DELTA_ANCHOR='ridge'` checkpoints, not to training or rollout correctness.
+
+**The real explanation**: persistence (a plain copy) is a non-expansive
+operator -- copying cannot amplify a value, so however wrong it is, it
+can't get exponentially worse under repeated feedback. The fitted ridge
+map has no such guarantee; `linear_frame_baseline()`'s own standalone
+rollout is stable (+69.49%) because it is a single, clean recursion
+applied to nothing but its own output. Embedded as `h10`'s per-step
+anchor, it instead operates on frames built from a chain of
+(learned-residual + ridge-anchor) values recursively fed back through 400
+undertrained steps of AR training -- any direction of the ridge map with
+gain greater than 1 compounds multiplicatively over the 68-step rollout,
+which is exactly the observed exponential, monotonic, never-recovering
+blowup. Swapping a non-expansive anchor for an expansive one turned a
+stable feedback loop into an unstable one. This is a genuine negative
+result, not an implementation defect -- the ridge-residual direction is
+abandoned, not queued for a bug fix.
+
+### 26.3 A diagnostics performance fix: chunking a small population multiplied sequential-loop overhead for nothing
+
+After capping `linear_frame_baseline()`'s rollout population at
+`max_val_seqs=2500` (v4.5 §25.3), the loop still split that population into
+~128-sequence chunks (`chunk=128`), each running the inherently sequential
+~68-step rollout independently -- ~20 chunks x 68 steps = ~1360 small GPU
+calls, dominated by CPU-side Python/kernel-dispatch overhead between calls
+rather than actual GPU compute. This is exactly why diagnostics showed as
+CPU-pegged with the GPU mostly idle. Added a `val_chunk` parameter
+(default: `max_val_seqs`, i.e. one single batch) that collapses the outer
+loop to one iteration, cutting that dispatch overhead by ~20x. `chunk`
+(used only for the ridge FIT loop, which has no inner sequential loop) is
+unchanged.
+
+### 26.4 `s7_h9_scaled` registered -- no step count baked in, unlike `s6_e3_scaled`
+
+New arm `ROUND2_ARMS["S"]["s7_h9_scaled"]`: `h9_ar_freq1`'s exact overrides
+(`AR_MODE=frame_ar`, `AR_FRAMES=8`, `AR_SEQS=2`, `AR_EVERY_N_STEPS=1`).
+Unlike `s6_e3_scaled`, no `MAX_STEPS` is baked into the arm -- `freq=1` is
+the most expensive AR frequency tried (measured 0.825s/step, i.e. ~2x
+`s6_e3_scaled`'s AR cost at `freq=8`), so the right step budget depends on
+actual available wall-clock, not a fixed convention.
+
+New launcher **`run_sweep_h300_scale_h9.sh`**, sized for a real ~30-minute
+time budget: `MAX_STEPS=2000` default (2000 * 0.825s ≈ 27.5 min, leaving
+margin for checkpoint/eval overhead), diagnostics skipped by default
+(`SKIP_DIAGNOSTICS=1` -- this arm doesn't need the ridge map; only the
+now-abandoned `h10_ridge_residual` did).
+
+**File upload check for this next run** -- if `data/train_80.h5`,
+`data/val_80.h5`, and the scripted decoder are already on the box from the
+prior `run_sweep_h300_branch_h_followup.sh` run (they should be, nothing
+deletes them), only these need to be re-synced:
+- `transformer_neurIPS/train_production_transformer_deep_dive.py` (new `s7_h9_scaled` arm + the `val_chunk` diagnostics fix)
+- `transformer_neurIPS/run_sweep_h300_scale_h9.sh` (new file)
+
+`model_variants.py` and `sweep_deep_dive.py` are unchanged since the last
+upload and do not need re-syncing for this run.
+
+Verified: `py_compile` on all three touched files, `resolve_arm('s7_h9_scaled')`
+resolving to the exact overrides above, `bash -n` on the new launcher, and
+the full 44-test suite.
+
+### 26.5 What v4.6 does NOT change
+
+- `h1_ar_freq2` through `h10_ridge_residual` are unchanged -- `s7_h9_scaled`
+  is an addition, matching `s6_e3_scaled`'s relationship to `e3_ar_long`.
+- No claim is made about whether `h9_ar_freq1`'s +43.78% holds at 2000
+  steps -- that is what `run_sweep_h300_scale_h9.sh` actually tests.
+- The `DELTA_ANCHOR='ridge'` code path itself is not removed or reverted --
+  it is a correct, tested, but empirically unproductive option, kept for
+  the record (§26.2) rather than deleted.

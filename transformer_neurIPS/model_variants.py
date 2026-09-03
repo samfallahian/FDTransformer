@@ -66,6 +66,7 @@ OPTIONAL BEHAVIOUR (all off by default, all parameter-count preserving)
 """
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -347,6 +348,7 @@ class BaseTransformer(nn.Module):
         self.num_x = config.NUM_X
         self.num_time = config.NUM_TIME
         self.predict_delta = bool(getattr(config, 'PREDICT_DELTA', False))
+        self.delta_anchor_kind = str(getattr(config, 'DELTA_ANCHOR', 'persistence'))
         self.normalize_features = bool(getattr(config, 'NORMALIZE_FEATURES', False))
         self.use_rope = bool(getattr(config, 'USE_ROPE', False))
         self.attn_impl = getattr(config, 'ATTN_IMPL', 'sdpa')
@@ -418,6 +420,31 @@ class BaseTransformer(nn.Module):
         # new checkpoints.
         self.register_buffer("causal_mask", torch.zeros(1, 1), persistent=False)
 
+        # `ridge_A` is ALWAYS a real tensor buffer (never None), so
+        # `self.delta_anchor_kind == 'ridge'` -- a plain string set once at
+        # construction, not data-dependent -- is the only thing gating its
+        # use in forward(). When DELTA_ANCHOR != 'ridge' this is an unused
+        # 1x1 placeholder, matching `causal_mask`'s pattern above.
+        if self.predict_delta and self.delta_anchor_kind == 'ridge':
+            ridge_path = getattr(config, 'RIDGE_MAP_PATH', None)
+            if not ridge_path or not os.path.exists(ridge_path):
+                raise FileNotFoundError(
+                    f"DELTA_ANCHOR='ridge' requires Config.RIDGE_MAP_PATH to "
+                    f"point at a fitted ridge map -- run diagnostics first "
+                    f"(linear_frame_baseline() saves it there): {ridge_path}")
+            payload = torch.load(ridge_path, map_location='cpu')
+            ridge_A = payload['A'].float()
+            expected_d = config.NUM_X * config.LATENT_DIM
+            if tuple(ridge_A.shape) != (expected_d + 1, expected_d):
+                raise ValueError(
+                    f"ridge map at {ridge_path} has shape {tuple(ridge_A.shape)}, "
+                    f"expected {(expected_d + 1, expected_d)} for this Config's "
+                    f"NUM_X={config.NUM_X}, LATENT_DIM={config.LATENT_DIM} "
+                    f"(it was fit under a different data/shape configuration).")
+            self.register_buffer("ridge_A", ridge_A)
+        else:
+            self.register_buffer("ridge_A", torch.zeros(1, 1))
+
     # -- feature statistics -------------------------------------------------
     def set_feature_stats(self, mean, std, eps=1e-6):
         """Install per-feature standardisation statistics (in-place)."""
@@ -452,6 +479,55 @@ class BaseTransformer(nn.Module):
         k_eff = min(k, T)
         return torch.cat([raw_lat[:, :k_eff], raw_lat[:, :T - k_eff]], dim=1)
 
+    def _ridge_anchor(self, raw_lat):
+        """Ridge-regression-map prediction anchor, used instead of
+        `_delta_anchor`'s straight persistence copy when
+        `DELTA_ANCHOR='ridge'`. `linear_frame_baseline()` found this fitted
+        linear map beats persistence by +69% in the same decoded-velocity
+        space `evaluate()` scores in -- a strictly stronger anchor than
+        copying the previous frame, so predicting the RESIDUAL on top of it
+        should need less of the network's capacity spent re-deriving
+        something a closed-form regression already gets mostly right.
+
+        At target token (t+1) belonging to a complete source frame (i.e.
+        t+1 >= NUM_X and its source frame lies fully within `raw_lat`),
+        returns the ridge map's prediction for that frame from the frame
+        immediately before it. Falls back to `_delta_anchor`'s persistence
+        value wherever no complete source frame is available: the leading
+        NUM_X-1 positions, or -- during AR rollout, where `curr` grows one
+        token at a time -- whenever `raw_lat` ends mid-frame.
+
+        Unlike `_delta_anchor`, this branches on a shape-derived value
+        (`n_complete`), so it is only guaranteed correct under
+        `torch.jit.script` (tried first by `save_scripted_model()`, and
+        compiles real control flow, unlike trace). If scripting ever falls
+        back to `torch.jit.trace` for a `DELTA_ANCHOR='ridge'` model, the
+        traced graph would fix whichever branch was taken at trace time --
+        accepted here since this is a research sweep arm, not a deployed
+        inference path.
+        """
+        fallback = self._delta_anchor(raw_lat)
+        B, T, LD = raw_lat.shape
+        NX = self.num_x
+        n_complete = T // NX
+        if n_complete < 1:
+            return fallback
+        D = NX * LD
+        frames = raw_lat[:, :n_complete * NX, :].reshape(B, n_complete, D)
+        ones = torch.ones(B, n_complete, 1, dtype=frames.dtype, device=frames.device)
+        src1 = torch.cat([frames, ones], dim=-1)
+        # Same bf16/float32 guard as `decode_centroid()`: the ridge map is a
+        # frozen float32 buffer, but this runs inside whatever CUDA autocast
+        # region the caller is in.
+        with torch.autocast(device_type='cuda', enabled=False):
+            pred = src1.float() @ self.ridge_A.float()      # (B, n_complete, D) -- predicts frames 1..n_complete
+        pred = pred.to(raw_lat.dtype).reshape(B, n_complete * NX, LD)
+        start = NX - 1
+        end = min(T, start + pred.shape[1])
+        out = fallback.clone()
+        out[:, start:end, :] = pred[:, :end - start, :]
+        return out
+
     def forward(self, x):
         B, T, C = x.shape
         raw_lat = x[..., :self.latent_dim]
@@ -471,7 +547,10 @@ class BaseTransformer(nn.Module):
         out = self.output_head(self.ln_f(h))
 
         if self.predict_delta:
-            out = out + self._delta_anchor(raw_lat)
+            if self.delta_anchor_kind == 'ridge':
+                out = out + self._ridge_anchor(raw_lat)
+            else:
+                out = out + self._delta_anchor(raw_lat)
         return out
 
 

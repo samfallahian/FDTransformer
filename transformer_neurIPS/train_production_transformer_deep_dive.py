@@ -233,8 +233,10 @@ schema changes.
 """
 
 import argparse
+import atexit
 import copy
 import shutil
+import socket
 import warnings
 import json
 import math
@@ -310,6 +312,125 @@ def _banner(title):
     print(_c(line, "cyan"))
     print(_bold(f"  {title}", "cyan"))
     print(_c(line, "cyan"))
+
+
+# --------------------------------------------------------------------------- #
+# Checkpoint-status banner (v6.0) -- resume vs. cold-start must be
+# impossible to miss scrolling through a long log. Deliberately louder
+# than the CUDA/MPS regime banner above: wider, boxed on all four sides,
+# padded with blank lines on both sides, and colour-coded on the actual
+# risk (green = resumed real progress, red = training is starting over
+# from step 0 with nothing loaded) rather than on device type. This is a
+# direct response to a real incident (OVERVIEW.md v6.0) where a cold
+# restart silently discarded 12 hours of progress and nothing in the
+# console output called it out.
+# --------------------------------------------------------------------------- #
+def _print_checkpoint_status_banner(resumed, cross_version, warm_started,
+                                     step, latest_path, warm_start_path,
+                                     log=print):
+    if resumed and not cross_version:
+        headline = f"RESUMING FROM CHECKPOINT -- STEP {step}"
+        detail = f"loaded: {os.path.abspath(latest_path)}"
+        color = "green"
+    elif resumed and cross_version:
+        headline = "STARTING OVER -- CROSS-VERSION CHECKPOINT, STEP RESET TO 0"
+        detail = f"shape-compatible weights only from: {os.path.abspath(latest_path)}"
+        color = "yellow"
+    elif warm_started:
+        headline = "STARTING OVER -- WARM-STARTED WEIGHTS ONLY, STEP 0"
+        detail = f"warm-start weights from: {os.path.abspath(warm_start_path)}"
+        color = "yellow"
+    else:
+        headline = "STARTING COMPLETELY FRESH -- STEP 0, RANDOM INIT, NOTHING LOADED"
+        detail = "no resume checkpoint and no --warm-start weights were loaded"
+        color = "red"
+
+    width = max(len(headline), len(detail)) + 8
+    bar = "#" * width
+    blank = "#" + " " * (width - 2) + "#"
+
+    # "several carriage returns" before, per explicit request -- make the
+    # banner impossible to mistake for scrollback from the previous section.
+    log("\n" * 4)
+    log(_bold(bar, color))
+    log(_bold(blank, color))
+    log(_bold("#" + headline.center(width - 2) + "#", color))
+    log(_bold("#" + detail.center(width - 2) + "#", color))
+    log(_bold(blank, color))
+    log(_bold(bar, color))
+    # "about 5 more carriage returns" after.
+    log("\n" * 5)
+
+
+# --------------------------------------------------------------------------- #
+# Single-process-per-arm lock (v6.0) -- makes a second, overlapping launch
+# of the SAME arm (same CHECKPOINT_DIR/run_name) refuse to start instead of
+# silently training in parallel against the same wandb run id and the same
+# checkpoint files. Deliberately simple (a JSON file + mtime staleness
+# check, no flock/fcntl) since the failure mode this guards against is a
+# human or a launcher script re-running the same command, not a tight race.
+# --------------------------------------------------------------------------- #
+LOCK_STALE_SECONDS = 1800  # 30 min: comfortably longer than one eval+checkpoint cycle
+
+
+def acquire_run_lock(cfg, run_name, log=print):
+    """Create `{run_name}.lock` under CHECKPOINT_DIR, or raise SystemExit if
+    a live (non-stale) lock for this run already exists. Returns the lock
+    path; caller is responsible for keeping it fresh (`touch_run_lock`) and
+    removing it (`release_run_lock`, best done via `atexit.register`).
+    """
+    os.makedirs(cfg.CHECKPOINT_DIR, exist_ok=True)
+    lock_path = os.path.join(cfg.CHECKPOINT_DIR, f"{run_name}.lock")
+    if os.path.exists(lock_path):
+        age = time.time() - os.path.getmtime(lock_path)
+        if age < LOCK_STALE_SECONDS:
+            try:
+                prev = json.load(open(lock_path))
+            except Exception:
+                prev = {}
+            raise SystemExit(_bold(
+                f"REFUSING TO START: another process appears to already be "
+                f"training arm '{run_name}' -- lock at {lock_path} was last "
+                f"touched {age:.0f}s ago by host={prev.get('host', '?')} "
+                f"pid={prev.get('pid', '?')} (started {prev.get('started', '?')}). "
+                f"This is exactly the failure mode that produced two "
+                f"overlapping wandb histories in the same run (OVERVIEW.md "
+                f"v6.0) -- refusing rather than risking it again. If that "
+                f"process is actually dead, delete {lock_path} and relaunch.",
+                "red"))
+        log(_c(f"  [lock] reclaiming stale lock at {lock_path} "
+               f"(age {age:.0f}s > {LOCK_STALE_SECONDS}s -- previous process "
+               f"likely crashed or was killed without cleaning up)", "yellow"))
+    info = {"host": socket.gethostname(), "pid": os.getpid(),
+             "started": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    tmp = lock_path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(info, f)
+    os.replace(tmp, lock_path)
+    atexit.register(release_run_lock, lock_path)
+    return lock_path
+
+
+def touch_run_lock(lock_path):
+    """Heartbeat: bump the lock file's mtime so a slow-but-alive process is
+    never mistaken for a dead one by another launch's staleness check.
+    Best-effort -- never raises into the training loop.
+    """
+    try:
+        os.utime(lock_path, None)
+    except Exception:
+        pass
+
+
+def release_run_lock(lock_path):
+    """Best-effort cleanup, registered with atexit so it fires on normal
+    exit and most exception paths (not on SIGKILL -- the staleness check
+    in `acquire_run_lock` is what covers that case on the NEXT launch).
+    """
+    try:
+        os.remove(lock_path)
+    except Exception:
+        pass
 
 
 def pick_device():
@@ -628,7 +749,7 @@ class Config:
     # OVERVIEW.md crosses a new major boundary (v4.x -> v5.0), not on
     # every point release. Kept in sync by
     # tests/test_version_sync.py.
-    WANDB_PROJECT = "NI_Review_v5"
+    WANDB_PROJECT = "NI_Review_v6"
     # Set to a short label (e.g. "v5_stability") to have wandb group several
     # concurrently-launched runs together in its UI (native multi-run
     # comparison view) -- see OVERVIEW.md v5.0. None (default) omits the
@@ -752,6 +873,23 @@ ROUND2_ARMS = {
                             "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
                                           "AR_FRAMES": 8, "AR_SEQS": 2,
                                           "AR_EVERY_N_STEPS": 1}},
+            "s8_h9_moreseqs_scaled": {"desc": "v3_h9_moreseqs's EXACT config (OVERVIEW.md v5.5, "
+                                              "+46.49% vs persistence at ~300 steps in the v5.0 "
+                                              "stability round) at production scale. Of the four "
+                                              "independent stability perturbations tested against "
+                                              "h9_ar_freq1 (weight decay, gradient clip, AR_SEQS, "
+                                              "LR), all four held within a ~5-point band of h9's "
+                                              "own +43.78% -- this one not only held but edged out "
+                                              "h9 itself, so it is the production candidate, not "
+                                              "h9's own unmodified config. Like s7_h9_scaled, no "
+                                              "MAX_STEPS is baked in here -- the run_sweep_*.sh "
+                                              "launcher's own --max-steps controls it, sized from "
+                                              "this exact config's own measured steady-state "
+                                              "throughput for whatever wall-clock budget is "
+                                              "actually available.",
+                                     "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                   "AR_FRAMES": 8, "AR_SEQS": 4,
+                                                   "AR_EVERY_N_STEPS": 1}},
         },
     },
     # ---------------------------------------------------------------- branch D
@@ -2572,6 +2710,13 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
     transfer (wandb queues it), so passing `tel=None` (the default) or
     having wandb disabled/unreachable changes nothing about this
     function's local-disk behavior.
+
+    `wandb_run_id` (v6.0) is stamped into the payload whenever `tel` has a
+    live run, so a FUTURE resume from THIS file can demand
+    (`resume="must"`) the exact same wandb run instead of reusing a static
+    `f"r{SWEEP_ROUND}_{ARM}"` id with `resume="allow"` -- the combination
+    that let an unrelated cold-started process silently append into a
+    previous attempt's history (OVERVIEW.md v6.0).
     """
     payload = {
         'step': step,
@@ -2581,6 +2726,11 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'config': config_dict(),
     }
+    if tel is not None and getattr(tel, "run", None) is not None:
+        try:
+            payload['wandb_run_id'] = tel.run.id
+        except Exception:
+            pass
     payload.update(extra)
     tmp = path + ".tmp"
     torch.save(payload, tmp)
@@ -2917,6 +3067,13 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
 # --------------------------------------------------------------------------- #
 def train(args, log=print):
     t_start = time.time()
+
+    # Claim this arm before spending any time loading data/model -- refuses
+    # to start (rather than silently training alongside) a second launch of
+    # the SAME arm while one is already live. See OVERVIEW.md v6.0.
+    run_name_for_lock = f"r{Config.SWEEP_ROUND}_{Config.ARM}"
+    run_lock_path = acquire_run_lock(Config, run_name_for_lock, log=log)
+
     device = Config.DEVICE
     torch.manual_seed(Config.SEED)
     np.random.seed(Config.SEED)
@@ -3079,6 +3236,17 @@ def train(args, log=print):
             # checkpoint".
             "promoted_rollout_mse": float('inf')}
 
+    # Tracked through the resume block below so the loud checkpoint-status
+    # banner (v6.0) and the wandb run-id decision downstream both reflect
+    # what ACTUALLY happened, not just "a latest.pt file exists on disk" --
+    # the exact gap that let a failed resume silently look like a successful
+    # one (OVERVIEW.md v6.0). `resumed_wandb_run_id` is only ever set when
+    # this really is the same optimisation run continuing, not a
+    # cross-version warm-start-in-disguise.
+    did_resume = False
+    cross_version = False
+    resumed_wandb_run_id = None
+
     if os.path.exists(latest_path) and not args.fresh:
         try:
             ck = torch.load(latest_path, map_location=device, weights_only=False)
@@ -3171,6 +3339,12 @@ def train(args, log=print):
                 scheduler._last_lr = [g['lr'] for g in optimizer.param_groups]
             if not cross_version:
                 best.update({k: v for k, v in ck.get('best', {}).items()})
+                # Only a genuine same-shape resume inherits the previous
+                # wandb run id -- a cross-version warm-start-in-disguise is
+                # a different logical run and must NOT write into the old
+                # run's history (see the wandb-id decision below).
+                resumed_wandb_run_id = ck.get('wandb_run_id')
+            did_resume = True
             # Rainbow-log the resume-from checkpoint the same way
             # `_log_write` rainbow-logs a completed write and
             # `load_warm_start` rainbow-logs its start-from checkpoint,
@@ -3186,6 +3360,19 @@ def train(args, log=print):
                 f"dropped_length_dependent={sorted(dropped)})")
         except Exception as e:
             log(f"  [resume] failed ({type(e).__name__}: {e}); starting fresh")
+            did_resume = False
+            cross_version = False
+            resumed_wandb_run_id = None
+
+    # Impossible-to-miss banner: is this run continuing real progress, or
+    # starting over? Deliberately louder than the CUDA/MPS regime banner
+    # above (OVERVIEW.md v6.0) -- this exact ambiguity, silently resolved
+    # the wrong way, is what cost 12 hours of progress in the incident that
+    # motivated this section.
+    _print_checkpoint_status_banner(
+        resumed=did_resume, cross_version=cross_version,
+        warm_started=warm_started, step=step, latest_path=latest_path,
+        warm_start_path=args.warm_start, log=log)
 
     # W&B run name embeds arm, NUM_TIME, and whether warm-start was actually
     # applied on this run (a resumed run or --no-warm-start reads as ws=0).
@@ -3201,11 +3388,50 @@ def train(args, log=print):
         "regime.cudnn_benchmark": regime.cudnn_benchmark,
         "warm_started": warm_started,
     })
-    _tel_kwargs = dict(project=Config.WANDB_PROJECT, name=wandb_run_name,
-                       id=run_name, resume="allow", config=wandb_config)
-    if getattr(Config, 'WANDB_GROUP', None):
-        _tel_kwargs["group"] = Config.WANDB_GROUP
-    tel = _Telemetry(not args.no_wandb, log=log, **_tel_kwargs)
+    # wandb run-id policy (v6.0) -- fixes the incident in OVERVIEW.md v6.0
+    # where a cold restart (checkpoint missing/reset) silently appended into
+    # a previous attempt's wandb history, because the id was always the
+    # static `f"r{SWEEP_ROUND}_{ARM}"` string with `resume="allow"`. Now:
+    #   * a genuine same-shape resume reuses the id PERSISTED INSIDE the
+    #     checkpoint it just loaded (`resumed_wandb_run_id`, written by
+    #     `save_checkpoint` below), with `resume="must"` -- if that id
+    #     doesn't actually exist upstream (deleted, wrong project, a
+    #     checkpoint from an offline run that never got a real id), fail
+    #     that attempt loudly instead of silently starting a run that LOOKS
+    #     resumed but shares no real history.
+    #   * anything else (cold start, --fresh, cross-version warm-start,
+    #     resume that failed) gets a BRAND NEW random id
+    #     (`wandb.util.generate_id()`) with `resume="never"` -- a cold start
+    #     can no longer land in anyone else's history, ever, regardless of
+    #     what `run_name` happens to be.
+    def _make_telemetry(run_id, resume_mode):
+        kwargs = dict(project=Config.WANDB_PROJECT, name=wandb_run_name,
+                      config=wandb_config, resume=resume_mode)
+        if run_id:
+            kwargs["id"] = run_id
+        if getattr(Config, 'WANDB_GROUP', None):
+            kwargs["group"] = Config.WANDB_GROUP
+        return _Telemetry(not args.no_wandb, log=log, **kwargs)
+
+    def _fresh_wandb_id():
+        try:
+            import wandb as _wandb_mod
+            return _wandb_mod.util.generate_id()
+        except Exception:
+            return None
+
+    if resumed_wandb_run_id:
+        tel = _make_telemetry(resumed_wandb_run_id, "must")
+        if tel.run is None and not args.no_wandb:
+            log(_bold(
+                f"  [wandb] STRICT RESUME FAILED for run id="
+                f"{resumed_wandb_run_id!r} (deleted upstream? different "
+                f"project? offline previously?) -- starting a NEW wandb run "
+                f"instead of risking a silent merge into unrelated history "
+                f"(OVERVIEW.md v6.0).", "yellow"))
+            tel = _make_telemetry(_fresh_wandb_id(), "never")
+    else:
+        tel = _make_telemetry(_fresh_wandb_id(), "never")
 
     # Disable the SEQUENTIAL AR aux loss on MPS/CPU. Even at AR_SEQS=1, the
     # frame_ar loop under token tokenization does `AR_FRAMES * NUM_X`
@@ -3606,6 +3832,7 @@ def train(args, log=print):
             archive_latest_checkpoint(Config, run_name, latest_path, step, log=log)
             write_status_json(Config, run_name, step, train_loss, best,
                               last_metrics, t_start, log=log)
+            touch_run_lock(run_lock_path)
 
         if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS:
             stop_reason = f"wall-clock limit ({Config.MAX_HOURS}h)"

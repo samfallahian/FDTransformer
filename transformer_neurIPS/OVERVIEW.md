@@ -3352,3 +3352,401 @@ optimum sensitive to nearby hyperparameter choices. The natural next step
 is scaling the best-of-the-stable-set (`v3_h9_moreseqs`'s config) to
 production, the same pattern as `e3_ar_long -> s6_e3_scaled` and
 `h1_ar_freq2 -> h9_ar_freq1 -> s7_h9_scaled`.
+
+## 29. v5.5 -- plan: an 8-hour production run of the winning, now-confirmed-stable config
+
+All model checkpoints and reports from every arm run so far are pulled
+down locally (`saved_models/`, `sweep_logs/`) via the `rsync` in §0 --
+nothing on the rented box is the only copy of anything at this point.
+This section is a PLAN, not a report: `s8_h9_moreseqs_scaled` has been
+registered and `run_sweep_h300_production_8h.sh` built and validated, but
+NOT yet launched as of this writing.
+
+### 29.1 What runs: `s8_h9_moreseqs_scaled`, not `h9` itself
+
+Of the four independent stability perturbations tested in v5.0 (§28.7)
+against `h9_ar_freq1` (weight decay 0.01->0.05, gradient clip 1.0->0.5,
+AR_SEQS 2->4, LR 1e-3->5e-4), all four held within a ~5-point band of
+`h9`'s own +43.78% -- confirming the win is stable. One of them,
+`v3_h9_moreseqs` (AR_SEQS 2->4, less gradient noise per AR-loss
+application), didn't just hold: it reached **+46.49%**, edging out `h9`
+itself. New arm `ROUND2_ARMS["S"]["s8_h9_moreseqs_scaled"]` is that exact
+config (`AR_MODE=frame_ar`, `AR_FRAMES=8`, `AR_SEQS=4`,
+`AR_EVERY_N_STEPS=1`) -- the production candidate is the best-of-the-
+stable-set, not the original unmodified `h9` config. Same "scale the
+winner, not the origin point" pattern as `e3_ar_long -> s6_e3_scaled` and
+`h1_ar_freq2 -> h9_ar_freq1`.
+
+### 29.2 Step budget: measured from this exact config's own steady-state throughput
+
+`v3_h9_moreseqs`'s own log (the v5.0 stability run) gives a clean
+steady-state read: step 125 at 3.4 min, step 300 at 4.9 min -- no slow
+first-eval or compile-warmup included -- **0.514 s/step**. Over an
+8-hour (28,800s) budget, reserving ~15 minutes for combined startup/
+eval/checkpoint overhead, that's roughly 54,000 steps at the measured
+rate. `MAX_STEPS` is set to **45,000**, deliberately below that raw
+estimate, for margin against measurement noise and the extra per-step
+cost of re-enabled scripted-checkpoint compiles (see 29.3).
+
+**Why being on the generous side here carries little risk**, unlike
+§28.6's warmup bug: `WARMUP_FRAC=0.03 x 45,000 = 1,350` steps, ~12
+minutes at this rate -- a small fraction of an 8-hour budget regardless
+of which way the throughput estimate is off. If `--max-hours 8.0`
+(kept on as the real enforced backstop, exactly as in every other
+launcher since v4.7) triggers before `MAX_STEPS` is reached, the run
+simply stops with a somewhat-less-annealed LR, not stuck deep in warmup
+the way a 5-minute run would be -- a graceful degradation, not the same
+class of failure.
+
+### 29.3 Production overrides: two v4.7 sweep-arm defaults deliberately flipped back
+
+`arm_command()` defaults every sweep arm to `SAVE_SCRIPTED_MODELS=False`
+and `CHECKPOINT_EVERY_STEPS=<max_steps>` (v4.7) -- correct for a
+5-30-minute throwaway screen, wrong for an 8-hour run meant to produce a
+real artifact:
+
+- **`SAVE_SCRIPTED_MODELS=True`** -- a deployable TorchScript export is
+  the actual point of a production run.
+- **`CHECKPOINT_EVERY_STEPS=2000`** -- resumable "latest" snapshots every
+  ~17 minutes of wall-clock, not just once at the very end. A crash 7
+  hours in without this loses everything.
+
+Both are passed as explicit `--set` overrides, listed after
+`arm_command()`'s own defaults in the combined `--set` flag -- verified
+directly (see 29.5) that the trainer's last-value-wins `--set` loop
+resolves them correctly regardless of order.
+
+Also unlike the v5.0 stability launcher: **diagnostics are NOT skipped**
+here (worth a fresh one-time ridge-baseline reconfirmation before an
+8-hour commitment -- a minute or two, negligible against 8 hours), and
+**`VAL_EVERY`/`ROLLOUT_SEQS` are widened** to 2000 steps / 128 sequences
+(from the stability round's 100 steps / 64 sequences) -- an 8-hour run
+affords both a coarser eval cadence (no need for the dense read a 5-minute
+screen needed) and a more statistically solid final rollout score.
+
+### 29.4 New launcher: `run_sweep_h300_production_8h.sh`
+
+```
+bash transformer_neurIPS/run_sweep_h300_production_8h.sh
+```
+
+Defaults: `MAX_STEPS=45000`, `MAX_HOURS=8.0`, `VAL_EVERY=2000`,
+`ROLLOUT_SEQS=128`, `CHECKPOINT_EVERY=2000`, `SUBSET_RATIO=1.0`,
+diagnostics on, single arm (`--max-parallel 1`, nothing else to run
+concurrently against). All overridable via environment variables per the
+script's own header. Only `train_production_transformer_deep_dive.py`
+(new `s8` arm) needs re-syncing if the rest of the required files are
+already on the box from the v5.0 run -- this launcher itself is also new.
+
+### 29.5 Verified before launch
+
+- `resolve_arm('s8_h9_moreseqs_scaled')` resolves to the exact
+  `v3_h9_moreseqs` overrides.
+- `arm_command()` exercised directly with this launcher's actual
+  `--set` values: confirmed the combined `--set` flag is
+  `['SAVE_SCRIPTED_MODELS=False', 'CHECKPOINT_EVERY_STEPS=45000',
+  'SAVE_SCRIPTED_MODELS=True', 'CHECKPOINT_EVERY_STEPS=2000']` -- the
+  trainer's last-value-wins `--set` loop resolves this to
+  `SAVE_SCRIPTED_MODELS=True` / `CHECKPOINT_EVERY_STEPS=2000` as
+  intended.
+- `bash -n` on the new launcher.
+- `py_compile` on the touched Python file.
+- The full 44-test suite.
+
+### 29.6 What v5.5 does NOT change (yet)
+
+- Nothing has been launched as of this writing -- this section documents
+  the plan and the artifacts built for it, not a result.
+- `h9_ar_freq1`, `v1`-`v4`, and `s7_h9_scaled` are unchanged --
+  `s8_h9_moreseqs_scaled` is an addition.
+- `WANDB_PROJECT` stays `NI_Review_v5` -- v5.5 is a minor version within
+  the v5.x major line, no rename needed (kept in sync by
+  `test_version_sync.py`).
+
+## 30. v6.0 -- hardening against the two-processes-one-wandb-run incident, and a much louder resume/fresh-start signal
+
+Crossing another major version boundary (v5.x -> v6.0) per the
+`WANDB_PROJECT` convention (§21.1) -- `Config.WANDB_PROJECT` renamed
+`NI_Review_v5` -> `NI_Review_v6`, kept in sync by `test_version_sync.py`.
+This is an infrastructure-only pass, not a new arm or a new result: it is
+the direct fix for the failure mode uncovered while post-mortem-ing
+`r2_s7_h9_scaled`'s wandb run (the one recovered to
+`saved_models/r2_s7_h9_scaled_rollout_best.pt` at step 134000, +31.35%).
+
+### 30.1 The incident, restated precisely
+
+`r2_s7_h9_scaled`'s single wandb run (`t80_ws0`) contains two disjoint
+training attempts concatenated on one x-axis: a clean 12.1-hour run from
+step 1 to step 90000 (`train_loss` reaching 0.0029), then a 38-minute gap,
+then a SECOND process that started completely cold (`warm_started=False`,
+its own step counter reset to 1, LR back at warmup) and ran a further 19.8
+hours to step 145000 -- but logged into the exact same wandb run. The
+overlapping x-axis is what looked like a "regression at step ~90000" when
+the run was first charted; it was actually two different curves sharing
+one plot. Root cause, found in this file's own code rather than assumed:
+line-level, `wandb.init(..., id=f"r{SWEEP_ROUND}_{ARM}", resume="allow")`
+-- a STATIC id derived only from the arm name, with `resume="allow"`,
+completely decoupled from whether this process actually loaded a
+checkpoint. Any relaunch of the same arm -- deliberate resume, accidental
+double-launch, or (as happened here) a cold restart after the checkpoint
+was missing/reset -- silently lands in the same wandb history no matter
+what actually happened on the training side.
+
+### 30.2 Fix 1: the wandb run id now follows the checkpoint, not the arm name
+
+`save_checkpoint()` (train_production_transformer_deep_dive.py) now stamps
+the live `tel.run.id` into every checkpoint payload as `wandb_run_id`
+whenever wandb is enabled. At startup, the resume block reads
+`resumed_wandb_run_id = ck.get('wandb_run_id')` back out of `latest.pt` --
+but only when the load is a genuine same-shape resume (`not cross_version`;
+a cross-version warm-start-in-disguise is a different logical run and must
+not inherit the old id). The wandb-id decision that follows:
+
+- **A real resume** (`resumed_wandb_run_id` set): `wandb.init(id=that_id,
+  resume="must")`. `resume="must"` is deliberately stricter than the old
+  `"allow"` -- if that id doesn't actually exist upstream (deleted run,
+  wrong project, a checkpoint saved while wandb was offline and never got
+  a real id), the attempt fails loudly and falls back to case 2 rather
+  than silently creating a run that *looks* resumed but shares no real
+  history with anything.
+- **Everything else** (cold start, `--fresh`, cross-version warm-start, a
+  failed strict-resume attempt): a brand-new random id via
+  `wandb.util.generate_id()`, with `resume="never"`. A cold start can no
+  longer land in anyone else's history, full stop, regardless of what
+  `run_name` happens to resolve to.
+
+This directly closes the incident: the second process in §30.1 had
+`warm_started=False` and no loaded checkpoint, so under this policy it
+would get a fresh id and `resume="never"` -- its 19.8-hour trajectory
+would show up as its own separate wandb run, not silently appended onto
+the first attempt's.
+
+### 30.3 Fix 2: a run lock, for the case Fix 1 doesn't cover
+
+Fix 1 protects against a cold start silently reusing old history. It does
+NOT protect against two processes that are BOTH doing a legitimate
+same-checkpoint resume at the same time (e.g. the same launcher accidentally
+invoked twice, or a retry wrapper firing while the original is still
+running) -- both would read the same `wandb_run_id` out of the same
+checkpoint and both would successfully `resume="must"` into it
+concurrently. New `acquire_run_lock()`/`touch_run_lock()`/
+`release_run_lock()`, called from the very top of `train()` (before any
+data loading, so a blocked duplicate fails in milliseconds, not after
+loading the H5 files): a JSON lock file at
+`CHECKPOINT_DIR/{run_name}.lock` (host, pid, start time), checked for
+staleness (`LOCK_STALE_SECONDS = 1800`) before every launch. A live lock
+refuses the new launch with a loud error naming the host/pid/age of the
+process apparently already running; a stale one (older than 30 minutes --
+comfortably longer than one checkpoint/eval cycle) is reclaimed with a
+warning, covering the crashed-without-cleanup case. The lock's mtime is
+touched on every `CHECKPOINT_EVERY_STEPS` save as a heartbeat, and removed
+via `atexit` on normal exit.
+
+30 minutes is deliberately generous: it's longer than the actual 38-minute
+gap in the §30.1 incident would have needed to be treated as "the previous
+process is gone," so this would not have blocked that legitimate-looking
+restart -- it targets the tighter-window double-launch case Fix 1 can't
+see, not the exact incident, which Fix 1 already covers on its own.
+
+### 30.4 Fix 3: an impossible-to-miss resume-vs-fresh-start banner
+
+Separately from the wandb-side fix, the console output itself never made
+"did this run just load 12 hours of progress, or start over" visually
+obvious -- it was one `[resume]`/`[warm-start]` log line among hundreds,
+easy to scroll past. New `_print_checkpoint_status_banner()`, printed
+right after the resume block resolves (before the wandb section, so it's
+visible even if wandb is disabled or fails to connect), and deliberately
+louder than the CUDA/MPS regime banner (§9's `_regime_banner_cuda`/
+`_regime_banner_mps_cpu`) it sits right below:
+
+- 4 blank lines before, 5 after (exact ask: "several carriage returns...
+  then about 5 more"), so the banner cannot be mistaken for adjacent
+  scrollback.
+- A full `#`-bordered box, sized to its own content, colour-coded on the
+  actual RISK rather than on device type:
+  - **green** -- `RESUMING FROM CHECKPOINT -- STEP N` (real progress
+    continuing; the safe case).
+  - **yellow** -- cross-version or warm-start-only restarts (starting
+    over, but deliberately/expectedly so).
+  - **red** -- `STARTING COMPLETELY FRESH -- STEP 0, RANDOM INIT, NOTHING
+    LOADED` (nothing loaded at all; this is the case that silently ate 12
+    hours in §30.1, and is now the loudest, reddest thing in the log).
+
+### 30.5 What v6.0 does NOT change
+
+- No arm definitions, no `Config` training defaults, no model code --
+  this is wandb/checkpoint/console plumbing only.
+- Legacy checkpoints saved before this change have no `wandb_run_id` key;
+  `ck.get('wandb_run_id')` returns `None` for them, which correctly routes
+  through the "brand-new id, `resume="never"`" path on their next resume --
+  a safe default (a fresh run, clearly separated) rather than a crash.
+- `LOCK_STALE_SECONDS=1800` is a judgment call, not a measured constant --
+  revisit if a real deployment's checkpoint/eval cycle ever runs longer
+  than that between saves.
+- **The "63%" goal, clarified**: nothing in this file documented a "63%"
+  figure under any name (checked every `##` section and every
+  `IMPROV%`/`improvement_pct` mention) -- confirmed with the operator that
+  the intended reference is the **ridge-regression ceiling, +69.49%**
+  (§25.1), not a separately-tracked "63%" number. That figure is
+  AUTOREGRESSIVE ROLLOUT improvement over persistence -- a full staircase
+  forecast (every frame fed back into the next), decoded through the
+  frozen AE decoder into centroid velocity (m/s) -- not a single-timestep
+  comparison. It is a diagnostic CEILING, not a result any transformer arm
+  has hit: the best CONFIRMED-stable result so far is `v3_h9_moreseqs` at
+  +46.49% (§28.7, 400-step shallow screen), and the actual production run
+  analysed in this section (`r2_s7_h9_scaled`, 145k steps, recovered to
+  `saved_models/r2_s7_h9_scaled_rollout_best.pt`) peaked at +31.35%. The
+  gap between the ridge ceiling (+69.49%) and the best transformer result
+  (+46.49%, or +31.35% at the production run that actually completed) is
+  the real headroom this whole investigation is chasing -- not "63%" of
+  anything. Full walkthrough of both numbers, why they aren't directly
+  comparable, and whether +46.49% is a realistic target: Appendix A.
+
+---
+
+## Appendix A: what "the goal" actually is -- +69.49% vs. +46.49% vs. +31.35%
+
+Three numbers get quoted around this investigation, in three genuinely
+different senses, and conflating them is easy to do by accident.
+
+### A.1 +69.49% -- the ridge-regression ceiling (§25.1), a diagnostic bound, not a target
+
+`linear_frame_baseline()` ridge-fits a plain **linear** map
+`frame(t) -> frame(t+1)` on ~500k frame-transitions (closed-form normal
+equations, `ridge=1e-3`), then rolls it out **autoregressively** -- feeding
+its own prediction back in for the full 68-frame horizon, exactly like an
+arm's own rollout eval -- and decodes through the same frozen AE decoder
+into centroid velocity (m/s) before scoring against persistence. The
+number was originally computed in the wrong space (+60.64% in raw
+470-dim latent space); fixing it to decoded m/s space made the gap WORSE,
+not better (+69.49%) -- the original concern understated the problem.
+
+What it means: a ceiling on how much a model could improve on persistence
+with **zero learned nonlinearity**. It exists to answer "does this task
+even have learnable temporal structure beyond persistence" (yes, a lot),
+not as something to literally build into the architecture -- §26.2
+documents that trying to (`h10_ridge_residual`, using the ridge map as the
+model's per-step prediction anchor) caused a catastrophic feedback
+blowup: persistence is a non-expansive operator under repeated AR
+feedback (copying a value can't amplify it), the ridge map is not, and
+any eigendirection of the ridge matrix with gain > 1 compounds
+multiplicatively over a 68-step rollout. Rollout MSE hit ~15,000x worse
+than persistence. **Use this number as a headroom gauge, never as an
+architectural template.**
+
+### A.2 +46.49% -- `v3_h9_moreseqs` (§28.7), a real but *shallow-screen* result
+
+Same metric space as the ridge ceiling (decoded, autoregressive,
+staircase), but this one is an actual transformer result, not a linear
+bound. It came from the v5.0 stability round: four independent
+one-variable perturbations against `h9_ar_freq1` (weight decay, gradient
+clip, `AR_SEQS`, LR), each a 400-step shallow screen. All four landed
+within a ~5-point band of `h9`'s own +43.78%, which is what earned the
+"confirmed-stable, not a fragile optimum" label. `v3_h9_moreseqs`
+(`AR_SEQS: 2->4`) edged out the rest at +46.49% -- see Appendix B for
+exactly what that knob does.
+
+**The catch: this was never run at production scale.** The plan to do so
+(`s8_h9_moreseqs_scaled`, §29) was built and validated but, as of §29's
+writing, not yet launched. What actually ran to completion and produced
+the checkpoint recovered in this session
+(`saved_models/r2_s7_h9_scaled_rollout_best.pt`) is **`s7_h9_scaled`** --
+the production scaling of `h9_ar_freq1` ITSELF (`AR_SEQS=2`), not the
+improved `v3`/`AR_SEQS=4` variant.
+
+### A.3 +31.35% -- what `s7_h9_scaled` actually delivered at 145k steps, and why the comparison to +43.78%/+46.49% is confounded
+
+`s7_h9_scaled`'s production run undershot `h9`'s own 400-step number
+(+43.78% -> +31.35%, a ~12-point drop) -- structurally the same direction
+as `e3_ar_long` (+30.77% shallow) -> `s6_e3_scaled` (+27.41% production),
+so on its face this reads as "shallow screens don't fully hold at
+production scale." **But this particular run has a confound the
+`e3`/`s6` pair does not**: per this session's wandb post-mortem
+(§30.1), `r2_s7_h9_scaled`'s single wandb run is actually two disjoint
+training attempts glued together -- a clean 12.1-hour run to step 90000
+(`train_loss` still improving, at 0.0029) that was then COLD-RESTARTED
+from scratch (not resumed) for another 19.8 hours to step 145000. The
+recovered +31.35% checkpoint (step 134000) comes from the SECOND,
+restarted attempt -- meaning the run that actually finished never got the
+benefit of the first 90000 steps' progress, and its own `improvement_pct`
+curve was still climbing (not plateaued) when the step budget ran out.
+
+**Implication**: the 12-point shallow-to-production gap on `s7` may be
+partly or entirely an artifact of the exact incident v6.0 (§30) exists to
+prevent, not solid evidence that `h9`'s win erodes at scale. This can't
+be disentangled retroactively (pass 1's own trajectory was cut off before
+its first real eval past step 90000), which is itself a good argument for
+getting `s8_h9_moreseqs_scaled` running cleanly under the v6.0 safety
+fixes rather than trying to re-read more meaning into `s7`'s numbers.
+
+### A.4 So, should you target +46.49%?
+
+Treat it as the next lever to pull, not a number to expect on arrival:
+`s8_h9_moreseqs_scaled` (the AR_SEQS=4 production scale-up) is already
+built and ready to launch. Whether it lands near +46.49%, near `s7`'s
++31.35%, or somewhere else entirely is now an open, un-confounded
+question -- precisely because v6.0's wandb-id/lock/banner fixes mean a
+future crash-and-restart on THAT run will resume correctly or fail into a
+clearly separate run, instead of silently blending two attempts the way
+`s7`'s did. +69.49% (Appendix A.1) is not a target either run is expected
+to reach -- it's the outer bound that motivates keep pulling on `AR_MODE`
+levers at all.
+
+## Appendix B: what `AR_SEQS` actually is
+
+### B.1 The auxiliary loss it's a parameter of
+
+Separately from the main per-token teacher-forced loss, the trainer
+periodically (every `AR_EVERY_N_STEPS` steps) runs an autoregressive
+rollout loss, `frame_ar_loss()` (train_production_transformer_deep_dive.py:1963):
+starting from a randomly-chosen context length, it feeds the model's OWN
+prediction back in as the next input token (not ground truth) for
+`AR_FRAMES` frames, then scores the resulting chain against the real
+future in decoded centroid-velocity space. This is what directly trains
+against exposure bias -- the gap between "predict one step from real
+context" (cheap, what teacher-forcing does every step) and "predict many
+steps in a row from your own drifting predictions" (expensive, what
+actually happens during rollout eval / real inference).
+
+### B.2 What the knob controls
+
+```python
+seqs = batch[:int(cfg.AR_SEQS)]      # train_production_transformer_deep_dive.py:1978
+```
+
+`AR_SEQS` is how many sequences, OUT OF THE CURRENT TRAINING MICRO-BATCH,
+get run through that autoregressive rollout loss each time it fires --
+not a separate batch, not new data, just a slice of the batch already
+loaded for the main loss. `AR_SEQS=2` (`h9_ar_freq1` / `s7_h9_scaled`)
+takes the first 2 sequences; `AR_SEQS=4` (`v3_h9_moreseqs` /
+`s8_h9_moreseqs_scaled`) takes 4.
+
+### B.3 Why more sequences helps: variance, not new information
+
+`centroid_velocity_loss()`'s result is a MEAN over that AR-sequence batch
+dimension. At `AR_SEQS=2`, each application of the aux loss is a noisy,
+low-sample-size estimate of "how bad is the rollout drift right now" --
+the gradient signal it contributes swings a lot depending on which 2
+sequences happened to land in that slot. Doubling to 4 halves the
+variance of that estimate (standard sqrt(n) averaging) without changing
+what's being measured -- same `AR_FRAMES=8` horizon, same
+`AR_EVERY_N_STEPS=1` frequency, everything else identical. That's the
+entire hypothesis `v3_h9_moreseqs` tested: does `h9`'s win hold up (or
+improve) with a cleaner gradient signal, or was it sensitive to that
+2-sequence noise? Per §28.7, it held up and edged slightly ahead.
+
+### B.4 The cost, and why it's clamped on MPS/CPU
+
+Real tradeoff, not free: "activation memory scales linearly with
+AR_SEQS" (comment at line ~559). Each of the `AR_FRAMES * NUM_X`
+sequential forward passes in the AR loop carries `AR_SEQS` in its batch
+dimension, so `AR_SEQS=4` roughly doubles the compute/memory of every AR-
+loss application specifically (the main teacher-forced loss and ITS batch
+size are untouched). This is why `regime.aux_micro_batch` exists:
+`AR_SEQS` is silently clamped down on MPS/CPU regardless of what an arm
+requests, because each sequential forward retains its own full activation
+graph and the whole `frame_ar` AR loss is disabled outright on MPS/CPU
+(`regime.disable_ar`) -- see §9's device-adaptive-regime table. `sched`
+mode (two forwards, no sequential retained-graph chain) is unaffected and
+stays enabled on MPS/CPU; `AR_SEQS` is meaningless there since `sched`
+mode doesn't read it.

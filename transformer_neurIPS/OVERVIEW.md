@@ -3750,3 +3750,109 @@ graph and the whole `frame_ar` AR loss is disabled outright on MPS/CPU
 mode (two forwards, no sequential retained-graph chain) is unaffected and
 stays enabled on MPS/CPU; `AR_SEQS` is meaningless there since `sched`
 mode doesn't read it.
+
+## 31. v6.1 -- ridge-map distillation: the safe reformulation of `h10_ridge_residual`, tested on MPS
+
+### 31.1 Why: Appendix A.4 floated this, the user asked for it built
+
+Appendix A.4 raised using the fitted ridge map's prediction as a
+supervisory DISTILLATION target instead of a feedback anchor, as an
+alternative to `h10_ridge_residual`'s abandoned approach -- structurally
+different enough from `h10` that it shouldn't reproduce that failure,
+but explicitly flagged there as untested speculation, not a validated
+plan. This section is that idea, built and verified on MPS.
+
+### 31.2 What changed, and why it can't reproduce `h10`'s blowup
+
+New standalone function `ridge_distill_targets(ground_truth_lat, ridge_A, cfg)`
+(train_production_transformer_deep_dive.py, next to `centroid_velocity_loss`)
+duplicates `model_variants.py`'s `_ridge_anchor()` math (same target
+alignment: token t+1 <- complete source frame ending at t, falling back
+to persistence at the leading edge) but is deliberately NOT a model
+method and NEVER wired into `forward()`. It is called once per training
+step on the batch's GROUND-TRUTH latents (the clean pre-noise slice
+`teacher_forced()` itself builds, not the model's own prediction), and
+its output never feeds back into itself, the model, or any later call --
+there is no recursive chain for a bad eigendirection to compound over.
+This is the exact property `h10_ridge_residual` lacked: that arm wired
+the ridge map into the model's own output, which then got fed back as
+input on every subsequent AR rollout step, so persistence's
+non-expansive guarantee (copying can't amplify) didn't apply and the
+error compounded multiplicatively (§26.2). Distillation-as-a-loss-term
+has nothing analogous to compound.
+
+New `Config` fields: `RIDGE_DISTILL_WEIGHT` (default `0.0`, opt-in) and
+`RIDGE_DISTILL_WARMUP_FRAC` (default `0.2`, same ramp convention as
+`AR_WEIGHT_WARMUP_FRAC`). Wired into the main training loop right after
+the primary `centroid_velocity_loss` computation, on EVERY micro-batch
+(not gated to `micro==0` like the AR aux loss) since it's one matmul
+against a frozen buffer, not a sequential loop -- cheap enough not to
+need frequency gating. Requires `Config.TOKENIZATION == 'token'` (same
+scoping as `_ridge_anchor()`) and a fitted `Config.RIDGE_MAP_PATH` file
+on disk; raises loudly, not silently, if either precondition is unmet.
+Zero new model parameters -- every existing checkpoint, including the
+recovered `saved_models/r2_s7_h9_scaled_rollout_best.pt` (step 134000,
++31.35%, confirmed by the user as the clean baseline going forward),
+stays warm-startable into this path unchanged.
+
+New arm `h11_ridge_distill` (ROUND2_ARMS["H"], next to `h9_ar_freq1`/
+`h10_ridge_residual`): `h9_ar_freq1`'s exact overrides plus
+`RIDGE_DISTILL_WEIGHT=0.5`, directly comparable to both `h9` (+43.78%,
+no distillation) and `h10` (catastrophic failure) since it shares `h9`'s
+exact base config.
+
+### 31.3 New test file: `tests/test_ridge_distill_loss.py`
+
+No permanent test file existed for the ridge mechanism at all before
+this (§26.2's own verification was an ad-hoc, not-committed check).
+Covers: exact hand-checked alignment against a `2*I` ridge matrix
+(mirroring §26.2's own method), fallback-to-persistence at the leading
+edge, correct behaviour when sequence length isn't a whole multiple of
+`NUM_X`, an explicit "feeding the output back in produces an independent
+result, not a compounded one" structural check, and
+`RIDGE_DISTILL_WEIGHT` defaulting to `0.0`. 7 new tests; full suite now
+51 (was 44), all passing.
+
+### 31.4 Verified on MPS (this Mac), before any CUDA time
+
+Two real local `train()` invocations (not `--smoke-test`, which never
+touches data/loss/checkpoints at all) against `data/train_80.h5` /
+`data/val_80.h5` at `--subset-ratio 0.02`:
+
+1. **Cold start** (`--fresh --no-warm-start`, 10 steps): `[ridge-distill]
+   loaded .../ridge_frame_map.pt (A: (471, 470)) -- weight ramps 0 -> 0.5
+   over 2 steps` printed correctly; the v6.0 banner correctly showed
+   **STARTING COMPLETELY FRESH** (red); training completed 10 finite
+   steps (no NaN/Inf, exactly as expected -- there is no feedback path
+   here for anything to blow up through); checkpoints saved normally.
+   The eval-time rollout number at step 10 was catastrophically bad
+   (-46547%), which is EXPECTED and not a regression signal: `AR_MODE`'s
+   `frame_ar` loss is disabled entirely on MPS (`regime.disable_ar`), so
+   these 10 steps trained on nothing but the per-token teacher-forced +
+   distillation loss -- nowhere near enough for the AR rollout task at
+   this step count, same as any arm this early.
+2. **Resume** (same command, `--fresh` removed): `[start-from:resume]
+   .../r2_h11_ridge_distill_latest.pt @ step 10` /
+   `(missing=0, unexpected=0, dropped_length_dependent=[])`, and the
+   banner correctly flipped to **RESUMING FROM CHECKPOINT -- STEP 10**
+   (green) -- confirms v6.0's resume banner and v6.1's new loss term
+   compose correctly in the same run.
+
+Smoke-test artifacts from both runs moved to `saved_models/sweep_arms_local/`
+after verification, keeping `saved_models/` root limited to the one
+confirmed-best checkpoint (per the §"move checkpoints" reorganisation
+earlier this session).
+
+### 31.5 What v6.1 does NOT change (yet)
+
+- `model_variants.py` is untouched -- no new parameters, no forward()
+  changes. `h1_ar_freq2` through `h10_ridge_residual`, `s7_h9_scaled`,
+  and `s8_h9_moreseqs_scaled` are all unchanged; `h11_ridge_distill` is
+  an addition.
+- No claim is made about whether `RIDGE_DISTILL_WEIGHT=0.5` actually
+  helps `h9`'s result -- MPS verification here is mechanical (loads,
+  runs, resumes, doesn't crash), not a research result. That requires a
+  real CUDA shallow screen, same as every other Branch H arm.
+- `WANDB_PROJECT` stays `NI_Review_v6` -- this is a minor version within
+  the v6.x line (new loss term + arm, no wandb/checkpoint-format change),
+  not a major boundary.

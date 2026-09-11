@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Full pod lifecycle, driven entirely by runpodctl (no OAuth/MCP needed):
+# create a pod -> wait for SSH -> build + scp the payload tarball -> run a time-boxed
+# training job -> pull ONLY the new artifacts back -> terminate the pod.
+#
+# PREREQUISITE -- do this yourself, NOT through this script or in chat
+# ======================================================================
+# A RunPod API key must be configured for runpodctl before running this.
+#
+# 1. https://www.console.runpod.io/user/settings -> expand "API Keys" ->
+#    "Create API Key".
+# 2. Permissions: select "All (full access)", NOT "Restricted" or
+#    "Read Only" -- runpodctl needs to create/list/delete pods and fetch
+#    SSH info, all write/management operations. RunPod's "Restricted"
+#    tier is scoped to per-Serverless-endpoint access, not documented to
+#    cover Pod management, so "All" is the only tier confirmed to work
+#    for what this script does.
+# 3. Copy the key (shown once), then run ONE of these YOURSELF, in your
+#    own terminal:
+#
+#      runpodctl doctor                    # interactive prompt, saves the key
+#      export RUNPOD_API_KEY=your-key      # this shell session only
+#
+# Never paste the key into a chat message, a script argument, or a
+# command line another process could log -- both methods above keep it
+# out of this script entirely; runpodctl reads it from
+# ~/.runpod/config.toml or the env var on its own. This script only ever
+# calls `runpodctl user` to CHECK that credentials exist -- it never
+# reads, prints, or stores the key itself.
+#
+# USAGE
+#   bash singleshot/provision_and_run.sh
+#
+# ENV VARS (all optional)
+#   GPU_ID             exact GPU type string from `runpodctl gpu list`
+#                       (default: auto-picks the first available H200 or
+#                       H300 listing; override if neither is in stock)
+#   TEMPLATE_ID         RunPod template id (default: runpod-torch-v280,
+#                       verified via `runpodctl template search pytorch`
+#                       to actually exist -- do NOT hand-type an --image
+#                       tag guessed from --help's illustrative example;
+#                       an earlier version of this script did exactly
+#                       that with a nonexistent tag and RunPod's backend
+#                       surfaced it as an opaque "graphql_error" instead
+#                       of "image not found"). bootstrap_remote.sh
+#                       installs its own venv + torch on top regardless
+#                       of which template's image is used, so this only
+#                       needs to be ANY real, working CUDA+Python3 image.
+#   IMAGE               set this instead of TEMPLATE_ID to use a specific
+#                       docker image directly (`--image`) rather than a
+#                       template -- verify it actually exists first, e.g.
+#                       `runpodctl template search <name>` or
+#                       `runpodctl template list --type official`.
+#   CONTAINER_DISK_GB   container disk size in GB (default 60 -- payload is
+#                       ~11.3GB; leaves headroom for the venv + checkpoints)
+#   ARM                 arm to run for this budget (default h11_ridge_distill
+#                       -- see rationale below; override for a different arm)
+#   MAX_HOURS           wall-clock cap passed to the trainer (default 0.5 = 30 min)
+#   MAX_STEPS           optimizer-step cap (default 2500 -- deliberately
+#                       sized BELOW a conservative throughput estimate so
+#                       WARMUP_FRAC doesn't break, same lesson as
+#                       OVERVIEW.md v5.0 section 28.6)
+#   WANDB_API_KEY       if set, wandb logs in non-interactively for this
+#                       run (`WANDB_API_KEY=... wandb login` supports this
+#                       with no prompt); if unset, the run uses --no-wandb
+#                       -- an unattended pipeline cannot satisfy wandb's
+#                       normal interactive/browser login
+#   POD_ID              reuse an already-running pod instead of creating one
+#   KEEP_POD            set to 1 to skip the final `pod delete` (for
+#                       debugging a run without losing the box)
+#   SSH_KEY             local private key to use (default ~/.ssh/id_ed25519
+#                       -- must match a key added via `runpodctl ssh add-key`
+#                       or already present on the pod's image)
+#
+# WHY h11_ridge_distill BY DEFAULT
+# ==================================
+# It's the one arm from this session verified only on MPS (mechanically:
+# loads, trains, resumes, doesn't crash) and has never touched real CUDA.
+# OVERVIEW.md v6.1 section 31.5 explicitly said the next step was "a real
+# CUDA shallow screen" -- 30 minutes is exactly that budget. Set ARM= to
+# run something else instead (e.g. s8_h9_moreseqs_scaled for the standing
+# production candidate).
+#
+# WHAT THIS SCRIPT DOES NOT DO
+# ==============================
+# It doesn't know RunPod's exact JSON field names for `gpu list --output
+# json` / `pod create --output json` / `ssh info --output json` ahead of
+# a real authenticated call -- runpodctl's --help text doesn't include a
+# schema, and this session has no key to test against. Every parse below
+# is defensive (tries several plausible field names, jq // fallbacks) and
+# ALWAYS prints the raw command output too, so a schema mismatch is
+# visible and fixable rather than silently wrong. If a jq parse comes up
+# empty, the script stops and tells you exactly what to look at instead
+# of guessing further.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TRANSFORMER_DIR="$(dirname "$HERE")"
+REPO_ROOT="$(dirname "$TRANSFORMER_DIR")"
+
+RUNPODCTL="${RUNPODCTL:-$HOME/.local/bin/runpodctl}"
+if ! command -v "$RUNPODCTL" >/dev/null 2>&1; then
+  echo "runpodctl not found at $RUNPODCTL -- see singleshot/README.md's" >&2
+  echo "'RunPod agent setup' section to install it." >&2
+  exit 1
+fi
+
+echo "=================================================================="
+echo " Checking RunPod credentials (never prints the key itself)..."
+echo "=================================================================="
+AUTH_CHECK="$("$RUNPODCTL" user -o json 2>&1 || true)"
+if echo "$AUTH_CHECK" | jq -e '.error' >/dev/null 2>&1; then
+  echo "No RunPod credentials configured. Run ONE of these yourself first:" >&2
+  echo "  runpodctl doctor" >&2
+  echo "  export RUNPOD_API_KEY=your-key   (create one -- 'All (full access)' permissions -- at https://www.console.runpod.io/user/settings)" >&2
+  echo "" >&2
+  echo "(raw check: $AUTH_CHECK)" >&2
+  exit 1
+fi
+echo "  OK -- credentials present."
+echo ""
+
+GPU_ID="${GPU_ID:-}"
+TEMPLATE_ID="${TEMPLATE_ID:-runpod-torch-v280}"
+IMAGE="${IMAGE:-}"
+CONTAINER_DISK_GB="${CONTAINER_DISK_GB:-60}"
+ARM="${ARM:-h11_ridge_distill}"
+MAX_HOURS="${MAX_HOURS:-0.5}"
+MAX_STEPS="${MAX_STEPS:-2500}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
+KEEP_POD="${KEEP_POD:-0}"
+
+if [[ -z "$GPU_ID" && -z "${POD_ID:-}" ]]; then
+  echo "Looking up an available H200/H300 GPU (override with GPU_ID=...)..."
+  GPU_JSON="$("$RUNPODCTL" gpu list -o json 2>&1)"
+  GPU_ID="$(echo "$GPU_JSON" | jq -r '
+    [.[]? // .gpus[]? |
+     select((.id // .gpuId // .displayName // .name // "") | test("H200|H300"; "i")) |
+     (.id // .gpuId // .displayName // .name)
+    ] | .[0] // empty' 2>/dev/null || true)"
+  if [[ -z "$GPU_ID" ]]; then
+    echo "" >&2
+    echo "Could not auto-find an H200/H300 in the GPU list (either none are" >&2
+    echo "in stock right now, or the JSON field names didn't match what this" >&2
+    echo "script guessed -- see the raw output below). Set GPU_ID explicitly" >&2
+    echo "and re-run:" >&2
+    echo "" >&2
+    echo "$GPU_JSON" >&2
+    exit 1
+  fi
+  echo "  using GPU_ID=$GPU_ID"
+fi
+echo ""
+
+if [[ -n "${POD_ID:-}" ]]; then
+  echo "Reusing existing pod $POD_ID (POD_ID was set)."
+  POD_JSON="$("$RUNPODCTL" pod get "$POD_ID" -o json)"
+else
+  if [[ -n "$IMAGE" ]]; then
+    echo "Creating pod (gpu=$GPU_ID, image=$IMAGE, disk=${CONTAINER_DISK_GB}GB)..."
+    IMAGE_FLAGS=(--image "$IMAGE")
+  else
+    echo "Creating pod (gpu=$GPU_ID, template=$TEMPLATE_ID, disk=${CONTAINER_DISK_GB}GB)..."
+    IMAGE_FLAGS=(--template-id "$TEMPLATE_ID")
+  fi
+  echo "This blocks until SSH actually answers (--wait), up to 10 minutes."
+  POD_JSON="$("$RUNPODCTL" pod create \
+    --gpu-id "$GPU_ID" \
+    "${IMAGE_FLAGS[@]}" \
+    --container-disk-in-gb "$CONTAINER_DISK_GB" \
+    --ports '22/tcp' \
+    --public-ip \
+    --wait --wait-timeout 10m \
+    -o json)"
+  POD_ID="$(echo "$POD_JSON" | jq -r '.id // .podId // empty')"
+  if [[ -z "$POD_ID" ]]; then
+    echo "Pod created but couldn't parse its id from the JSON below --" >&2
+    echo "check manually with 'runpodctl pod list':" >&2
+    echo "$POD_JSON" >&2
+    exit 1
+  fi
+  echo "  pod id: $POD_ID"
+fi
+echo ""
+
+cleanup_pod() {
+  if [[ "$KEEP_POD" == "1" ]]; then
+    echo "KEEP_POD=1 set -- leaving pod $POD_ID running. Terminate it"
+    echo "yourself when done: runpodctl pod delete $POD_ID"
+    return
+  fi
+  echo ""
+  echo "Terminating pod $POD_ID..."
+  "$RUNPODCTL" pod delete "$POD_ID" || echo "  (delete failed -- terminate manually: runpodctl pod delete $POD_ID)" >&2
+}
+trap cleanup_pod EXIT
+
+echo "Fetching SSH connection info..."
+SSH_INFO_JSON="$("$RUNPODCTL" ssh info "$POD_ID" -o json 2>&1)"
+echo "$SSH_INFO_JSON"
+POD_HOST="$(echo "$SSH_INFO_JSON" | jq -r '.host // .ip // .sshHost // .publicIp // empty' 2>/dev/null || true)"
+POD_PORT="$(echo "$SSH_INFO_JSON" | jq -r '.port // .sshPort // empty' 2>/dev/null || true)"
+if [[ -z "$POD_HOST" || -z "$POD_PORT" ]]; then
+  # Fall back to regex-extracting from a plain ssh command string, if
+  # that's what this schema actually returns (e.g. a "command"/"sshCommand"
+  # field, or plain text when -o json wasn't fully honoured for this
+  # subcommand).
+  CMD_LINE="$(echo "$SSH_INFO_JSON" | grep -oE 'ssh[^"]*' | head -1 || true)"
+  POD_HOST="${POD_HOST:-$(echo "$CMD_LINE" | grep -oE '@[^ ]+' | tr -d '@' | head -1)}"
+  POD_PORT="${POD_PORT:-$(echo "$CMD_LINE" | grep -oE '\-p ?[0-9]+' | grep -oE '[0-9]+' | head -1)}"
+fi
+if [[ -z "$POD_HOST" || -z "$POD_PORT" ]]; then
+  echo "" >&2
+  echo "Could not parse host/port out of the ssh-info output above." >&2
+  echo "Read it yourself, then re-run the remaining steps manually:" >&2
+  echo "  POD_HOST=<host> POD_PORT=<port> bash $HERE/scp_to_pod.sh" >&2
+  exit 1
+fi
+echo "  host=$POD_HOST port=$POD_PORT"
+echo ""
+
+export POD_HOST POD_PORT SSH_KEY
+echo "=================================================================="
+echo " Building tarball (if not already built)"
+echo "=================================================================="
+TARBALL="${TARBALL:-$HERE/cgan_singleshot_payload.tar.gz}"
+if [[ -f "$TARBALL" ]]; then
+  echo "  reusing existing $TARBALL ($(du -h "$TARBALL" | cut -f1))"
+  echo "  (delete it first, or set OUT_FILE/TARBALL to a new path, to force a rebuild)"
+else
+  bash "$HERE/build_tarball.sh"
+fi
+
+echo ""
+echo "=================================================================="
+echo " scp'ing + extracting on the pod"
+echo "=================================================================="
+TARBALL="$TARBALL" bash "$HERE/scp_to_pod.sh"
+
+echo ""
+echo "=================================================================="
+echo " Bootstrapping + launching the ${MAX_HOURS}h-capped run (arm=$ARM)"
+echo "=================================================================="
+WANDB_FLAG="--no-wandb"
+WANDB_SETUP=":"
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  WANDB_FLAG=""
+  WANDB_SETUP="WANDB_API_KEY='$WANDB_API_KEY' wandb login --relogin"
+fi
+
+# Single non-interactive SSH command: bootstrap (venv + deps, skipping the
+# printed-not-run wandb-login step) then launch training directly, capped
+# by both MAX_STEPS and MAX_HOURS. Blocks until the trainer exits.
+ssh -p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+  "root@$POD_HOST" bash -s <<REMOTE
+set -euo pipefail
+cd /workspace/cgan/transformer_neurIPS
+bash singleshot/bootstrap_remote.sh
+# bootstrap_remote.sh's default VENV_DIR is \$REPO_ROOT/.venv, i.e.
+# /workspace/cgan/.venv -- one level up from transformer_neurIPS/.
+source ../.venv/bin/activate
+$WANDB_SETUP
+python train_production_transformer_deep_dive.py \\
+  --arm $ARM --round 2 --max-steps $MAX_STEPS --max-hours $MAX_HOURS \\
+  --val-every 500 $WANDB_FLAG
+REMOTE
+
+echo ""
+echo "=================================================================="
+echo " Pulling back ONLY the new artifacts (not the training data)"
+echo "=================================================================="
+rsync -avP -e "ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
+  "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/saved_models/r2_${ARM}_"* \
+  "$TRANSFORMER_DIR/saved_models/" 2>&1 || echo "  (no r2_${ARM}_* files found to pull -- check the run actually saved a checkpoint)"
+rsync -avP -e "ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
+  "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/sweep_logs/" \
+  "$TRANSFORMER_DIR/sweep_logs/" 2>&1 || true
+
+echo ""
+echo "Done. Results under saved_models/ and sweep_logs/ (local)."
+echo "Pod will now be terminated (trap on EXIT) unless KEEP_POD=1 was set."

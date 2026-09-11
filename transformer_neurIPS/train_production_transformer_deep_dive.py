@@ -687,6 +687,21 @@ class Config:
     # 0.0 (off) preserves existing arm behavior exactly.
     AR_FEEDBACK_NOISE_STD = 0.0
 
+    # Ridge-map DISTILLATION loss (v6.1, OVERVIEW.md Appendix A/B) -- the
+    # safe reformulation of the abandoned h10_ridge_residual idea. Pulls
+    # the network's own one-step prediction toward the fitted ridge map's
+    # prediction (see linear_frame_baseline(), which saves the fitted
+    # matrix to RIDGE_MAP_PATH) as an EXTRA loss term computed once per
+    # step from ground truth. Unlike DELTA_ANCHOR='ridge' (model_variants.py
+    # BaseTransformer._ridge_anchor(), wired into forward() and re-fed on
+    # every AR rollout step -- the mechanism behind h10's catastrophic
+    # feedback blowup), the ridge prediction here NEVER re-enters itself or
+    # the model's own recursive chain; it is a pure supervisory target,
+    # structurally incapable of that failure mode. 0.0 (off) preserves
+    # existing arm behavior exactly.
+    RIDGE_DISTILL_WEIGHT = 0.0
+    RIDGE_DISTILL_WARMUP_FRAC = 0.2   # same ramp convention as AR_WEIGHT_WARMUP_FRAC
+
     # -- evaluation ---------------------------------------------------------
     VAL_CONTEXT_STEPS = 12                      # frames fed as context
     VAL_ROLLOUT_STEPS = NUM_X * (NUM_TIME - VAL_CONTEXT_STEPS)   # 1768 tokens (v1.0: 728)
@@ -1080,6 +1095,23 @@ ROUND2_ARMS = {
                                                  "AR_FRAMES": 8, "AR_SEQS": 2,
                                                  "AR_EVERY_N_STEPS": 2,
                                                  "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
+            "h11_ridge_distill": {"desc": "h9_ar_freq1's exact config plus RIDGE_DISTILL_WEIGHT -- "
+                                          "the SAFE reformulation of h10_ridge_residual's idea "
+                                          "(OVERVIEW.md v6.1): distill the network's one-step "
+                                          "prediction toward the fitted ridge map's prediction as "
+                                          "an extra loss term, instead of wiring the ridge map into "
+                                          "forward()'s own output as an anchor. The ridge prediction "
+                                          "here is computed once per step from ground truth and never "
+                                          "re-enters any recursive chain, so it cannot reproduce h10's "
+                                          "feedback-compounding blowup by construction (see "
+                                          "ridge_distill_targets()'s docstring). Requires this sweep's "
+                                          "diagnostics step to have run (fits and saves the ridge map "
+                                          "to Config.RIDGE_MAP_PATH before any arm trains) -- do not "
+                                          "pass --skip-diagnostics on a run that includes h11.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                                "AR_FRAMES": 8, "AR_SEQS": 2,
+                                                "AR_EVERY_N_STEPS": 1,
+                                                "RIDGE_DISTILL_WEIGHT": 0.5}},
         },
     },
     # ---------------------------------------------------------------- branch V
@@ -1409,6 +1441,60 @@ def centroid_velocity_loss(pred_latent, tgt_latent, cfg=Config):
     if getattr(cfg, 'CENTROID_LOSS', 'l2') == 'mse':
         return err.pow(2).mean()
     return torch.linalg.vector_norm(err, dim=-1).mean()
+
+
+def ridge_distill_targets(ground_truth_lat, ridge_A, cfg):
+    """Ridge map's next-token prediction from GROUND TRUTH latents, for
+    every position with a complete source frame -- a supervisory
+    DISTILLATION target for `Config.RIDGE_DISTILL_WEIGHT`, not an anchor.
+
+    Deliberately NOT a method on the model, unlike `model_variants.py`'s
+    `BaseTransformer._ridge_anchor()`, which is wired into `forward()`'s
+    own output and therefore re-enters the autoregressive feedback loop on
+    every AR rollout step -- exactly the mechanism behind
+    `h10_ridge_residual`'s catastrophic blowup (OVERVIEW.md v4.6 §26.2):
+    persistence is non-expansive under repeated feedback, the ridge map is
+    not, and any eigendirection with gain > 1 compounds multiplicatively
+    over a 68-step rollout. This function is pure and is called ONCE per
+    training step on the batch's ground-truth latents; its output never
+    feeds back into itself, into the model, or into any later call of
+    this same function -- there is no recursive chain here for a bad
+    eigendirection to compound over. Structurally incapable of `h10`'s
+    failure mode, not just empirically safer.
+
+    Same alignment convention as `_ridge_anchor()` (target token t+1 <-
+    the complete source frame ending at t, falling back to persistence --
+    same-x-location, previous frame -- wherever no complete source frame
+    is available yet). The math is intentionally DUPLICATED rather than
+    shared with `_ridge_anchor()` so a future edit to that method (which
+    IS meant to sit in the AR feedback path for `DELTA_ANCHOR='ridge'`
+    models) can never accidentally change this distillation-only path's
+    behavior, or vice versa.
+
+    Token-tokenization only, matching every AR-mode arm and
+    `_ridge_anchor()`'s own scoping -- callers must not invoke this under
+    `Config.TOKENIZATION == 'frame'`.
+    """
+    NX = cfg.NUM_X
+    B, T, LD = ground_truth_lat.shape
+    k_eff = min(NX - 1, T)
+    fallback = torch.cat(
+        [ground_truth_lat[:, :k_eff], ground_truth_lat[:, :T - k_eff]], dim=1)
+    n_complete = T // NX
+    if n_complete < 1:
+        return fallback
+    D = NX * LD
+    frames = ground_truth_lat[:, :n_complete * NX, :].reshape(B, n_complete, D)
+    ones = torch.ones(B, n_complete, 1, dtype=frames.dtype, device=frames.device)
+    src1 = torch.cat([frames, ones], dim=-1)
+    with torch.autocast(device_type='cuda', enabled=False):
+        pred = src1.float() @ ridge_A.float()      # (B, n_complete, D)
+    pred = pred.to(ground_truth_lat.dtype).reshape(B, n_complete * NX, LD)
+    start = NX - 1
+    end = min(T, start + pred.shape[1])
+    out = fallback.clone()
+    out[:, start:end, :] = pred[:, :end - start, :]
+    return out
 
 
 def centroid_per_dim_errors(pred_latent, tgt_latent, cfg=Config):
@@ -3471,6 +3557,44 @@ def train(args, log=print):
     ar_target_w = float(Config.AR_LOSS_WEIGHT)
     ar_warm = max(1, int(Config.MAX_STEPS * float(Config.AR_WEIGHT_WARMUP_FRAC)))
 
+    # -- ridge-map distillation loss (v6.1) ---------------------------------
+    # Safe reformulation of the abandoned h10_ridge_residual idea -- see
+    # ridge_distill_targets()'s docstring for why this can't reproduce that
+    # failure. Loaded once here (not per-step) since Config.RIDGE_MAP_PATH
+    # is a fixed file for the whole run. Independent of regime.disable_ar /
+    # AR_MODE entirely -- this hooks into the always-on per-step
+    # teacher-forced loss, not the frame_ar auxiliary loss MPS disables, so
+    # it runs identically on every device.
+    ridge_distill_w_target = float(Config.RIDGE_DISTILL_WEIGHT)
+    ridge_distill_warm = max(1, int(Config.MAX_STEPS * float(Config.RIDGE_DISTILL_WARMUP_FRAC)))
+    ridge_A = None
+    if ridge_distill_w_target > 0:
+        if Config.TOKENIZATION != 'token':
+            raise ValueError(
+                f"RIDGE_DISTILL_WEIGHT={ridge_distill_w_target} requires "
+                f"TOKENIZATION='token' (got {Config.TOKENIZATION!r}) -- "
+                f"ridge_distill_targets() shares _ridge_anchor()'s "
+                f"token-only alignment convention.")
+        ridge_path = getattr(Config, 'RIDGE_MAP_PATH', None)
+        if not ridge_path or not os.path.exists(ridge_path):
+            raise FileNotFoundError(
+                f"RIDGE_DISTILL_WEIGHT={ridge_distill_w_target} requires "
+                f"Config.RIDGE_MAP_PATH to point at a fitted ridge map -- "
+                f"run diagnostics first (linear_frame_baseline() saves it "
+                f"there): {ridge_path}")
+        ridge_payload = torch.load(ridge_path, map_location=device, weights_only=False)
+        ridge_A = ridge_payload['A'].to(device=device, dtype=torch.float32)
+        expected_d = Config.NUM_X * Config.LATENT_DIM
+        if tuple(ridge_A.shape) != (expected_d + 1, expected_d):
+            raise ValueError(
+                f"ridge map at {ridge_path} has shape {tuple(ridge_A.shape)}, "
+                f"expected {(expected_d + 1, expected_d)} for this Config's "
+                f"NUM_X={Config.NUM_X}, LATENT_DIM={Config.LATENT_DIM} "
+                f"(it was fit under a different data/shape configuration).")
+        log(f"  [ridge-distill] loaded {ridge_path} "
+            f"(A: {tuple(ridge_A.shape)}) -- weight ramps 0 -> "
+            f"{ridge_distill_w_target} over {ridge_distill_warm} steps")
+
     # -- memory expectation printout ---------------------------------------
     # Rough peak-attention-score estimate per code path, so an operator can
     # see at a glance what the resolved regime is spending memory on and
@@ -3555,11 +3679,13 @@ def train(args, log=print):
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_acc = primary_acc = ar_acc = 0.0
+        loss_acc = primary_acc = ar_acc = distill_acc = 0.0
         last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
                   and step % max(1, int(Config.AR_EVERY_N_STEPS)) == 0)
+        distill_w = (ridge_distill_w_target * min(1.0, (step + 1) / ridge_distill_warm)
+                     if ridge_A is not None else 0.0)
 
         micro_count = 0
         for micro in range(accum_steps):
@@ -3579,6 +3705,18 @@ def train(args, log=print):
                 loss = centroid_velocity_loss(pred_lat, tgt_lat, Config)
                 primary_acc += loss.item()
                 last_pred, last_tgt = pred_lat.detach(), tgt_lat.detach()
+                # Ridge-distillation term: one matmul against a frozen buffer,
+                # no sequential loop -- cheap enough to run on EVERY
+                # micro-batch, unlike the AR aux loss below. Computed from the
+                # same clean ground-truth slice teacher_forced() builds
+                # internally (pre-noise), never from the model's own output --
+                # see ridge_distill_targets()'s docstring for why that matters.
+                if ridge_A is not None:
+                    ridge_inp = to_per_token_latent(batch[:, :-1, :Config.LATENT_DIM], Config)
+                    ridge_tgt_lat = ridge_distill_targets(ridge_inp, ridge_A, Config)
+                    distill = centroid_velocity_loss(pred_lat, ridge_tgt_lat, Config)
+                    distill_acc += distill.item()
+                    loss = loss + distill_w * distill
                 # The auxiliary loss is sequential and by far the most expensive
                 # part of a step, so it runs on the first micro-batch only.
                 if run_ar and micro == 0:
@@ -3661,6 +3799,9 @@ def train(args, log=print):
                 payload.update({f"train/{k}": v for k, v in dim_err.items()})
             if run_ar:
                 payload["ar_loss"] = ar_acc
+            if ridge_A is not None:
+                payload["ridge_distill_loss"] = distill_acc / accum_steps
+                payload["ridge_distill_weight"] = distill_w
             if torch.cuda.is_available():
                 payload["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
             tel.log(payload)

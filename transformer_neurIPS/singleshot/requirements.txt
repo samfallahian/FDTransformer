@@ -1,0 +1,48 @@
+# Feedable requirements for the singleshot deploy package.
+# Verbatim copy of ../requirements_sweep.txt (the verified-minimal set for
+# train_production_transformer_deep_dive.py / model_variants.py /
+# sweep_deep_dive.py) -- kept as a separate file here so this directory is
+# self-contained and can be `pip install -r requirements.txt`'d without
+# reaching back into the rest of the repo. If ../requirements_sweep.txt
+# changes, resync this copy.
+#
+# INSTALL ORDER MATTERS FOR TORCH -- see bootstrap_remote.sh, which reads
+# the note below and builds the correct STABLE-CUDA install command
+# automatically; do not just `pip install -r requirements.txt` blindly on
+# a fresh box and expect a CUDA build of torch to appear (plain PyPI
+# `torch` is CPU-only).
+
+numpy==2.4.2
+h5py==3.15.1
+wandb>=0.29.0
+
+# --- torch: read this before installing -------------------------------
+#
+# STABLE branch, not nightly -- the nightly build used during local
+# development (torch==2.12.0.dev20260312) was never a requirement of the
+# code, just whatever happened to be on hand; everything this repo uses
+# (torch.compile, torch.amp.autocast with bfloat16, torch.jit.trace/
+# torch.jit.script) has been stable-release functionality for a long
+# time. Plain `pip install torch` pulls a CPU-only build, though --
+# CUDA wheels live on a version-specific index:
+#
+#   pip install torch --index-url https://download.pytorch.org/whl/<CUDA_TAG>
+#
+# where <CUDA_TAG> matches the box's CUDA driver (check with `nvidia-smi`
+# for the driver's max supported CUDA version, then pick the closest
+# cuXXX tag PyTorch's stable index offers -- see
+# https://pytorch.org/get-started/locally/, "Stable" tab, for the current
+# tag matrix; this changes over time so don't hardcode a specific cuXXX
+# tag into automation without checking). bootstrap_remote.sh in this same
+# directory does this detection for you.
+#
+# Minimum functional requirement (not exact-version-critical): torch with
+# CUDA support, recent enough for `torch.compile`, `torch.amp.autocast`
+# with bfloat16, and `torch.jit.trace`/`torch.jit.script` (both used by
+# save_scripted_model()).
+torch>=2.11.0
+
+# --- Python version -----------------------------------------------------
+# Python 3.11 or 3.12 is the conservative, best-supported target for this
+# torch.jit-based scripted-model path. 3.14 has been verified to work but
+# is bleeding-edge (expect DeprecationWarnings from torch.jit on it).

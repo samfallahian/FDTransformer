@@ -45,8 +45,10 @@ htmlcov/
 *.pkl.csv
 encoder/autoencoderGEN3/validation_detailed_*.csv
 
-# singleshot deploy package's built tarball (~11GB) -- built locally by
-# build_tarball.sh, never committed (see transformer_neurIPS/singleshot/README.md).
+# defensive: singleshot deploy package no longer builds a tarball
+# (transfers individual files instead -- see
+# transformer_neurIPS/singleshot/README.md), but keep this in case one
+# ever gets created by hand for the cloud-storage-relay option.
 transformer_neurIPS/singleshot/*.tar*
 
 # Environment variables

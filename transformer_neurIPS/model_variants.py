@@ -528,7 +528,22 @@ class BaseTransformer(nn.Module):
         out[:, start:end, :] = pred[:, :end - start, :]
         return out
 
-    def forward(self, x):
+    def forward(self, x, force_persistence_anchor: bool = False):
+        """`force_persistence_anchor`, when True, uses `_delta_anchor()`
+        (plain persistence) for THIS call regardless of
+        `self.delta_anchor_kind` -- overriding `DELTA_ANCHOR='ridge'`
+        one call at a time (OVERVIEW.md v6.3, menu item 3). Exists so
+        `DELTA_ANCHOR='ridge'` can be used for the non-recursive
+        teacher-forced loss (safe: `_ridge_anchor()` is applied once,
+        never fed back into itself) while every RECURSIVE caller
+        (`frame_ar_loss`, `rollout_frames`, `sched_sampling_loss`'s
+        pass-1) forces persistence instead -- persistence is non-
+        expansive under repeated feedback, the ridge map is not, and
+        letting the ridge anchor sit inside a feedback loop is exactly
+        what caused `h10_ridge_residual`'s catastrophic blowup
+        (OVERVIEW.md v4.6 section 26.2). Default `False` preserves
+        every existing call site's behavior unchanged.
+        """
         B, T, C = x.shape
         raw_lat = x[..., :self.latent_dim]
 
@@ -547,7 +562,7 @@ class BaseTransformer(nn.Module):
         out = self.output_head(self.ln_f(h))
 
         if self.predict_delta:
-            if self.delta_anchor_kind == 'ridge':
+            if self.delta_anchor_kind == 'ridge' and not force_persistence_anchor:
                 out = out + self._ridge_anchor(raw_lat)
             else:
                 out = out + self._delta_anchor(raw_lat)

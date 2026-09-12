@@ -673,7 +673,20 @@ class Config:
     AR_MODE = 'none'           # none | frame_ar | sched
     AR_LOSS_WEIGHT = 0.0
     AR_WEIGHT_WARMUP_FRAC = 0.2   # ramp AR weight 0 -> AR_LOSS_WEIGHT over this fraction
-    AR_FRAMES = 2              # horizon in whole TIME FRAMES (10 tokens each, v3.1)
+    AR_FRAMES = 2              # horizon in whole TIME FRAMES (10 tokens each, v3.1) -- the FINAL/target horizon; stays the ceiling even under a curriculum (see AR_FRAMES_START)
+    # Rollout-horizon curriculum (OVERVIEW.md v6.3, menu item 1). None
+    # (default) disables the curriculum entirely -- AR_FRAMES is used
+    # flat from step 1, exactly today's behavior. When set to an int
+    # < AR_FRAMES, the AR loss horizon ramps AR_FRAMES_START -> AR_FRAMES
+    # linearly over AR_FRAMES_WARMUP_FRAC*MAX_STEPS steps, so the network
+    # isn't asked to correct a long rollout before it can reliably do a
+    # short one. AR_FRAMES itself is deliberately left as the ceiling
+    # (not overwritten by the curriculum's current value) so the
+    # memory-expectation printout below -- which reads AR_FRAMES once at
+    # startup -- still reports the true worst-case peak, not a
+    # curriculum-deflated early estimate.
+    AR_FRAMES_START = None
+    AR_FRAMES_WARMUP_FRAC = 0.3   # separate ramp length from AR_WEIGHT_WARMUP_FRAC -- horizon and loss-weight curricula are independent knobs
     AR_SEQS = 4                # sequences used for the sequential AR loop
     AR_EVERY_N_STEPS = 4
     AR_DETACH_FEEDBACK = True  # truncate gradient through the fed-back token
@@ -1095,23 +1108,34 @@ ROUND2_ARMS = {
                                                  "AR_FRAMES": 8, "AR_SEQS": 2,
                                                  "AR_EVERY_N_STEPS": 2,
                                                  "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
-            "h11_ridge_distill": {"desc": "h9_ar_freq1's exact config plus RIDGE_DISTILL_WEIGHT -- "
-                                          "the SAFE reformulation of h10_ridge_residual's idea "
-                                          "(OVERVIEW.md v6.1): distill the network's one-step "
-                                          "prediction toward the fitted ridge map's prediction as "
-                                          "an extra loss term, instead of wiring the ridge map into "
-                                          "forward()'s own output as an anchor. The ridge prediction "
-                                          "here is computed once per step from ground truth and never "
-                                          "re-enters any recursive chain, so it cannot reproduce h10's "
-                                          "feedback-compounding blowup by construction (see "
-                                          "ridge_distill_targets()'s docstring). Requires this sweep's "
-                                          "diagnostics step to have run (fits and saves the ridge map "
-                                          "to Config.RIDGE_MAP_PATH before any arm trains) -- do not "
-                                          "pass --skip-diagnostics on a run that includes h11.",
+            "h11_ridge_distill": {"desc": "h9_ar_freq1's config, upgraded in place (OVERVIEW.md "
+                                          "v6.3) with THREE acceleration ideas at once against the "
+                                          "ridge/linear ceiling (+69%, v6.2) -- a deliberate "
+                                          "speed-over-clean-attribution tradeoff for a single 30-min "
+                                          "CUDA screen, called out honestly rather than hidden: "
+                                          "(1) AR_FRAMES_START=2 curriculum, ramping the AR-loss "
+                                          "horizon up to AR_FRAMES=8 rather than asking the network "
+                                          "to correct a full 8-frame rollout from step 1; "
+                                          "(2) RIDGE_DISTILL_WEIGHT now also distills the AR "
+                                          "rollout itself toward the ridge map's own independent "
+                                          "multi-frame rollout (ridge_rollout_targets()), not just "
+                                          "the one-step prediction; (3) PREDICT_DELTA=True with "
+                                          "DELTA_ANCHOR='ridge' is engaged for the first time on "
+                                          "this arm, SAFELY, because forward()'s new "
+                                          "force_persistence_anchor flag forces plain persistence "
+                                          "for every recursive (AR/rollout) call and reserves the "
+                                          "ridge anchor for the one-step teacher-forced loss only -- "
+                                          "the split that h10_ridge_residual (v4.6 section 26.2) "
+                                          "didn't have, which is why that arm blew up and this one "
+                                          "shouldn't. Requires this sweep's diagnostics step to have "
+                                          "run (fits and saves the ridge map to Config.RIDGE_MAP_PATH "
+                                          "before any arm trains) -- do not pass --skip-diagnostics "
+                                          "on a run that includes h11.",
                                   "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
-                                                "AR_FRAMES": 8, "AR_SEQS": 2,
-                                                "AR_EVERY_N_STEPS": 1,
-                                                "RIDGE_DISTILL_WEIGHT": 0.5}},
+                                                "AR_FRAMES": 8, "AR_FRAMES_START": 2,
+                                                "AR_SEQS": 2, "AR_EVERY_N_STEPS": 1,
+                                                "RIDGE_DISTILL_WEIGHT": 0.5,
+                                                "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
         },
     },
     # ---------------------------------------------------------------- branch V
@@ -1495,6 +1519,46 @@ def ridge_distill_targets(ground_truth_lat, ridge_A, cfg):
     out = fallback.clone()
     out[:, start:end, :] = pred[:, :end - start, :]
     return out
+
+
+def ridge_rollout_targets(last_frame_lat, ridge_A, cfg, n_frames):
+    """Ridge map's OWN independent MULTI-FRAME rollout -- a supervisory
+    target for `frame_ar_loss`'s AR rollout (OVERVIEW.md v6.3, menu item
+    2), not a one-step target like `ridge_distill_targets()` above.
+
+    Reuses the exact recursion `linear_frame_baseline()` already uses for
+    its own diagnostic rollout (see that function's validation loop):
+    starting from the single frame immediately preceding the horizon,
+    repeatedly appends a bias column and multiplies by `ridge_A` to
+    predict the next frame, feeding EACH STEP'S OWN OUTPUT back into
+    itself for `n_frames` steps. Critically, this recursion is entirely
+    self-contained -- it never touches the network, and its result is
+    only ever used as a fixed comparison target for the network's
+    separately-computed rollout, never substituted into the network's
+    own feedback chain. Same safety property as `ridge_distill_targets()`:
+    structurally incapable of `h10_ridge_residual`'s feedback-compounding
+    failure (OVERVIEW.md v4.6 section 26.2), because nothing here is
+    IN the network's loop to compound through.
+
+    `last_frame_lat`: (B, NX*LD) -- the flattened frame immediately
+    before the rollout horizon (token tokenization only, matching
+    `_ridge_anchor()`/`ridge_distill_targets()`'s own scoping).
+    Returns (B, n_frames*NX, LD), matching `frame_ar_loss`'s own
+    `torch.cat(preds, 1)` shape exactly, ready for direct comparison via
+    `centroid_velocity_loss()`.
+    """
+    NX, LD = cfg.NUM_X, cfg.LATENT_DIM
+    B = last_frame_lat.shape[0]
+    cur = last_frame_lat
+    ones = torch.ones(B, 1, dtype=torch.float32, device=cur.device)
+    preds = []
+    with torch.autocast(device_type='cuda', enabled=False):
+        cur = cur.float()
+        for _ in range(n_frames):
+            cur = torch.cat([cur, ones], dim=1) @ ridge_A.float()
+            preds.append(cur.unsqueeze(1))
+    out = torch.cat(preds, dim=1).to(last_frame_lat.dtype)   # (B, n_frames, D)
+    return out.reshape(B, n_frames * NX, LD)
 
 
 def centroid_per_dim_errors(pred_latent, tgt_latent, cfg=Config):
@@ -2017,6 +2081,9 @@ def rollout_frames(model, batch, cfg, ctx_frames=None, n_frames=None):
         curr = frames[:, :ctx_frames, :]
         preds = []
         for _ in range(n_frames):
+            # NOTE: FrameTransformer.forward() has no `force_persistence_
+            # anchor` param (it never implemented a ridge-anchor option at
+            # all -- see model_variants.py) -- do not pass it here.
             nxt = model(curr)[:, -1:, :]
             preds.append(nxt)
             gi = curr.shape[1]
@@ -2033,7 +2100,7 @@ def rollout_frames(model, batch, cfg, ctx_frames=None, n_frames=None):
     curr = batch[:, :ctx_len, :]
     preds = []
     for _ in range(horizon):
-        nxt = model(curr)[:, -1:, :]
+        nxt = model(curr, force_persistence_anchor=True)[:, -1:, :]
         preds.append(nxt)
         gi = curr.shape[1]
         if gi >= batch.shape[1]:
@@ -2046,7 +2113,8 @@ def rollout_frames(model, batch, cfg, ctx_frames=None, n_frames=None):
     return out[:, :n_done * NX, :].reshape(B, n_done, NX, LD)
 
 
-def frame_ar_loss(model, batch, cfg, generator=None):
+def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
+                  ridge_A=None):
     """Frame-aligned multi-step autoregressive loss.
 
     The context is a whole number of frames and the horizon is a whole number of
@@ -2058,9 +2126,21 @@ def frame_ar_loss(model, batch, cfg, generator=None):
     to extrapolate from one fixed anchor. Feedback is detached by default:
     gradients still flow through each individual prediction, but not through the
     whole chain, which keeps activation memory bounded at long horizons.
+
+    `n_frames_override` (OVERVIEW.md v6.3, menu item 1): if given, use this
+    AR horizon instead of `cfg.AR_FRAMES` -- lets the training loop drive a
+    rollout-horizon curriculum without mutating shared Config state.
+    `None` (default) is exactly today's behavior.
+
+    `ridge_A` (OVERVIEW.md v6.3, menu item 2): if given (and not None),
+    ALSO computes the ridge map's own independent multi-frame rollout
+    (`ridge_rollout_targets()`) from the same starting context, and
+    returns `(ground_truth_loss, ridge_rollout_loss)` instead of a single
+    tensor. `None` (default) keeps today's scalar-tensor return exactly
+    -- every other call site/test is unaffected.
     """
     NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
-    n_fr = int(cfg.AR_FRAMES)
+    n_fr = int(n_frames_override) if n_frames_override is not None else int(cfg.AR_FRAMES)
     seqs = batch[:int(cfg.AR_SEQS)]
     if seqs.shape[0] == 0 or n_fr < 1:
         return None
@@ -2089,6 +2169,10 @@ def frame_ar_loss(model, batch, cfg, generator=None):
         return x
 
     if getattr(model, 'frame_native', False):
+        # NOTE: FrameTransformer.forward() has no `force_persistence_anchor`
+        # param and no ridge-anchor option at all -- ridge_A is ignored on
+        # this branch (scoped to token tokenization only, matching
+        # `_ridge_anchor()`/`ridge_distill_targets()`'s own scoping).
         frames = seq_to_frames(seqs, NX, LD)
         width = NX * LD
         curr = frames[:, :ctx_frames, :]
@@ -2117,7 +2201,11 @@ def frame_ar_loss(model, batch, cfg, generator=None):
     curr = seqs[:, :ctx_len, :]
     preds = []
     for i in range(horizon):
-        nxt = model(curr)[:, -1:, :]
+        # force_persistence_anchor=True: this call is INSIDE the AR
+        # feedback loop -- must never use DELTA_ANCHOR='ridge' here
+        # regardless of Config (OVERVIEW.md v6.3 menu item 3 / the
+        # h10_ridge_residual incident, v4.6 section 26.2).
+        nxt = model(curr, force_persistence_anchor=True)[:, -1:, :]
         preds.append(nxt)
         tok = seqs[:, ctx_len + i:ctx_len + i + 1, :].clone()
         tok[:, :, :LD] = _feed(nxt)
@@ -2131,9 +2219,19 @@ def frame_ar_loss(model, batch, cfg, generator=None):
     # the central triplet (vx, vy, vz) at index 62 of 125 spatial
     # points. See OVERVIEW.md §10.9.7 for the rationale and centroid-
     # index derivation.
-    return centroid_velocity_loss(
-        torch.cat(preds, 1),
-        seqs[:, ctx_len:ctx_len + horizon, :LD], cfg)
+    network_preds = torch.cat(preds, 1)
+    gt_loss = centroid_velocity_loss(
+        network_preds, seqs[:, ctx_len:ctx_len + horizon, :LD], cfg)
+    if ridge_A is None:
+        return gt_loss
+    # Menu item 2: the ridge map's OWN independent rollout from the same
+    # starting context (last frame of `curr` before the loop began, i.e.
+    # the last NX tokens of the context), never touching the network --
+    # see ridge_rollout_targets()'s docstring for the safety argument.
+    last_frame = seqs[:, ctx_len - NX:ctx_len, :LD].reshape(seqs.shape[0], NX * LD)
+    ridge_rollout = ridge_rollout_targets(last_frame, ridge_A, cfg, n_fr)
+    ridge_loss = centroid_velocity_loss(network_preds, ridge_rollout, cfg)
+    return gt_loss, ridge_loss
 
 
 def sched_sampling_loss(model, batch, cfg, p, generator=None):
@@ -2154,7 +2252,13 @@ def sched_sampling_loss(model, batch, cfg, p, generator=None):
         inp, tgt = batch[:, :-1, :], batch[:, 1:, :width]
 
     with torch.no_grad():
-        own = model(inp)
+        # force_persistence_anchor=True (token models only -- FrameTransformer
+        # has no such param / no ridge-anchor option): `own`'s output feeds
+        # back into pass 2's input, so conservatively treat this the same
+        # as any other feedback path (OVERVIEW.md v6.3 menu item 3), even
+        # though a single substitution is lower-risk than frame_ar_loss's
+        # full chained rollout.
+        own = model(inp) if frame_native else model(inp, force_persistence_anchor=True)
     # own[t] is the prediction of position t+1, so the replacement for input
     # position t is own[t-1]. Position 0 has no predecessor; keep ground truth.
     repl = torch.cat([inp[:, :1, :width], own[:, :-1, :]], dim=1)
@@ -2416,6 +2520,31 @@ def make_lr_lambda(cfg):
         return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * prog))
 
     return fn
+
+
+def ar_frames_for_step(step, cfg):
+    """Rollout-horizon curriculum (OVERVIEW.md v6.3, menu item 1): the
+    AR-loss horizon to use AT THIS STEP, ramping linearly from
+    `cfg.AR_FRAMES_START` to `cfg.AR_FRAMES` (the ceiling -- see
+    `AR_FRAMES`'s own comment for why it's never overwritten) over
+    `cfg.MAX_STEPS * cfg.AR_FRAMES_WARMUP_FRAC` steps, rounded to the
+    nearest whole frame and clamped to `[AR_FRAMES_START, AR_FRAMES]`.
+
+    `cfg.AR_FRAMES_START is None` (the default for every arm that
+    doesn't opt in) disables the curriculum entirely: returns
+    `cfg.AR_FRAMES` flat, unconditionally, matching every existing arm's
+    behavior exactly with zero change.
+    """
+    start = getattr(cfg, 'AR_FRAMES_START', None)
+    target = int(cfg.AR_FRAMES)
+    if start is None:
+        return target
+    start = int(start)
+    if start >= target:
+        return target
+    warm = max(1, int(cfg.MAX_STEPS * float(getattr(cfg, 'AR_FRAMES_WARMUP_FRAC', 0.3))))
+    frac = min(1.0, (step + 1) / warm)
+    return int(round(start + frac * (target - start)))
 
 
 def config_dict():
@@ -3023,6 +3152,159 @@ def load_warm_start(model, ckpt_path, device, log=print):
     }
 
 
+def load_resume_checkpoint(model, optimizer, scheduler, latest_path, device,
+                           fresh, best, log=print):
+    """If `latest_path` exists (and `fresh` is not set), load it into
+    `model`/`optimizer`/`scheduler` and pick up training where it left
+    off. This is THE mechanism that guarantees any future training run
+    picks up an existing checkpoint from `Config.CHECKPOINT_DIR`
+    (`saved_models/`) rather than silently starting over -- extracted
+    out of `train()` itself (previously inlined) specifically so it has
+    a permanent unit test (`tests/test_checkpoint_resume.py`) instead of
+    only ever being exercised by a real multi-hour run.
+
+    Mirrors `load_warm_start()`'s shape-sanitisation approach (drop only
+    allowlisted length-dependent tensors, hard-fail on anything else),
+    plus cross-version detection, scheduler-state restoration, and the
+    `wandb_run_id` capture that OVERVIEW.md v6.0 added after the
+    two-processes-one-wandb-run incident (section 30.1) -- see that
+    section for why a resume's wandb id must come from the checkpoint
+    itself, not be re-derived from the arm name.
+
+    Returns `(step, best, did_resume, cross_version, resumed_wandb_run_id)`.
+    When `latest_path` doesn't exist, or `fresh` is set, or loading
+    fails for any reason: `(0 if not already past that, best unchanged,
+    False, False, None)` -- i.e. training proceeds exactly as if no
+    checkpoint existed, matching `train()`'s pre-extraction behavior.
+    """
+    step = 0
+    did_resume = False
+    cross_version = False
+    resumed_wandb_run_id = None
+
+    if not os.path.exists(latest_path) or fresh:
+        return step, best, did_resume, cross_version, resumed_wandb_run_id
+
+    try:
+        ck = torch.load(latest_path, map_location=device, weights_only=False)
+        raw_sd = ck['model_state_dict']
+        # Sanitize length-dependent tensors just like load_warm_start:
+        # a `latest.pt` produced by a v1.0 (NUM_TIME=40) run has
+        # `time_embeddings.weight` of shape (40, 256), which cannot be
+        # copied into the v2.0 (NUM_TIME=80) model's (80, 256) parameter.
+        # `strict=False` alone does NOT skip shape-mismatched present
+        # keys -- it still raises. So we drop them explicitly and let
+        # them stay at their freshly-initialised (or warm-started) values.
+        model_sd = model.state_dict()
+        dropped = {}
+        filtered = {}
+        for k, v in raw_sd.items():
+            if k in model_sd and hasattr(v, "shape") and tuple(v.shape) != tuple(model_sd[k].shape):
+                dropped[k] = (tuple(v.shape), tuple(model_sd[k].shape))
+                continue
+            filtered[k] = v
+        bad = [k for k in dropped if k not in WARM_START_LENGTH_DEPENDENT_KEYS]
+        if bad:
+            detail = ", ".join(
+                f"{k}: ckpt{dropped[k][0]} vs model{dropped[k][1]}" for k in bad)
+            raise RuntimeError(
+                f"resume shape mismatch outside length-dependent allowlist: {detail}")
+        missing, unexpected = model.load_state_dict(filtered, strict=False)
+        # Cross-version detection: if length-dependent tensors had to be
+        # dropped, this is not a real resume -- it is a warm-start out of
+        # a v1.0 (NUM_TIME=40) checkpoint that just happens to be sitting
+        # in the v2.0 saved_models/ directory. In that case:
+        #   * the step counter from v1.0 is meaningless for v2.0 (v1.0
+        #     ran to MAX_STEPS=6000; keeping step=6000 makes the
+        #     `while step < MAX_STEPS:` loop exit immediately without
+        #     training a single step at NUM_TIME=80 -- observed regression);
+        #   * the optimizer's per-parameter moment tensors are stale for
+        #     any reinitialised parameter;
+        #   * the scheduler's `last_epoch` should start at 0 so the v2.0
+        #     run gets its full warmup+cosine schedule, not the v1.0
+        #     annealed tail;
+        #   * `best` metrics from v1.0 (at NUM_TIME=40, VAL_ROLLOUT_STEPS=728)
+        #     are not comparable to v2.0 (VAL_ROLLOUT_STEPS=1768).
+        # So we reset step/best/scheduler to fresh in that branch. Same
+        # optimizer/scheduler skip still applies for the regular
+        # (no-dropped) resume path.
+        cross_version = bool(dropped)
+        if ck.get('optimizer_state_dict') and not cross_version:
+            optimizer.load_state_dict(ck['optimizer_state_dict'])
+        elif ck.get('optimizer_state_dict') and cross_version:
+            log(f"  [resume] skipping optimizer state: length-dependent "
+                f"tensors were reinitialised ({sorted(dropped)})")
+        if cross_version:
+            log(f"  [resume] cross-version detected (v1.0 -> v2.0): "
+                f"resetting step=0 and best/* -- v1.0 metrics at "
+                f"NUM_TIME=40 are not comparable to v2.0 at NUM_TIME=80. "
+                f"Effectively a warm-start from {latest_path}.")
+            step = 0
+        else:
+            step = int(ck.get('step', 0))
+        # Restore scheduler state directly instead of replaying
+        # scheduler.step() `step` times: the replay path called
+        # scheduler.step() before any optimizer.step() had run in this
+        # process, which is exactly the pattern PyTorch warns about
+        # ("Detected call of `lr_scheduler.step()` before
+        # `optimizer.step()`") and which also silently skips the first
+        # scheduled LR value. If the checkpoint carries a scheduler
+        # state_dict (v2.0.2+), load it verbatim; else fall back to
+        # setting `last_epoch` and rebuilding the LR without calling
+        # `.step()` (see PyTorch docs: setting last_epoch and calling
+        # get_last_lr is the supported resume-without-warning path).
+        sched_sd = ck.get('scheduler_state_dict')
+        if sched_sd is not None and not cross_version:
+            try:
+                scheduler.load_state_dict(sched_sd)
+            except Exception as e:
+                log(f"  [resume] scheduler.load_state_dict failed "
+                    f"({type(e).__name__}: {e}); reconstructing from step")
+                sched_sd = None
+        elif cross_version:
+            # Leave the scheduler at last_epoch=-1 so v2.0 gets its full
+            # warmup+cosine schedule; no `.step()` is called pre-optimizer.
+            sched_sd = "cross_version_reset"
+        if sched_sd is None and step > 0:
+            # Reconstruct scheduler position without triggering the
+            # step-before-optimizer warning. LambdaLR reads last_epoch
+            # and applies the lr_lambda(last_epoch) on the next .step().
+            scheduler.last_epoch = step - 1
+            for group, base_lr in zip(optimizer.param_groups,
+                                      scheduler.base_lrs):
+                group['lr'] = base_lr * scheduler.lr_lambdas[0](step - 1)
+            scheduler._last_lr = [g['lr'] for g in optimizer.param_groups]
+        if not cross_version:
+            best.update({k: v for k, v in ck.get('best', {}).items()})
+            # Only a genuine same-shape resume inherits the previous
+            # wandb run id -- a cross-version warm-start-in-disguise is
+            # a different logical run and must NOT write into the old
+            # run's history (see the wandb-id decision below).
+            resumed_wandb_run_id = ck.get('wandb_run_id')
+        did_resume = True
+        # Rainbow-log the resume-from checkpoint the same way
+        # `_log_write` rainbow-logs a completed write and
+        # `load_warm_start` rainbow-logs its start-from checkpoint,
+        # so operators can visually pinpoint "we RESUMED from this
+        # exact file at step N" in a long scrollback.
+        try:
+            abs_resume = os.path.abspath(latest_path)
+        except Exception:
+            abs_resume = str(latest_path)
+        log(_rainbow(f"[start-from:resume] {abs_resume} @ step {step}"))
+        log(f"  [resume] {latest_path} at step {step} "
+            f"(missing={len(missing)}, unexpected={len(unexpected)}, "
+            f"dropped_length_dependent={sorted(dropped)})")
+    except Exception as e:
+        log(f"  [resume] failed ({type(e).__name__}: {e}); starting fresh")
+        step = 0
+        did_resume = False
+        cross_version = False
+        resumed_wandb_run_id = None
+
+    return step, best, did_resume, cross_version, resumed_wandb_run_id
+
+
 # --------------------------------------------------------------------------- #
 # Per-epoch persistence report
 # --------------------------------------------------------------------------- #
@@ -3322,133 +3604,13 @@ def train(args, log=print):
             # checkpoint".
             "promoted_rollout_mse": float('inf')}
 
-    # Tracked through the resume block below so the loud checkpoint-status
-    # banner (v6.0) and the wandb run-id decision downstream both reflect
-    # what ACTUALLY happened, not just "a latest.pt file exists on disk" --
-    # the exact gap that let a failed resume silently look like a successful
-    # one (OVERVIEW.md v6.0). `resumed_wandb_run_id` is only ever set when
-    # this really is the same optimisation run continuing, not a
-    # cross-version warm-start-in-disguise.
-    did_resume = False
-    cross_version = False
-    resumed_wandb_run_id = None
-
-    if os.path.exists(latest_path) and not args.fresh:
-        try:
-            ck = torch.load(latest_path, map_location=device, weights_only=False)
-            raw_sd = ck['model_state_dict']
-            # Sanitize length-dependent tensors just like load_warm_start:
-            # a `latest.pt` produced by a v1.0 (NUM_TIME=40) run has
-            # `time_embeddings.weight` of shape (40, 256), which cannot be
-            # copied into the v2.0 (NUM_TIME=80) model's (80, 256) parameter.
-            # `strict=False` alone does NOT skip shape-mismatched present
-            # keys -- it still raises. So we drop them explicitly and let
-            # them stay at their freshly-initialised (or warm-started) values.
-            model_sd = model.state_dict()
-            dropped = {}
-            filtered = {}
-            for k, v in raw_sd.items():
-                if k in model_sd and hasattr(v, "shape") and tuple(v.shape) != tuple(model_sd[k].shape):
-                    dropped[k] = (tuple(v.shape), tuple(model_sd[k].shape))
-                    continue
-                filtered[k] = v
-            bad = [k for k in dropped if k not in WARM_START_LENGTH_DEPENDENT_KEYS]
-            if bad:
-                detail = ", ".join(
-                    f"{k}: ckpt{dropped[k][0]} vs model{dropped[k][1]}" for k in bad)
-                raise RuntimeError(
-                    f"resume shape mismatch outside length-dependent allowlist: {detail}")
-            missing, unexpected = model.load_state_dict(filtered, strict=False)
-            # Cross-version detection: if length-dependent tensors had to be
-            # dropped, this is not a real resume -- it is a warm-start out of
-            # a v1.0 (NUM_TIME=40) checkpoint that just happens to be sitting
-            # in the v2.0 saved_models/ directory. In that case:
-            #   * the step counter from v1.0 is meaningless for v2.0 (v1.0
-            #     ran to MAX_STEPS=6000; keeping step=6000 makes the
-            #     `while step < MAX_STEPS:` loop exit immediately without
-            #     training a single step at NUM_TIME=80 -- observed regression);
-            #   * the optimizer's per-parameter moment tensors are stale for
-            #     any reinitialised parameter;
-            #   * the scheduler's `last_epoch` should start at 0 so the v2.0
-            #     run gets its full warmup+cosine schedule, not the v1.0
-            #     annealed tail;
-            #   * `best` metrics from v1.0 (at NUM_TIME=40, VAL_ROLLOUT_STEPS=728)
-            #     are not comparable to v2.0 (VAL_ROLLOUT_STEPS=1768).
-            # So we reset step/best/scheduler to fresh in that branch. Same
-            # optimizer/scheduler skip still applies for the regular
-            # (no-dropped) resume path.
-            cross_version = bool(dropped)
-            if ck.get('optimizer_state_dict') and not cross_version:
-                optimizer.load_state_dict(ck['optimizer_state_dict'])
-            elif ck.get('optimizer_state_dict') and cross_version:
-                log(f"  [resume] skipping optimizer state: length-dependent "
-                    f"tensors were reinitialised ({sorted(dropped)})")
-            if cross_version:
-                log(f"  [resume] cross-version detected (v1.0 -> v2.0): "
-                    f"resetting step=0 and best/* -- v1.0 metrics at "
-                    f"NUM_TIME=40 are not comparable to v2.0 at NUM_TIME=80. "
-                    f"Effectively a warm-start from {latest_path}.")
-                step = 0
-            else:
-                step = int(ck.get('step', 0))
-            # Restore scheduler state directly instead of replaying
-            # scheduler.step() `step` times: the replay path called
-            # scheduler.step() before any optimizer.step() had run in this
-            # process, which is exactly the pattern PyTorch warns about
-            # ("Detected call of `lr_scheduler.step()` before
-            # `optimizer.step()`") and which also silently skips the first
-            # scheduled LR value. If the checkpoint carries a scheduler
-            # state_dict (v2.0.2+), load it verbatim; else fall back to
-            # setting `last_epoch` and rebuilding the LR without calling
-            # `.step()` (see PyTorch docs: setting last_epoch and calling
-            # get_last_lr is the supported resume-without-warning path).
-            sched_sd = ck.get('scheduler_state_dict')
-            if sched_sd is not None and not cross_version:
-                try:
-                    scheduler.load_state_dict(sched_sd)
-                except Exception as e:
-                    log(f"  [resume] scheduler.load_state_dict failed "
-                        f"({type(e).__name__}: {e}); reconstructing from step")
-                    sched_sd = None
-            elif cross_version:
-                # Leave the scheduler at last_epoch=-1 so v2.0 gets its full
-                # warmup+cosine schedule; no `.step()` is called pre-optimizer.
-                sched_sd = "cross_version_reset"
-            if sched_sd is None and step > 0:
-                # Reconstruct scheduler position without triggering the
-                # step-before-optimizer warning. LambdaLR reads last_epoch
-                # and applies the lr_lambda(last_epoch) on the next .step().
-                scheduler.last_epoch = step - 1
-                for group, base_lr in zip(optimizer.param_groups,
-                                          scheduler.base_lrs):
-                    group['lr'] = base_lr * scheduler.lr_lambdas[0](step - 1)
-                scheduler._last_lr = [g['lr'] for g in optimizer.param_groups]
-            if not cross_version:
-                best.update({k: v for k, v in ck.get('best', {}).items()})
-                # Only a genuine same-shape resume inherits the previous
-                # wandb run id -- a cross-version warm-start-in-disguise is
-                # a different logical run and must NOT write into the old
-                # run's history (see the wandb-id decision below).
-                resumed_wandb_run_id = ck.get('wandb_run_id')
-            did_resume = True
-            # Rainbow-log the resume-from checkpoint the same way
-            # `_log_write` rainbow-logs a completed write and
-            # `load_warm_start` rainbow-logs its start-from checkpoint,
-            # so operators can visually pinpoint "we RESUMED from this
-            # exact file at step N" in a long scrollback.
-            try:
-                abs_resume = os.path.abspath(latest_path)
-            except Exception:
-                abs_resume = str(latest_path)
-            log(_rainbow(f"[start-from:resume] {abs_resume} @ step {step}"))
-            log(f"  [resume] {latest_path} at step {step} "
-                f"(missing={len(missing)}, unexpected={len(unexpected)}, "
-                f"dropped_length_dependent={sorted(dropped)})")
-        except Exception as e:
-            log(f"  [resume] failed ({type(e).__name__}: {e}); starting fresh")
-            did_resume = False
-            cross_version = False
-            resumed_wandb_run_id = None
+    # THE mechanism that guarantees any future run picks up an existing
+    # checkpoint from Config.CHECKPOINT_DIR rather than silently starting
+    # over -- see load_resume_checkpoint()'s docstring and
+    # tests/test_checkpoint_resume.py.
+    step, best, did_resume, cross_version, resumed_wandb_run_id = (
+        load_resume_checkpoint(model, optimizer, scheduler, latest_path,
+                               device, args.fresh, best, log=log))
 
     # Impossible-to-miss banner: is this run continuing real progress, or
     # starting over? Deliberately louder than the CUDA/MPS regime banner
@@ -3595,6 +3757,13 @@ def train(args, log=print):
             f"(A: {tuple(ridge_A.shape)}) -- weight ramps 0 -> "
             f"{ridge_distill_w_target} over {ridge_distill_warm} steps")
 
+    if getattr(Config, 'AR_FRAMES_START', None) is not None:
+        _ar_frames_warm = max(1, int(Config.MAX_STEPS * float(Config.AR_FRAMES_WARMUP_FRAC)))
+        log(f"  [ar-curriculum] AR_FRAMES ramps {Config.AR_FRAMES_START} -> "
+            f"{Config.AR_FRAMES} over {_ar_frames_warm} steps "
+            f"(memory estimate below uses the ceiling, {Config.AR_FRAMES}, "
+            f"not the current/starting value)")
+
     # -- memory expectation printout ---------------------------------------
     # Rough peak-attention-score estimate per code path, so an operator can
     # see at a glance what the resolved regime is spending memory on and
@@ -3625,6 +3794,13 @@ def train(args, log=print):
         # Approximate AR peak: activation graphs for AR_FRAMES*NUM_X forwards
         # under token tokenization, at the growing sequence length. Use the
         # final (largest) forward's L as the ceiling estimate.
+        #
+        # Deliberately reads Config.AR_FRAMES (the curriculum's TARGET/
+        # ceiling, OVERVIEW.md v6.3) rather than the curriculum's current
+        # step-0 value -- under AR_FRAMES_START, the real horizon grows
+        # throughout training, so estimating from anything less than the
+        # ceiling would under-report the true eventual peak. Do not "fix"
+        # this to read a live/current horizon value.
         n_ar_fwd = int(Config.AR_FRAMES) * (1 if frame_level else Config.NUM_X)
         ar_peak = _attn_bytes(int(Config.AR_SEQS), rollout_L, forwards=n_ar_fwd)
         ar_peak_str = _fmt_bytes(ar_peak) + f" ({n_ar_fwd} retained forwards)"
@@ -3679,13 +3855,14 @@ def train(args, log=print):
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_acc = primary_acc = ar_acc = distill_acc = 0.0
+        loss_acc = primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = 0.0
         last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
                   and step % max(1, int(Config.AR_EVERY_N_STEPS)) == 0)
         distill_w = (ridge_distill_w_target * min(1.0, (step + 1) / ridge_distill_warm)
                      if ridge_A is not None else 0.0)
+        current_ar_frames = ar_frames_for_step(step, Config)
 
         micro_count = 0
         for micro in range(accum_steps):
@@ -3720,14 +3897,30 @@ def train(args, log=print):
                 # The auxiliary loss is sequential and by far the most expensive
                 # part of a step, so it runs on the first micro-batch only.
                 if run_ar and micro == 0:
-                    aux = (frame_ar_loss(model, batch, Config, generator=cpu_gen)
+                    aux = (frame_ar_loss(model, batch, Config, generator=cpu_gen,
+                                         n_frames_override=current_ar_frames,
+                                         ridge_A=ridge_A if distill_w > 0 else None)
                            if ar_mode == 'frame_ar'
                            else sched_sampling_loss(model, batch, Config,
                                                     Config.SCHED_SAMPLING_P,
                                                     generator=dev_gen))
                     if aux is not None:
-                        ar_acc = aux.item()
-                        loss = loss + ar_w * aux
+                        if isinstance(aux, tuple):
+                            # Menu item 2: frame_ar_loss returned
+                            # (ground-truth loss, ridge-rollout distill
+                            # loss) because ridge_A was passed in above.
+                            # Same ar_w/distill_w ramps already governing
+                            # the AR loss and the one-step distillation
+                            # term now cover the AR-horizon distillation
+                            # term too -- one weight per concern, not a
+                            # third independent knob.
+                            gt_aux, ridge_ar_aux = aux
+                            ar_acc = gt_aux.item()
+                            ridge_ar_distill_acc = ridge_ar_aux.item()
+                            loss = loss + ar_w * gt_aux + distill_w * ridge_ar_aux
+                        else:
+                            ar_acc = aux.item()
+                            loss = loss + ar_w * aux
                 loss_acc += loss.item()
                 loss = loss / accum_steps
 
@@ -3799,6 +3992,9 @@ def train(args, log=print):
                 payload.update({f"train/{k}": v for k, v in dim_err.items()})
             if run_ar:
                 payload["ar_loss"] = ar_acc
+                payload["ar_frames_current"] = current_ar_frames
+                if distill_w > 0:
+                    payload["ridge_ar_distill_loss"] = ridge_ar_distill_acc
             if ridge_A is not None:
                 payload["ridge_distill_loss"] = distill_acc / accum_steps
                 payload["ridge_distill_weight"] = distill_w

@@ -214,7 +214,7 @@ if [[ -z "$POD_HOST" || -z "$POD_PORT" ]]; then
   echo "" >&2
   echo "Could not parse host/port out of the ssh-info output above." >&2
   echo "Read it yourself, then re-run the remaining steps manually:" >&2
-  echo "  POD_HOST=<host> POD_PORT=<port> bash $HERE/scp_to_pod.sh" >&2
+  echo "  POD_HOST=<host> POD_PORT=<port> bash $HERE/scp_env_files.sh" >&2
   exit 1
 fi
 echo "  host=$POD_HOST port=$POD_PORT"
@@ -222,25 +222,34 @@ echo ""
 
 export POD_HOST POD_PORT SSH_KEY
 echo "=================================================================="
-echo " Building tarball (if not already built)"
+echo " Phase 1/2: env files (code, checkpoint, ridge map, AE decoder)"
 echo "=================================================================="
-TARBALL="${TARBALL:-$HERE/cgan_singleshot_payload.tar.gz}"
-if [[ -f "$TARBALL" ]]; then
-  echo "  reusing existing $TARBALL ($(du -h "$TARBALL" | cut -f1))"
-  echo "  (delete it first, or set OUT_FILE/TARBALL to a new path, to force a rebuild)"
-else
-  bash "$HERE/build_tarball.sh"
-fi
+bash "$HERE/scp_env_files.sh"
 
 echo ""
 echo "=================================================================="
-echo " scp'ing + extracting on the pod"
+echo " Phase 2/2: data files, IN THE BACKGROUND -- bootstrap runs now,"
+echo " concurrently, over a second ssh connection"
 echo "=================================================================="
-TARBALL="$TARBALL" bash "$HERE/scp_to_pod.sh"
+bash "$HERE/scp_data_files.sh" &
+DATA_SCP_PID=$!
+
+echo ""
+echo "Bootstrapping the venv while the data transfer above runs in parallel..."
+ssh -p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+  "root@$POD_HOST" bash -s <<'REMOTE'
+set -euo pipefail
+cd /workspace/cgan/transformer_neurIPS
+bash singleshot/bootstrap_remote.sh
+REMOTE
+
+echo ""
+echo "Waiting for the data transfer to finish (if it hasn't already)..."
+wait "$DATA_SCP_PID"
 
 echo ""
 echo "=================================================================="
-echo " Bootstrapping + launching the ${MAX_HOURS}h-capped run (arm=$ARM)"
+echo " Launching the ${MAX_HOURS}h-capped run (arm=$ARM)"
 echo "=================================================================="
 WANDB_FLAG="--no-wandb"
 WANDB_SETUP=":"
@@ -249,14 +258,26 @@ if [[ -n "${WANDB_API_KEY:-}" ]]; then
   WANDB_SETUP="WANDB_API_KEY='$WANDB_API_KEY' wandb login --relogin"
 fi
 
-# Single non-interactive SSH command: bootstrap (venv + deps, skipping the
-# printed-not-run wandb-login step) then launch training directly, capped
-# by both MAX_STEPS and MAX_HOURS. Blocks until the trainer exits.
+# Both bootstrap and the data transfer are confirmed done above -- this
+# SSH command only launches training, nothing else. Blocks until the
+# trainer exits.
+#
+# MANUAL FALLBACK -- keep this at your fingertips if this script ever
+# dies/hangs mid-run again (see OVERVIEW.md v6.0 section 30.1 for the
+# incident that made this whole package this cautious). SSH in yourself
+# and run, verbatim (also documented in singleshot/README.md section
+# 5a, kept in sync with this exact command so the two never drift):
+#
+#   cd /workspace/cgan/transformer_neurIPS
+#   source /workspace/cgan/.venv/bin/activate
+#   python train_production_transformer_deep_dive.py \
+#     --arm h11_ridge_distill --round 2 \
+#     --max-steps 2500 --max-hours 0.5 \
+#     --val-every 500 --no-wandb
 ssh -p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
   "root@$POD_HOST" bash -s <<REMOTE
 set -euo pipefail
 cd /workspace/cgan/transformer_neurIPS
-bash singleshot/bootstrap_remote.sh
 # bootstrap_remote.sh's default VENV_DIR is \$REPO_ROOT/.venv, i.e.
 # /workspace/cgan/.venv -- one level up from transformer_neurIPS/.
 source ../.venv/bin/activate

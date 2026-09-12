@@ -3856,3 +3856,335 @@ earlier this session).
 - `WANDB_PROJECT` stays `NI_Review_v6` -- this is a minor version within
   the v6.x line (new loss term + arm, no wandb/checkpoint-format change),
   not a major boundary.
+
+## 32. v6.2 -- how confident should we be in +69%, external research on acceleration, and a concurrency plan
+
+Prompted directly by the operator watching `s8_h9_moreseqs_scaled`'s
+early numbers (+27.17% at step 2000, dipping to +22.68% at step 4000,
+out of a 45000-step budget) and asking, reasonably, whether +69% is a
+credible target at all. This section is research and planning --
+nothing here is implemented yet except where explicitly noted.
+
+### 32.1 How sure can we be that +69% is reachable?
+
+Not very, and there is a real, literature-grounded reason to say so
+rather than just "it needs more training."
+
+**What we actually know, from this project's own numbers:**
+- The ridge/linear baseline reproduces cleanly across independent fits
+  (+69.49% originally, §25.1; +68.97% refit fresh on the H200 this
+  session, §31 -- see the `s8` diagnostics run). It is a real, stable
+  number, not a fluke of one lucky fit.
+- No transformer arm has ever beaten it. The best CONFIRMED-stable
+  number is a 400-step shallow screen (+46.49%, §28.7); the best actual
+  production number is `s7`'s +31.35% at 145k steps (Appendix A); `s8`
+  at 4000/45000 steps is sitting at +22-27%, noisily, and it is much too
+  early to read a trend into two eval points.
+
+**What the wider literature says about this exact shape of gap:**
+- A specific mechanism keeps showing up: **exposure bias / error
+  compounding**. Teacher forcing (what the main per-step loss trains
+  on) produces "fast and stable optimisation" but a model trained that
+  way "is less robust when the input sequence becomes progressively
+  imperfect during closed-loop rollout" -- exactly the training-vs-
+  rollout mismatch this project has been fighting since Branch A/D/F
+  (§18-24) and which AR-loss frequency (the dominant lever found so
+  far, §25.4) directly targets. ([Scheduled Sampling for Sequence
+  Prediction with Recurrent Neural Networks](https://proceedings.neurips.cc/paper/2015/file/e995f98d56967d946471af29d7bf99f1-Paper.pdf),
+  [emergentmind synthesis](https://www.emergentmind.com/topics/scheduled-sampling))
+- This is an active 2025-2026 research area specifically for
+  autoregressive time-series transformers, not a solved problem:
+  [Mitigating Exposure Bias in Risk-Aware Time Series Forecasting with
+  Soft Tokens](https://arxiv.org/abs/2512.10056) and
+  [AROpt](https://arxiv.org/html/2602.02288v2) (borrowing DeepSeek-V3's
+  accept/reject rollout mechanism for continuous-valued forecasting)
+  are both from the last few months, both explicitly framing the
+  problem as "errors compound rapidly with horizon, even from small
+  per-step errors."
+- More pointed still: [Why Do Transformers Fail to Forecast Time Series
+  In-Context?](https://arxiv.org/abs/2510.09776) (Zhou, Wang, Goel,
+  Zhang, Oct 2026) studies transformers against AR(p) processes
+  specifically and characterizes a **closed-form representational gap
+  between linear self-attention and optimal linear forecasters** --
+  i.e. for this whole class of problem, there is theoretical work
+  arguing plain transformers are not just under-trained relative to a
+  linear baseline, they may be structurally disadvantaged against one.
+  The paper also names a rollout failure mode, "collapse-to-mean and
+  error compounding," matching this project's own repeated observation
+  that models trained without AR-loss correction degrade toward
+  something anchor-like over the rollout horizon rather than staying
+  sharp.
+- General time-series literature independently confirms the pattern
+  outside of transformers specifically: neural nets losing to linear
+  baselines is well-documented whenever the underlying process is
+  close to linear locally, which is exactly the hypothesis our own
+  ridge-map result supports for this 47-dim latent's one-step dynamics.
+  ([ScienceDirect: neural networks for linear time-series
+  forecasting](https://www.sciencedirect.com/science/article/abs/pii/S0305054800000332))
+
+**Conclusion**: +69% should be read as "how good a *locally linear*
+model is, applied recursively," not as evidence a nonlinear transformer
+can reach the same number by training longer on the current recipe. The
+gap is likely dominated by exposure bias (fixable, and the one lever
+already proven to matter most in this project) plus a possible genuine
+representational disadvantage of plain self-attention on this class of
+process (not obviously fixable by more steps alone). Treat +46-50%
+range as a more realistic near-term target; +69% is the ceiling that
+motivates keeps trying, not a number to expect on arrival.
+
+### 32.2 Acceleration ideas -- planning-stage menu, none implemented yet
+
+Ordered by (estimated benefit) / (estimated implementation cost), given
+we are specifically trying to beat exposure bias against a strong
+linear reference, not trying to out-scale it:
+
+1. **Rollout-horizon curriculum on `AR_FRAMES`** (cheap, high expected
+   value). Currently `AR_FRAMES` is a fixed constant (8) from step 1.
+   Recent rollout-training literature schedules the horizon/blending
+   explicitly -- start short (e.g. `AR_FRAMES=1-2`) so the AR loss is
+   learnable from the start, and grow it toward the full horizon as
+   training progresses, rather than asking the network to correct an
+   8-frame rollout before it can reliably do a 1-frame one. Directly
+   analogous to `AR_WEIGHT_WARMUP_FRAC`'s existing ramp, just on the
+   horizon instead of the weight. ([scheduled rollout recovery
+   training / blending-radius curricula](https://www.emergentmind.com/topics/scheduled-sampling))
+2. **Extend ridge-distillation into the AR rollout loss itself**
+   (moderate cost, potentially the most direct lever). `h11`'s
+   `RIDGE_DISTILL_WEIGHT` (§31) only pulls the ONE-STEP teacher-forced
+   prediction toward the ridge map's prediction. The ridge map's own
+   *multi-step* rollout (computed once, recursively, entirely
+   independently of the network -- exactly like
+   `linear_frame_baseline()` already does for diagnostics) could serve
+   as a per-frame supervisory target for `frame_ar_loss`'s own rollout
+   too, still never re-entering any feedback loop (same safety property
+   as §31). This directly trains the network to match the ceiling
+   we're trying to reach, at every horizon step it's scored on.
+3. **Split anchor choice by loss, not globally** (moderate cost, a
+   deliberate middle ground between `h10` and `h11`). `h10_ridge_
+   residual`'s mistake was using the ridge map as the anchor INSIDE the
+   AR feedback loop. Nothing stops using it as the anchor for the
+   teacher-forced main loss specifically (which never recurses) while
+   keeping plain persistence as the AR loss's anchor (which does) --
+   getting `PREDICT_DELTA`'s "start at a strong prior" benefit for the
+   one loss where it's safe, without touching the one where it isn't.
+4. **Direct multi-horizon auxiliary head** (higher cost, sidesteps
+   accumulation structurally rather than mitigating it). Predict
+   several future frames in one shot (non-autoregressively) as an
+   additional loss term, rather than only ever reaching frame N by
+   chaining N single-step predictions. Literature explicitly names this
+   as the way to bypass error compounding entirely rather than manage
+   it. Biggest architectural lift of the options here.
+5. **Soft physical-consistency penalty** (higher cost, longer-horizon
+   idea). PINN literature reports physics-based penalty terms
+   "accelerate convergence by reducing the solution space" for
+   turbulence/vortex problems specifically. Nothing in the current loss
+   uses spatial structure across the 26 (v3.1: 10) x-stations at all --
+   a smoothness or approximate-consistency penalty across neighboring
+   stations could regularize the solution space the same way. Not
+   trivial: would need to reconstruct spatial relationships from the
+   decoded 375-dim output, and PINN literature itself flags training-
+   stability risk from badly-tuned physics-penalty weights.
+   ([PSTNet / divergence-free layers](https://arxiv.org/pdf/2603.07957))
+6. **LR/weight-decay/gradient-clip retuning, model capacity increases**
+   (low priority, already weak evidence). §28.7's stability round tested
+   exactly this axis (4 perturbations against `h9`) and found AR-loss
+   frequency dominated everything else tried by a wide margin -- and a
+   LARGER model beating a much-smaller linear map on THIS metric is not
+   obviously a capacity story to begin with. Deprioritized until 1-3
+   above are tried.
+7. **AROpt-style accept/reject rollout stabilization** (highest cost,
+   most novel). Directly borrowed from very recent (2026) LLM-training-
+   inspired work adapting DeepSeek-V3's accept/reject mechanism to
+   continuous-valued autoregressive forecasting specifically to "enable
+   robust autoregressive rollout." Worth tracking, not worth building
+   before the cheaper options above are exhausted.
+
+None of the above are registered as arms yet -- this is the planning
+inventory the operator asked for, to pick from once `h11`'s CUDA screen
+result is in.
+
+### 32.3 Running two arms concurrently on one GPU -- real, but not free
+
+Motivated by `s8`'s own observed utilization: 24-47% GPU, ~34GB/144GB
+VRAM on the H200 (§ the live diagnosis in this session) -- clearly not
+saturating the box. External research confirms the instinct is sound in
+general, with real caveats:
+
+- **This only helps when a single job already under-utilizes the GPU**
+  -- which `s8` demonstrably does. Literature is explicit: "parallel
+  training of multiple instances ... is only relevant for small models
+  which, on their own, don't utilize the GPU well enough," and the
+  inverse warning is just as explicit: "if a single job already
+  saturates the GPU, concurrent jobs will only slow each other down."
+  ([PyTorch Forums discussion](https://discuss.pytorch.org/t/multiprocessing-vs-nvidia-mps-for-parallel-training-on-a-single-gpu/99877))
+- **Plain co-location (two `python` processes, no config) uses default
+  time-slicing, not true concurrency** -- benchmarks show runtime
+  "increases close to linearly as more concurrent processes are added"
+  under plain time-slicing, i.e. little to no actual speedup, sometimes
+  a net slowdown from contention.
+- **NVIDIA MPS (Multi-Process Service)** is the mechanism that gives
+  genuine spatial co-residency instead: "with MPS, runtime shows little
+  to no increase and occupancy grows gradually, indicating the
+  different processes truly execute concurrently." Requires starting an
+  MPS control daemon on the pod (`nvidia-cuda-mps-control -d`) before
+  launching the two training processes -- not yet wired into any script
+  here.
+  ([Characterizing Concurrency Mechanisms for NVIDIA GPUs under Deep
+  Learning Workloads](https://arxiv.org/pdf/2110.00459))
+- **Memory duplicates per process** -- each job pays its own CUDA
+  context + framework overhead on top of its model/activations, so two
+  jobs cost more than 2x one job's marginal memory, not exactly 2x.
+  34GB observed for one `s8`-shaped run leaves comfortable room for a
+  second on a 144GB H200, but this should be verified empirically
+  (start 2, watch `nvidia-smi`), not assumed to scale further without
+  checking.
+- **Practical recommendation**: enable MPS, start with exactly 2
+  concurrent jobs (not more), and measure real wall-clock throughput
+  before committing to a larger concurrent lineup -- one anecdotal
+  report in the research even found 2 concurrent jobs slower than
+  running them sequentially in a differently-shaped setup, so this
+  needs measuring on OUR workload, not assumed from the general
+  literature.
+
+Not implemented yet -- pairs naturally with §32.2's menu once `h11`'s
+result is in: run the next candidate idea alongside a continuation of
+whichever config is currently leading, instead of strictly
+sequentially, once MPS is confirmed to actually help on this box.
+
+## 33. v6.3 -- menu items 1, 2, 3 implemented and folded into `h11_ridge_distill`
+
+The operator picked three of §32.2's planning-stage menu items --
+rollout-horizon curriculum (1), extending ridge-distillation into the
+AR rollout itself (2), and splitting anchor choice by loss (3) -- and
+asked for all three to be folded directly into `h11_ridge_distill` as
+the go-forward recipe, not kept as separate untested arms. This section
+documents what shipped; whether it actually helps is still an open
+question for the operator's own manual 30-minute CUDA run.
+
+**Direct answer to "is the ridge map's output used as some sort of
+static guide for future trainings?"**: yes, exactly that. `ridge_frame_
+map.pt` is fit ONCE (`linear_frame_baseline()`, part of diagnostics)
+and never updated by gradient descent or anything else during training
+-- the same frozen matrix is reused unchanged for the entire run, and
+is reusable for future runs/arms indefinitely (as long as `NUM_X`/
+`LATENT_DIM`/the data distribution don't change). All three items below
+read this same static file; none of them make it adaptive.
+
+### 33.1 Rollout-horizon curriculum (menu item 1)
+
+New `Config.AR_FRAMES_START` (default `None` -- disables the curriculum
+entirely, every pre-v6.3 arm unaffected) and `Config.AR_FRAMES_WARMUP_
+FRAC` (default 0.3, independent of `AR_WEIGHT_WARMUP_FRAC`). New pure
+function `ar_frames_for_step(step, cfg)` (next to `make_lr_lambda()`)
+ramps the AR-loss horizon linearly from `AR_FRAMES_START` to `AR_FRAMES`
+over `MAX_STEPS * AR_FRAMES_WARMUP_FRAC` steps, so the network isn't
+asked to correct an 8-frame rollout before it can reliably do a 2-frame
+one. `frame_ar_loss()` gained `n_frames_override` (defaults to `None` ->
+today's flat `cfg.AR_FRAMES` behavior) so the training loop can drive
+the ramp without mutating shared `Config` state.
+
+**Repercussion handled explicitly, per the operator's own ask**: the
+`[memory]` expectation printout estimates AR-loss peak memory from
+`Config.AR_FRAMES` read once at startup. `AR_FRAMES` is deliberately
+left meaning the CEILING (never overwritten to the curriculum's current
+value) specifically so this printout still reports the true worst-case
+peak under a ramping horizon, not a curriculum-deflated early estimate.
+Commented directly at both the printout and the `AR_FRAMES_START` field
+so a future edit doesn't "fix" this into an under-report.
+
+### 33.2 Ridge-rollout distillation (menu item 2)
+
+New pure function `ridge_rollout_targets(last_frame_lat, ridge_A, cfg,
+n_frames)`, next to `ridge_distill_targets()` (§31). Reuses the EXACT
+recursion `linear_frame_baseline()` already uses for its own diagnostic
+rollout (`cur = torch.cat([cur, ones], 1) @ A`, repeated `n_frames`
+times) -- the ridge map rolls out purely on its OWN output, never
+touching the network, so it inherits the same structural safety
+argument as `ridge_distill_targets()`: nothing here is IN a feedback
+loop for a bad eigendirection to compound through.
+
+`frame_ar_loss()` gained an optional `ridge_A` param (token-tokenization
+branch only, matching every other ridge mechanism's scoping). When
+given, it now returns `(ground_truth_loss, ridge_rollout_loss)` instead
+of a single tensor; `None` (default) keeps the old scalar-tensor return
+exactly, so every pre-v6.3 call site is unaffected. The training loop
+weights the ground-truth term with the existing `ar_w` ramp and the
+ridge-rollout term with the SAME `distill_w` ramp already driving the
+one-step distillation (§31) -- one weight now covers both the one-step
+AND the AR-horizon distillation, rather than a third independent knob.
+
+### 33.3 Split anchor choice by loss (menu item 3)
+
+`BaseTransformer.forward()` (`model_variants.py`) gained
+`force_persistence_anchor: bool = False`. `True` forces `_delta_anchor()`
+(plain persistence) for that one call regardless of `self.delta_anchor_
+kind` -- overriding `DELTA_ANCHOR='ridge'` just for that call. Default
+`False` preserves every existing checkpoint/behavior exactly.
+
+Wired to `True` at every call that is INSIDE a recursive feedback chain
+-- `frame_ar_loss()`'s token-tokenization loop, both branches of
+`rollout_frames()` (covering real eval-time/inference rollout too, not
+just training), and `sched_sampling_loss()`'s pass-1 (conservatively,
+though not on `h11`'s critical path since `h9`/`h11` use `AR_MODE=
+'frame_ar'` not `'sched'`). Left at the default (`False`, i.e. ridge
+anchor allowed) ONLY at `teacher_forced()`'s single non-recursive call
+-- the one place `DELTA_ANCHOR='ridge'` was always meant to apply.
+`FrameTransformer.forward()` never had a ridge-anchor option at all and
+was left untouched; its call sites do not pass the new parameter.
+
+This is the split `h10_ridge_residual` (v4.6 §26.2) didn't have: that
+arm's blowup came specifically from the ridge anchor sitting INSIDE the
+AR feedback loop. With the split, `DELTA_ANCHOR='ridge'` is used on
+`h11` for the first time, safely, because it can only ever apply to the
+one call that never recurses.
+
+### 33.4 `h11_ridge_distill` upgraded in place
+
+All three combined into the existing arm (not a new `h12` -- the
+operator's explicit "we'll use that going forward" framing):
+```python
+"h11_ridge_distill": {"overrides": {
+    "AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+    "AR_FRAMES": 8, "AR_FRAMES_START": 2, "AR_SEQS": 2, "AR_EVERY_N_STEPS": 1,
+    "RIDGE_DISTILL_WEIGHT": 0.5,
+    "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge",
+}}
+```
+Honestly flagged in the arm's own `desc` string: this conflates three
+variables in one 30-minute screen, a deliberate speed-over-clean-
+attribution tradeoff, not something to forget when reading the result.
+
+### 33.5 Verified
+
+- 15 new tests (`tests/test_ridge_distill_loss.py` extended with
+  `ridge_rollout_targets` cases; new `tests/test_split_anchor.py`,
+  hand-checked against a real tiny `BaseTransformer`; new `tests/
+  test_ar_frames_curriculum.py`). Full suite now 66 (was 51), all green.
+- `resolve_arm('h11_ridge_distill')` reflects every new override.
+- A real local MPS `train()` run (not `--smoke-test`) against `h11_
+  ridge_distill`: 10 steps completed, one eval fired, checkpoints saved,
+  no exception from any v6.3 code path. `AR_MODE='frame_ar'` is still
+  disabled entirely on MPS (`regime.disable_ar`), so this validates the
+  curriculum/distillation/anchor-split WIRING, not whether they help --
+  same caveat as every prior MPS check this session (§31.4).
+- **One pre-existing, already-documented limitation surfaced for the
+  first time by this run**, not a new bug: `save_scripted_model()`'s
+  `torch.jit.trace` fallback for `DELTA_ANCHOR='ridge'` models hardcodes
+  the trace-time device into `_ridge_anchor()`'s `torch.ones(...)` call,
+  so the CPU roundtrip *verification* fails on an MPS-trained model. The
+  state-dict `.pt` (the authoritative artifact) still saved correctly
+  both times -- exactly the graceful degradation `save_checkpoint()` was
+  designed for. §25.5 already flagged this exact risk when `DELTA_
+  ANCHOR='ridge'` was introduced ("accepted here since this is a
+  research sweep arm, not a deployed inference path") -- `h11` is simply
+  the first ridge-anchor arm to actually reach `save_checkpoint()` and
+  make it visible. Not fixed; not blocking.
+
+### 33.6 What v6.3 does NOT change
+
+- No claim is made that any of items 1-3 actually improves on `h9`/
+  `s7`/`s8`'s numbers -- that is exactly what the operator's manual
+  30-minute SSH run against real CUDA is for.
+- `h1_ar_freq2` through `h10_ridge_residual`, `s7_h9_scaled`, and `s8_
+  h9_moreseqs_scaled` are all unchanged.
+- `WANDB_PROJECT` stays `NI_Review_v6` -- still within the v6.x line.

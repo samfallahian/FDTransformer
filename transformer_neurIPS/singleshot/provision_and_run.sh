@@ -52,7 +52,9 @@
 #                       `runpodctl template search <name>` or
 #                       `runpodctl template list --type official`.
 #   CONTAINER_DISK_GB   container disk size in GB (default 60 -- payload is
-#                       ~11.3GB; leaves headroom for the venv + checkpoints)
+#                       ~13.1GB now that train_80.h5/val_80.h5 are stored
+#                       uncompressed, see decompress_h5.py; leaves headroom
+#                       for the venv + checkpoints)
 #   ARM                 arm to run for this budget (default h11_ridge_distill
 #                       -- see rationale below; override for a different arm)
 #   MAX_HOURS           wall-clock cap passed to the trainer (default 0.5 = 30 min)
@@ -68,9 +70,35 @@
 #   POD_ID              reuse an already-running pod instead of creating one
 #   KEEP_POD            set to 1 to skip the final `pod delete` (for
 #                       debugging a run without losing the box)
+#   FORCE_TERMINATE_ON_PULL_FAILURE
+#                       the final artifact pull-back (checkpoints,
+#                       sweep_logs) retries a few times, then -- if it's
+#                       still failing -- refuses to delete the pod so a
+#                       transient SSH/network failure can't cost you the
+#                       run's actual output. Set this to 1 to delete the
+#                       pod anyway even if that pull-back never succeeded
+#                       (i.e. you've confirmed there's nothing worth
+#                       keeping, or already retrieved it manually).
 #   SSH_KEY             local private key to use (default ~/.ssh/id_ed25519
 #                       -- must match a key added via `runpodctl ssh add-key`
 #                       or already present on the pod's image)
+#   TRANSFER_METHOD     "scp" (default, proven) or "croc" (EXPERIMENTAL,
+#                       UNVERIFIED end to end -- see scp_data_files.sh's
+#                       header comment for the full story: a live test
+#                       confirmed croc's default public relay caps out
+#                       around 18-21 MB/s, the same ceiling seen in real
+#                       uploads, but the self-hosted-relay fix for that
+#                       never completed a transfer before the test pod
+#                       was closed, likely because the ports it needs
+#                       weren't exposed at pod-creation time -- this
+#                       script now requests them (see CROC_RELAY_PORT),
+#                       but that fix itself hasn't been tested yet
+#                       either). Falls back to scp automatically for
+#                       any file croc doesn't get, never fatal.
+#   CROC_RELAY_PORT     base port for TRANSFER_METHOD=croc's self-hosted
+#                       relay (default 9019). Needs THIS port plus the
+#                       4 above it exposed as TCP ports on the pod --
+#                       this script's `pod create` call does that.
 #
 # WHY h11_ridge_distill BY DEFAULT
 # ==================================
@@ -130,6 +158,8 @@ MAX_HOURS="${MAX_HOURS:-0.5}"
 MAX_STEPS="${MAX_STEPS:-2500}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 KEEP_POD="${KEEP_POD:-0}"
+TRANSFER_METHOD="${TRANSFER_METHOD:-scp}"
+CROC_RELAY_PORT="${CROC_RELAY_PORT:-9019}"
 
 if [[ -z "$GPU_ID" && -z "${POD_ID:-}" ]]; then
   echo "Looking up an available H200/H300 GPU (override with GPU_ID=...)..."
@@ -164,12 +194,26 @@ else
     echo "Creating pod (gpu=$GPU_ID, template=$TEMPLATE_ID, disk=${CONTAINER_DISK_GB}GB)..."
     IMAGE_FLAGS=(--template-id "$TEMPLATE_ID")
   fi
+  # 22/tcp for SSH, plus CROC_RELAY_PORT's 5-port range (base + croc's
+  # default 4 "transfers" ports) so scp_data_files.sh's TRANSFER_METHOD
+  # =croc path (self-hosted relay ON the pod) has any chance of being
+  # reachable from the local machine -- RunPod pods only expose ports
+  # explicitly listed here, SSH's own mapping does not cover anything
+  # else. UNVERIFIED as of this writing whether this is sufficient
+  # (see scp_data_files.sh's header comment) -- the live test that
+  # would have confirmed it ran against a pod created before this line
+  # existed, so its self-hosted-relay half never had a reachable port
+  # to test in the first place.
+  CROC_PORTS="$CROC_RELAY_PORT/tcp"
+  for i in 1 2 3 4; do
+    CROC_PORTS="$CROC_PORTS,$((CROC_RELAY_PORT + i))/tcp"
+  done
   echo "This blocks until SSH actually answers (--wait), up to 10 minutes."
   POD_JSON="$("$RUNPODCTL" pod create \
     --gpu-id "$GPU_ID" \
     "${IMAGE_FLAGS[@]}" \
     --container-disk-in-gb "$CONTAINER_DISK_GB" \
-    --ports '22/tcp' \
+    --ports "22/tcp,$CROC_PORTS" \
     --public-ip \
     --wait --wait-timeout 10m \
     -o json)"
@@ -184,10 +228,34 @@ else
 fi
 echo ""
 
+PULL_BACK_OK=1  # flipped to 0 by rsync_with_retry() on a genuine failure
+                # (see the pull-back step below) -- cleanup_pod() below
+                # refuses to auto-terminate on 0, since the artifacts this
+                # whole run was for might not have made it off the pod yet.
+
 cleanup_pod() {
   if [[ "$KEEP_POD" == "1" ]]; then
     echo "KEEP_POD=1 set -- leaving pod $POD_ID running. Terminate it"
     echo "yourself when done: runpodctl pod delete $POD_ID"
+    return
+  fi
+  if [[ "$PULL_BACK_OK" != "1" && "${FORCE_TERMINATE_ON_PULL_FAILURE:-0}" != "1" ]]; then
+    echo ""
+    echo "==================================================================" >&2
+    echo " NOT terminating pod $POD_ID -- the artifact pull-back below" >&2
+    echo " reported a genuine failure (not just \"no files matched\"), so" >&2
+    echo " whatever this run produced may still only exist on the pod." >&2
+    echo " Retrieve it yourself, THEN terminate:" >&2
+    echo "" >&2
+    echo "   POD_HOST=$POD_HOST POD_PORT=$POD_PORT SSH_KEY=$SSH_KEY \\" >&2
+    echo "     rsync -avP -e \"ssh -p \$POD_PORT -i \$SSH_KEY\" \\" >&2
+    echo "     \"root@\$POD_HOST:/workspace/cgan/transformer_neurIPS/saved_models/r2_${ARM}_*\" \\" >&2
+    echo "     \"$TRANSFORMER_DIR/saved_models/\"" >&2
+    echo "   runpodctl pod delete $POD_ID" >&2
+    echo "" >&2
+    echo " Or, if you're confident nothing of value is on this pod, re-run" >&2
+    echo " with FORCE_TERMINATE_ON_PULL_FAILURE=1 to delete it anyway." >&2
+    echo "==================================================================" >&2
     return
   fi
   echo ""
@@ -195,6 +263,47 @@ cleanup_pod() {
   "$RUNPODCTL" pod delete "$POD_ID" || echo "  (delete failed -- terminate manually: runpodctl pod delete $POD_ID)" >&2
 }
 trap cleanup_pod EXIT
+
+# Retries an rsync pull up to $3 (default 3) times with a short backoff,
+# printing progress before/after every attempt -- fixes two real problems
+# found in a live run: (1) almost no console output while this step ran,
+# so a hang/slow transfer looked identical to nothing happening, and (2)
+# a genuine SSH connection failure (exit 255, "kex_exchange_identification:
+# read: Operation timed out") got silently swallowed by a bare `|| echo
+# "no files found"`, which is flat-out WRONG for that failure -- it then
+# let the pod get terminated with the run's actual artifacts possibly
+# still stranded on it. rsync exit 24 ("vanishing source files", e.g. the
+# archive's own rotation pruning a file mid-transfer, see OVERVIEW.md's
+# rsync retrieval notes) is treated as success; every other nonzero exit
+# is a real failure, retried, and -- if still failing after $3 attempts --
+# reported loudly with PULL_BACK_OK=0 so cleanup_pod() above refuses to
+# terminate the pod out from under undelivered data.
+rsync_with_retry() {
+  local desc="$1" src="$2" dest="$3" max_attempts="${4:-3}"
+  local attempt=1 rc out
+  while (( attempt <= max_attempts )); do
+    echo "  [pull $attempt/$max_attempts] $desc ..."
+    # `out=$(...) ; rc=$?` would trip `set -e` on a failing rsync (the
+    # assignment's own exit status IS rsync's, and a plain failing
+    # statement is not exempt from errexit) -- the `&&`/`||` chain keeps
+    # this line itself always "successful" so rc is captured either way.
+    out="$(rsync -avP -e "ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
+      "$src" "$dest" 2>&1)" && rc=0 || rc=$?
+    echo "$out"
+    if [[ "$rc" == "0" || "$rc" == "24" ]]; then
+      echo "  [pull $attempt/$max_attempts] $desc: OK (rsync exit $rc)"
+      return 0
+    fi
+    echo "  [pull $attempt/$max_attempts] $desc: FAILED (rsync exit $rc)" >&2
+    if (( attempt < max_attempts )); then
+      echo "  retrying in 15s..." >&2
+      sleep 15
+    fi
+    attempt=$((attempt + 1))
+  done
+  echo "  [pull] $desc: giving up after $max_attempts attempts (exit $rc)." >&2
+  return 1
+}
 
 echo "Fetching SSH connection info..."
 SSH_INFO_JSON="$("$RUNPODCTL" ssh info "$POD_ID" -o json 2>&1)"
@@ -220,7 +329,7 @@ fi
 echo "  host=$POD_HOST port=$POD_PORT"
 echo ""
 
-export POD_HOST POD_PORT SSH_KEY
+export POD_HOST POD_PORT SSH_KEY TRANSFER_METHOD CROC_RELAY_PORT
 echo "=================================================================="
 echo " Phase 1/2: env files (code, checkpoint, ridge map, AE decoder)"
 echo "=================================================================="
@@ -291,13 +400,34 @@ echo ""
 echo "=================================================================="
 echo " Pulling back ONLY the new artifacts (not the training data)"
 echo "=================================================================="
-rsync -avP -e "ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
-  "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/saved_models/r2_${ARM}_"* \
-  "$TRANSFORMER_DIR/saved_models/" 2>&1 || echo "  (no r2_${ARM}_* files found to pull -- check the run actually saved a checkpoint)"
-rsync -avP -e "ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" \
-  "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/sweep_logs/" \
-  "$TRANSFORMER_DIR/sweep_logs/" 2>&1 || true
+CKPT_OK=1
+if ! rsync_with_retry "checkpoints (saved_models/r2_${ARM}_*)" \
+    "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/saved_models/r2_${ARM}_"* \
+    "$TRANSFORMER_DIR/saved_models/"; then
+  CKPT_OK=0
+  PULL_BACK_OK=0
+fi
+LOGS_OK=1
+if ! rsync_with_retry "sweep_logs/" \
+    "root@$POD_HOST:/workspace/cgan/transformer_neurIPS/sweep_logs/" \
+    "$TRANSFORMER_DIR/sweep_logs/"; then
+  LOGS_OK=0
+  PULL_BACK_OK=0
+fi
 
 echo ""
-echo "Done. Results under saved_models/ and sweep_logs/ (local)."
-echo "Pod will now be terminated (trap on EXIT) unless KEEP_POD=1 was set."
+echo "------------------------------------------------------------------"
+echo " Pull-back summary"
+echo "------------------------------------------------------------------"
+echo "  checkpoints: $([[ "$CKPT_OK" == "1" ]] && echo OK || echo "FAILED -- see above")"
+find "$TRANSFORMER_DIR/saved_models" -maxdepth 1 -name "r2_${ARM}_*" -newermt "-15 min" \
+  -exec ls -la {} \; 2>/dev/null | sed 's/^/    /'
+echo "  sweep_logs:  $([[ "$LOGS_OK" == "1" ]] && echo OK || echo "FAILED -- see above")"
+echo ""
+if [[ "$PULL_BACK_OK" == "1" ]]; then
+  echo "Done. Results under saved_models/ and sweep_logs/ (local)."
+  echo "Pod will now be terminated (trap on EXIT) unless KEEP_POD=1 was set."
+else
+  echo "AT LEAST ONE PULL-BACK STEP FAILED -- see cleanup_pod()'s message" >&2
+  echo "below for how to retrieve manually before this pod is terminated." >&2
+fi

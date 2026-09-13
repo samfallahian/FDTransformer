@@ -590,12 +590,17 @@ def _stream_sequences_to_hdf5(out_path, sequence_iter, *, expected_plan_count,
             dataset = None
             for plan_idx, seq in sequence_iter:
                 if dataset is None:
+                    # compression=None deliberately -- see decompress_h5.py's
+                    # docstring / OVERVIEW.md: gzip only shrank this float32
+                    # physics data by ~13% while still paying full
+                    # single-threaded zlib decompression cost on every load.
+                    # Not worth the tradeoff.
                     dataset = f_out.create_dataset(
                         'data',
                         shape=(0, NUM_TIME_NEW, NUM_X, 52),
                         maxshape=(None, NUM_TIME_NEW, NUM_X, 52),
                         chunks=(1, NUM_TIME_NEW, NUM_X, 52),
-                        compression='gzip',
+                        compression=None,
                         dtype='float32')
 
                 if plan_idx == 1 or plan_idx % progress_every == 0:

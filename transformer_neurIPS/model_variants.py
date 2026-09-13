@@ -432,7 +432,10 @@ class BaseTransformer(nn.Module):
                     f"DELTA_ANCHOR='ridge' requires Config.RIDGE_MAP_PATH to "
                     f"point at a fitted ridge map -- run diagnostics first "
                     f"(linear_frame_baseline() saves it there): {ridge_path}")
-            payload = torch.load(ridge_path, map_location='cpu')
+            # weights_only=True is safe here -- this file is always our own
+            # locally-fitted output (linear_frame_baseline()'s payload is a
+            # plain dict of tensors, nothing else), never a third-party file.
+            payload = torch.load(ridge_path, map_location='cpu', weights_only=True)
             ridge_A = payload['A'].float()
             expected_d = config.NUM_X * config.LATENT_DIM
             if tuple(ridge_A.shape) != (expected_d + 1, expected_d):
@@ -514,7 +517,22 @@ class BaseTransformer(nn.Module):
             return fallback
         D = NX * LD
         frames = raw_lat[:, :n_complete * NX, :].reshape(B, n_complete, D)
-        ones = torch.ones(B, n_complete, 1, dtype=frames.dtype, device=frames.device)
+        # `torch.ones(..., device=frames.device)` looks dynamic in eager
+        # mode but `torch.jit.script` was observed baking the device in as
+        # a COMPILE-TIME CONSTANT (whatever device `inner` was on when
+        # save_scripted_model() called torch.jit.script(), i.e. BEFORE its
+        # later `.to("cpu")` move) -- the scripted graph came back with a
+        # literal `device=torch.device("cuda:0")`, which then explodes on
+        # the CPU-side roundtrip-verification forward pass with "Expected
+        # all tensors to be on the same device, but found at least two
+        # devices, cpu and cuda:0" (confirmed on a real CUDA run). Same
+        # underlying issue as the MPS-side "Passed CPU tensor to MPS op"
+        # failure documented in OVERVIEW.md v6.1 section 31.4/v6.3 section
+        # 33.5 -- not device-specific, a general `device=` kwarg problem.
+        # `ones_like()` ties device/dtype to the ACTUAL runtime tensor
+        # instead of a separately-scripted `.device` attribute read, which
+        # TorchScript handles correctly as truly dynamic.
+        ones = torch.ones_like(frames[..., :1])
         src1 = torch.cat([frames, ones], dim=-1)
         # Same bf16/float32 guard as `decode_centroid()`: the ridge map is a
         # frozen float32 buffer, but this runs inside whatever CUDA autocast

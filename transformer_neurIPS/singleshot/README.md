@@ -3,19 +3,20 @@
 Everything needed to go from "empty rented pod" to "training running,
 telemetry flowing to wandb": code, data, the recovered checkpoint, the
 AE decoder, and the dependency/bootstrap scripts. No tarball -- files
-transfer individually, in two phases, specifically so bootstrapping the
-venv and transferring the large data files can happen **at the same
-time** over two separate SSH connections, instead of one blocking the
-other.
+transfer individually, in two phases, so bootstrapping the venv and
+transferring the large data files can happen **at the same time**
+instead of one blocking the other. On the pod side, everything runs
+inside named `screen` sessions over a SINGLE SSH connection -- see
+"Running everything on the pod via screen" below.
 
 ## What's in here
 
 | File | Role |
 |---|---|
-| `provision_and_run.sh` | Run **locally**. The full lifecycle in one command: create a pod via `runpodctl`, wait for SSH, send env files, bootstrap the pod WHILE the data files transfer in the background, run a time-boxed training job, pull the new artifacts back, terminate the pod. See "Fully automated lifecycle" below. |
-| `scp_env_files.sh` | Run **locally**. Phase 1: sends code, the recovered checkpoint, the ridge map, the AE decoder, and this directory's own `requirements.txt`/`bootstrap_remote.sh` -- everything except the large data files. Small, finishes in seconds. |
-| `scp_data_files.sh` | Run **locally**. Phase 2: sends `train_80.h5` (7.9G) and `val_80.h5` (3.4G) as two concurrent `scp` processes. Independent of phase 1 -- run it any time after, or in a separate terminal at the same time as, phase 1. |
-| `bootstrap_remote.sh` | Run **on the pod**. Creates a venv, installs pinned deps + the correct CUDA **stable** (not nightly) torch build, then stops and prints the `wandb login` step for you to run yourself -- never called non-interactively past that point unless `WANDB_API_KEY` is set. Only needs phase 1's files -- can run while phase 2 is still transferring. |
+| `provision_and_run.sh` | Run **locally**. The full lifecycle in one command: create a pod via `runpodctl`, wait for SSH, send env files, bootstrap the pod WHILE the data files transfer in the background, run a time-boxed training job, pull the new artifacts back (retried a few times, with progress printed for every attempt), terminate the pod -- but only if that pull-back actually succeeded; a genuine failure (as opposed to "no files matched") leaves the pod running rather than risk deleting undelivered results (`FORCE_TERMINATE_ON_PULL_FAILURE=1` overrides this). See "Fully automated lifecycle" below. |
+| `scp_env_files.sh` | Run **locally**. Phase 1: sends code, the recovered checkpoint(s) (including the MPS baseline for Experiment A below), the ridge map, the AE decoder, and this directory's own `requirements.txt`/`bootstrap_remote.sh` -- everything except the large data files. Small, finishes in seconds. |
+| `scp_data_files.sh` | Run **locally**. Phase 2: sends `train_80.h5` (~9.2G) and `val_80.h5` (~3.9G) as two concurrent `scp` processes. Independent of phase 1 -- run it any time before, during, or after phase 1. Both files are stored uncompressed (`decompress_h5.py`, see below) -- slightly larger on disk/wire, but no more single-threaded gzip decompression cost on every load. |
+| `bootstrap_remote.sh` | Run **on the pod** (normally inside the `bootstrap` screen, see below). Creates a venv, installs pinned deps + `mc` (midnight commander) + `screen` + `croc` + the correct CUDA **stable** (not nightly) torch build, then stops and prints the `wandb login` step for you to run yourself -- never called non-interactively past that point unless `WANDB_API_KEY` is set. Only needs phase 1's files -- can run while phase 2 is still transferring. |
 | `requirements.txt` | Copy of `/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/requirements_sweep.txt` (the verified-minimal dependency set), kept self-contained here. |
 
 ## Why not a tarball
@@ -42,32 +43,61 @@ POD_HOST=<pod ip> POD_PORT=<ssh port> bash /Users/kkreth/PycharmProjects/cgan/tr
 Checks every required file exists locally first (same `[OK]`/`[MISSING]`
 table every `run_sweep_h300_*.sh` launcher in this repo already uses),
 then `scp`s each one individually and verifies the byte count matches on
-both ends before moving to the next. Finishes in seconds.
+both ends before moving to the next. Finishes in seconds. This includes
+the MPS baseline checkpoint (`saved_models/r2_h11_ridge_distill_latest.pt`)
+that Experiment A below resumes from -- if you retrain a new baseline,
+re-run this phase before launching, or Experiment A will silently
+cold-start instead (exactly the failure mode OVERVIEW.md v6.0 exists to
+prevent -- always re-check the `[OK]` table above before assuming a
+checkpoint made it to the pod).
 
-**As soon as phase 1 is done, open a second terminal and start
-bootstrapping** (no need to wait for phase 2):
-
-```bash
-ssh -p <ssh port> -i ~/.ssh/id_ed25519 root@<pod ip>
-bash /workspace/cgan/transformer_neurIPS/singleshot/bootstrap_remote.sh
-```
-
-**Phase 2 (slow) -- the training/validation data**, in your first
-terminal (or a third one -- it doesn't depend on phase 1 or bootstrap at
-all, only on the pod having somewhere to put the files):
+**Phase 2 (slow) -- the training/validation data**, run any time before,
+during, or after phase 1 -- it's independent, only needs the pod to have
+somewhere to put the files:
 
 ```bash
 POD_HOST=<pod ip> POD_PORT=<ssh port> bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/scp_data_files.sh
 ```
 
 Sends `train_80.h5` and `val_80.h5` as two concurrent `scp` processes
-(not sequential) and verifies both sizes match on completion. By the
-time this finishes, bootstrap in your other terminal has likely already
-finished too -- you're ready to smoke-test/launch as soon as both are done.
+(not sequential) and verifies both sizes match on completion.
 
 Optional overrides on both scripts: `POD_USER` (default `root`),
 `SSH_KEY` (default `/Users/kkreth/.ssh/id_ed25519`), `REMOTE_ROOT`
 (default `/workspace` -- files land at `$REMOTE_ROOT/cgan/...`).
+
+## Running everything on the pod via `screen` -- one SSH connection, not three
+
+Older versions of this doc said "open a second terminal for bootstrap
+while phase 2 transfers." You don't need that anymore: SSH in **once**,
+then launch each job as its own detached `screen` session -- it keeps
+running (and stays attachable) even if your SSH connection drops, which
+is exactly the fragility that bit a run earlier this session (a dropped
+foreground SSH session silently killed the training process with
+nothing to reconnect to).
+
+```bash
+ssh -p <ssh port> -i ~/.ssh/id_ed25519 root@<pod ip>
+```
+
+Then, from that one shell, run each row below (any order -- each one
+waits on its own prerequisite, so firing all three immediately is safe):
+
+| Screen | Command | What it does |
+|---|---|---|
+| `bootstrap` | `screen -dmS bootstrap bash -c 'bash /workspace/cgan/transformer_neurIPS/singleshot/bootstrap_remote.sh; echo "--- bootstrap done, now tailing exp-a ---"; tail -F /workspace/cgan/transformer_neurIPS/exp_a.log'` | Builds the venv, installs deps + `mc` (see below). Once done, automatically switches to tailing Experiment A's log (`tail -F` waits for the file to exist, so this works regardless of launch order) -- this one screen becomes your live view of Experiment A without needing a 4th terminal. |
+| `exp-a` | `screen -dmS exp-a bash -c 'until [ -f /workspace/cgan/.venv/bin/activate ]; do sleep 5; done; cd /workspace/cgan/transformer_neurIPS && source /workspace/cgan/.venv/bin/activate && python train_production_transformer_deep_dive.py --arm h11_ridge_distill --round 2 --max-steps 2500 --max-hours 0.5 --val-every 500 --no-wandb 2>&1 \| tee exp_a.log'` | **Resumes** from the MPS baseline checkpoint (`r2_h11_ridge_distill_latest.pt`, step 25 -- see phase 1). Waits for the venv to exist before starting, so it's safe to launch before/alongside `bootstrap`. Only start this after phase 2 (data) has also finished. |
+| `exp-b` | `screen -dmS exp-b bash -c 'until [ -f /workspace/cgan/.venv/bin/activate ]; do sleep 5; done; cd /workspace/cgan/transformer_neurIPS && source /workspace/cgan/.venv/bin/activate && python train_production_transformer_deep_dive.py --arm h11_ridge_distill --round 3 --max-steps 2500 --max-hours 0.5 --val-every 500 --no-wandb --fresh --no-warm-start 2>&1 \| tee exp_b.log'` | Cold start, no baseline -- the control arm of the two-experiment comparison. `--round 3` (vs. `exp-a`'s `--round 2`) gives it distinct checkpoint/lock filenames, so both can run at once without colliding. |
+
+**Reattach to any of them any time** (including after reconnecting from
+a dropped SSH session):
+```bash
+screen -r bootstrap    # or exp-a / exp-b
+```
+Detach without killing it: `Ctrl-A` then `D`. List everything running:
+`screen -ls`. If you want wandb telemetry on either experiment, attach
+to a screen (or open a plain interactive shell) and run `wandb login`
+yourself first, then drop `--no-wandb` from that experiment's command.
 
 ## Fully automated lifecycle: create pod -> run -> pull results -> terminate
 
@@ -225,76 +255,19 @@ account (see the honesty note above).
 Via RunPod's website, `runpodctl pod create` directly, or (once signed
 in) the MCP tools from "RunPod agent setup" below.
 
-### 2. Send the files (two phases, can overlap)
+### 2. Send the files, then run everything via `screen`
 
-Covered above -- `scp_env_files.sh` (fast), then open a second terminal
-to bootstrap (step 3) while `scp_data_files.sh` (slow) runs.
-
-### 3. SSH in and bootstrap
-
+Covered in full above -- "Sending the files" for the two `scp_*`
+phases, then "Running everything on the pod via `screen`" for the
+bootstrap/exp-a/exp-b table. `--smoke-test` is worth running once by
+hand before committing to a real launch:
 ```bash
-ssh -p <ssh port> -i /Users/kkreth/.ssh/id_ed25519 root@<pod ip>
-bash /workspace/cgan/transformer_neurIPS/singleshot/bootstrap_remote.sh
+python /workspace/cgan/transformer_neurIPS/train_production_transformer_deep_dive.py --arm h11_ridge_distill --round 2 --smoke-test
 ```
+Builds the model and runs the causality gate on synthetic data in
+seconds, with no data/checkpoint/wandb I/O at all.
 
-This creates a venv, installs `numpy`/`h5py`/`wandb` (pinned) and the
-correct stable-CUDA `torch` build (auto-detected from `nvidia-smi`),
-verifies the interpreter can see the GPU, and then **stops** -- it will
-not log in to wandb for you. Only needs phase 1's files, so this can run
-while phase 2 (the data) is still transferring.
-
-### 4. Log in to wandb yourself
-
-```bash
-source /workspace/cgan/.venv/bin/activate
-wandb login
-```
-
-This is interactive on purpose (browser auth / paste an API key from
-https://wandb.ai/authorize) -- credentials never touch this package or
-any script in it.
-
-### 5. Smoke-test, then launch
-
-Once both phases have finished (confirm phase 2's script printed its
-size-verification "OK" lines):
-
-```bash
-cd /workspace/cgan/transformer_neurIPS
-python /workspace/cgan/transformer_neurIPS/train_production_transformer_deep_dive.py --arm s8_h9_moreseqs_scaled --round 2 --smoke-test
-bash /workspace/cgan/transformer_neurIPS/run_sweep_h300_production_8h.sh
-```
-
-`--smoke-test` builds the model and runs the causality gate on synthetic
-data in seconds, with no data/checkpoint/wandb I/O at all -- confirms
-the arm resolves and the pinned shapes are coherent before committing
-to the real 8-hour run.
-
-### 5a. Running `h11_ridge_distill` manually -- keep this at your fingertips
-
-**If `provision_and_run.sh` ever dies/hangs again** (as it did earlier
-this session -- see OVERVIEW.md v6.0 §30.1 for the wandb-duplicate-run
-incident this whole `singleshot/` package exists to guard against),
-this is the exact fully-qualified command to launch it by hand, once
-you're SSH'd in and steps 3/4 above are done:
-
-```bash
-cd /workspace/cgan/transformer_neurIPS
-source /workspace/cgan/.venv/bin/activate
-python /workspace/cgan/transformer_neurIPS/train_production_transformer_deep_dive.py \
-  --arm h11_ridge_distill --round 2 \
-  --max-steps 2500 --max-hours 0.5 \
-  --val-every 500 --no-wandb
-```
-
-(Drop `--no-wandb` and run `wandb login` first per step 4 if you want
-telemetry for this run.) This is the literal command
-`provision_and_run.sh` runs on your behalf -- same arm, same 30-minute/
-2500-step cap, same everything -- just typed by hand instead of
-generated inside a heredoc. `provision_and_run.sh` itself carries the
-identical command in a comment right above where it builds that heredoc,
-so the script and this README never drift apart on what "running h11
-manually" actually means.
+### 3. Why `h11_ridge_distill` bundles three acceleration ideas at once
 
 **As of OVERVIEW.md v6.3**, `h11_ridge_distill` bundles three
 acceleration ideas at once (deliberately, in one screen -- see v6.3 for
@@ -305,16 +278,23 @@ horizon), ridge-map distillation extended into the AR rollout itself
 safely for the first time (via `forward()`'s new
 `force_persistence_anchor` split -- the ridge anchor only ever applies
 to the non-recursive teacher-forced loss, never inside the AR/rollout
-feedback loop that caused `h10_ridge_residual`'s blowup). The command
-above is unchanged; only what it now actually does changed.
+feedback loop that caused `h10_ridge_residual`'s blowup).
 
-To pull the result back yourself afterward (in case the pod's about to
-be interrupted/terminated and you can't wait for automation):
+The `exp-a`/`exp-b` table above IS the fully-qualified manual launch
+command for each -- if `provision_and_run.sh` (or a screen session)
+ever dies/hangs again (as one did earlier this session -- see
+OVERVIEW.md v6.0 §30.1 for the wandb-duplicate-run incident this whole
+`singleshot/` package exists to guard against), those are exactly the
+commands to re-run by hand.
+
+To pull either experiment's result back yourself (in case the pod's
+about to be interrupted/terminated and you can't wait for automation):
 
 ```bash
 rsync -avP -e "ssh -p <ssh port> -i /Users/kkreth/.ssh/id_ed25519" \
   "root@<pod ip>:/workspace/cgan/transformer_neurIPS/saved_models/r2_h11_ridge_distill_"* \
   /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/saved_models/sweep_arms_local/
+# exp-b used --round 3 -- substitute r3_ for r2_ above to pull that one instead.
 ```
 
 ## RunPod agent setup
@@ -344,25 +324,76 @@ a Claude Code session instead of via these scripts.
 
 `scp` (what these scripts use) needs no setup beyond SSH access and
 works with any provider, not just RunPod -- that's why it's the default
-here. A few alternatives, roughly fastest to slowest for the ~11.3GB
-`train_80.h5`+`val_80.h5` pair specifically:
+here. `croc` is now pre-installed on the pod by `bootstrap_remote.sh`
+(right after the `apt-get update`/`mc`/`screen` step), so it's ready to
+use with zero extra setup on either the outbound (pushing data to a
+fresh pod) or inbound (pulling checkpoints/results back before
+terminating a pod) direction. A few alternatives, roughly fastest to
+slowest for the ~11.3GB `train_80.h5`+`val_80.h5` pair specifically:
 
-1. **`runpodctl send` / `runpodctl receive`** -- RunPod's own tool
-   (built on `croc`): NAT traversal + relay, no SSH key/port juggling,
-   often meaningfully faster than a raw `scp` stream for a large single
-   transfer. Already installed at `/Users/kkreth/.local/bin/runpodctl`:
+1. **`croc`**, self-hosted relay -- `scp_data_files.sh` now has this
+   wired in as an opt-in (`TRANSFER_METHOD=croc bash scp_data_files.sh`,
+   or `TRANSFER_METHOD=croc bash provision_and_run.sh` for the full
+   lifecycle), falling back to `scp` automatically for any file it
+   doesn't get. **Status: confirmed the problem, NOT yet confirmed the
+   fix.** A live benchmark (`tests/test_croc_transfer_speed.py`,
+   POD_HOST/POD_PORT against a real pod) measured croc's DEFAULT
+   *public* relay (`schollz`'s) at ~18-21 MB/s moving a 100MB random
+   file -- matching the exact ceiling seen on real `train_80.h5`
+   uploads regardless of local link speed, and matching community
+   reports of that public relay's own shared bandwidth cap. The
+   intended fix -- self-hosting the relay ON THE POD, so traffic goes
+   straight over the same direct IP path SSH already uses instead of
+   through whichever datacenter hosts the public relay -- did NOT
+   complete in that same test: the receiver connected to its own
+   `localhost` relay fine, but the sender (this machine) never reached
+   it, and the pod was closed before the cause could be confirmed with
+   a raw port-reachability check. Leading theory: RunPod pods only
+   expose ports explicitly listed at `pod create` time, and the pod
+   used for that test predates `provision_and_run.sh`'s current
+   `--ports` line (added afterward specifically to fix this -- see
+   `CROC_RELAY_PORT` in that script's header) -- so this needs a fresh
+   pod and a re-run of that same test before treating it as confirmed.
+   Two real bugs found and fixed getting even the public-relay half of
+   that test working, worth knowing if you touch this again:
+   - `croc` 11.x refuses a receive code as a bare CLI argument by
+     default (a security change vs. older versions) -- needs its
+     "classic mode" persisted setting enabled once
+     (`~/.config/croc/classic_enabled` on whichever side receives).
+   - `croc relay &` run via a plain non-interactive `ssh host "cmd &"`
+     gets SIGHUP'd the instant that ssh command's own shell exits --
+     the process is simply gone half a second later. Needs `setsid`
+     inside a nested `bash -c '... &'` to actually survive.
+   - Do NOT clean up a self-hosted relay with `pkill -f "croc relay"`
+     if anything else follows it in the same ssh command string --
+     `pkill -f` scans every process's full command line, which
+     trivially includes the invoking shell's OWN command line (it
+     literally contains the pkill invocation's text), and pkill's
+     self-exclusion only covers the pkill process itself, not its
+     parent shell -- it silently kills the whole SSH session instead
+     (`ssh -v` shows `exit-signal`, not a clean exit code). Kill by the
+     exact pid captured at launch instead.
+2. **`runpodctl send` / `runpodctl receive`** -- RunPod's own tool
+   (also built on `croc`, same relay network): NAT traversal + relay,
+   no SSH key/port juggling. Already installed locally at
+   `/Users/kkreth/.local/bin/runpodctl`:
    `runpodctl send /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/data/train_80.h5`
    prints a one-time code, run `runpodctl receive <code>` on the pod to
-   pull it (one call per file -- it doesn't take a directory).
-2. **Cloud-storage relay** -- upload the data files once to S3/R2/GCS
+   pull it (one call per file -- it doesn't take a directory). Prefer
+   plain `croc` (above) when you want to send multiple files/a glob in
+   one call.
+3. **Cloud-storage relay** -- upload the data files once to S3/R2/GCS
    from this machine, then `curl`/`aws s3 cp`/`gsutil cp` them down on
    the pod. Turns a slow home-upload into a one-time cost, and multiple
    pods can reuse the same uploaded objects without re-uploading from
    home each time. Best option if you expect to provision more than one
    pod against the same data.
-3. **`rsync -avP`** in place of `scp` -- not faster for a first
+4. **`rsync -avP`** in place of `scp` -- not faster for a first
    transfer, but resumable if the connection drops partway (the
    convention already used elsewhere in this repo for pulling results
    back, see `OVERVIEW.md` §0). `scp_data_files.sh` re-sends the whole
    file on a retry rather than resuming; switch to `rsync` here if a
-   flaky connection makes that costly.
+   flaky connection makes that costly. Still the right tool for small,
+   incremental result pulls (single checkpoint/status file) where
+   `croc`'s one-time-code handshake is more ceremony than the transfer
+   is worth.

@@ -1109,33 +1109,40 @@ ROUND2_ARMS = {
                                                  "AR_EVERY_N_STEPS": 2,
                                                  "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
             "h11_ridge_distill": {"desc": "h9_ar_freq1's config, upgraded in place (OVERVIEW.md "
-                                          "v6.3) with THREE acceleration ideas at once against the "
-                                          "ridge/linear ceiling (+69%, v6.2) -- a deliberate "
-                                          "speed-over-clean-attribution tradeoff for a single 30-min "
-                                          "CUDA screen, called out honestly rather than hidden: "
+                                          "v6.3, corrected in v6.5) with TWO acceleration ideas "
+                                          "against the ridge/linear ceiling (+69%, v6.2): "
                                           "(1) AR_FRAMES_START=2 curriculum, ramping the AR-loss "
                                           "horizon up to AR_FRAMES=8 rather than asking the network "
                                           "to correct a full 8-frame rollout from step 1; "
-                                          "(2) RIDGE_DISTILL_WEIGHT now also distills the AR "
-                                          "rollout itself toward the ridge map's own independent "
-                                          "multi-frame rollout (ridge_rollout_targets()), not just "
-                                          "the one-step prediction; (3) PREDICT_DELTA=True with "
-                                          "DELTA_ANCHOR='ridge' is engaged for the first time on "
-                                          "this arm, SAFELY, because forward()'s new "
-                                          "force_persistence_anchor flag forces plain persistence "
-                                          "for every recursive (AR/rollout) call and reserves the "
-                                          "ridge anchor for the one-step teacher-forced loss only -- "
-                                          "the split that h10_ridge_residual (v4.6 section 26.2) "
-                                          "didn't have, which is why that arm blew up and this one "
-                                          "shouldn't. Requires this sweep's diagnostics step to have "
-                                          "run (fits and saves the ridge map to Config.RIDGE_MAP_PATH "
-                                          "before any arm trains) -- do not pass --skip-diagnostics "
-                                          "on a run that includes h11.",
+                                          "(2) RIDGE_DISTILL_WEIGHT distills BOTH the one-step "
+                                          "prediction and the AR rollout itself toward the ridge "
+                                          "map's own independent multi-frame rollout "
+                                          "(ridge_rollout_targets()). PREDICT_DELTA=True/"
+                                          "DELTA_ANCHOR='ridge' (v6.3's third idea) was REMOVED in "
+                                          "v6.5: a real CUDA run's rollout eval was ~594x worse than "
+                                          "persistence, and it was NOT h10_ridge_residual's bug "
+                                          "recurring (force_persistence_anchor WAS correctly wired "
+                                          "at every recursive call site) -- it was a different, new "
+                                          "bug in the same idea: the one-step teacher-forced loss "
+                                          "(the dominant training signal by call frequency) trained "
+                                          "the delta head against the ridge anchor, while every "
+                                          "recursive/eval call forces the persistence anchor instead "
+                                          "-- same weights, two different anchors, so the learned "
+                                          "delta is systematically off by (persistence - ridge) at "
+                                          "every position, compounding through the AR chain (see "
+                                          "OVERVIEW.md v6.5, reproduced in isolation on a tiny "
+                                          "trainable model: ~5700x MSE regression from the anchor "
+                                          "swap alone). Ridge's influence on this arm is now purely "
+                                          "through the (safe, anchor-agnostic) distillation LOSS "
+                                          "terms, matching v6.1's original, simpler design. Requires "
+                                          "this sweep's diagnostics step to have run (fits and saves "
+                                          "the ridge map to Config.RIDGE_MAP_PATH before any arm "
+                                          "trains) -- do not pass --skip-diagnostics on a run that "
+                                          "includes h11.",
                                   "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
                                                 "AR_FRAMES": 8, "AR_FRAMES_START": 2,
                                                 "AR_SEQS": 2, "AR_EVERY_N_STEPS": 1,
-                                                "RIDGE_DISTILL_WEIGHT": 0.5,
-                                                "PREDICT_DELTA": True, "DELTA_ANCHOR": "ridge"}},
+                                                "RIDGE_DISTILL_WEIGHT": 0.5}},
         },
     },
     # ---------------------------------------------------------------- branch V
@@ -2980,8 +2987,15 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
 # Default checkpoint fed to `--warm-start`: the v1.0 rollout-best winner from
 # tests/reports/r1_a3b_delta_ar_deep_dive.md (4.78 M-param, epoch 2400,
 # causal OK). NOT `_best.pt` -- the deep dive nominated `_rollout_best.pt`.
+#
+# Lives under CHECKPOINT_DIR/old/ (the v1.0-frozen-checkpoints bucket from
+# this session's saved_models/ reorganisation), NOT CHECKPOINT_DIR itself --
+# found the hard way when a default-warm-start launch of h11_ridge_distill
+# failed with "checkpoint not found" against the OLD (pre-reorganisation)
+# path. Fixed here rather than moving the file back: `old/` is where every
+# other v1.0 artifact already lives, so this should point there too.
 DEFAULT_WARM_START_CKPT = os.path.join(
-    Config.CHECKPOINT_DIR, "r1_a3b_delta_ar_rollout_best.pt")
+    Config.CHECKPOINT_DIR, "old", "r1_a3b_delta_ar_rollout_best.pt")
 
 # Keys whose absence is EXPECTED when warm-starting a v1.0 (NUM_TIME=40)
 # checkpoint into a v2.0 (NUM_TIME=80) model, and why:
@@ -2994,8 +3008,17 @@ DEFAULT_WARM_START_CKPT = os.path.join(
 # (causal_mask/feat_mean/feat_std) for the same reasons the leaderboard test
 # tolerates them: legacy no-op buffers or normalisation stats that the trainer
 # repopulates before the first optimiser step (see `set_feature_stats` above).
+#
+# `ridge_A` (OVERVIEW.md v6.1/v6.3) is ALSO benign-missing: any v1.0/pre-v6.1
+# checkpoint predates the ridge-anchor mechanism entirely, so it simply never
+# had this buffer -- the freshly-constructed model's own __init__ already
+# registers the correct buffer (a real fitted matrix for DELTA_ANCHOR='ridge',
+# or model_variants.py's 1x1 placeholder otherwise) before warm-start ever
+# runs, so there is nothing to "transfer" here regardless. Found the hard way
+# warm-starting h11_ridge_distill (DELTA_ANCHOR='ridge') from the v1.0
+# checkpoint above -- hard-failed on "missing key: ridge_A" before this fix.
 WARM_START_LENGTH_DEPENDENT_KEYS = frozenset({"time_embeddings.weight"})
-WARM_START_BENIGN_MISSING_KEYS = frozenset({"causal_mask", "feat_mean", "feat_std"})
+WARM_START_BENIGN_MISSING_KEYS = frozenset({"causal_mask", "feat_mean", "feat_std", "ridge_A"})
 
 
 def _wsc(text, color):
@@ -3560,8 +3583,23 @@ def train(args, log=print):
     # -- torch.compile (CUDA only, never fatal) ----------------------------
     if regime.compile_model:
         try:
-            model = torch.compile(model)
-            log("  [compile] torch.compile(model): OK")
+            # dynamic=True: the SAME compiled model is called from both
+            # teacher_forced() (fixed shape: micro_batch x full SEQ_LEN)
+            # AND the AR-rollout loop (frame_ar_loss/rollout_frames), whose
+            # batch is much smaller (AR_SEQS, e.g. 2 vs. micro_batch=32) AND
+            # whose sequence length grows by one token/frame on every one of
+            # up to AR_FRAMES*NUM_X iterations, from a randomized starting
+            # context length picked fresh each call. Without dynamic=True,
+            # dynamo specializes a separate compiled graph per exact shape
+            # it sees, blows through the default cache_size_limit (8) almost
+            # immediately once AR runs, and silently falls back to eager for
+            # every shape past that limit -- while the recompilation attempts
+            # themselves are real, CPU-bound wall-clock cost paid mid-step,
+            # compounding the GPU-idle gaps this run's [/34.x] investigation
+            # already found from unnecessary .item() syncs. dynamic=True
+            # tells dynamo to treat these as symbolic dims up front instead.
+            model = torch.compile(model, dynamic=True)
+            log("  [compile] torch.compile(model, dynamic=True): OK")
         except Exception as e:
             log(f"  [compile] torch.compile(model) failed "
                 f"({type(e).__name__}: {e}); continuing eager")
@@ -3744,7 +3782,11 @@ def train(args, log=print):
                 f"Config.RIDGE_MAP_PATH to point at a fitted ridge map -- "
                 f"run diagnostics first (linear_frame_baseline() saves it "
                 f"there): {ridge_path}")
-        ridge_payload = torch.load(ridge_path, map_location=device, weights_only=False)
+        # weights_only=True is safe -- this file is always our own locally-
+        # fitted output (linear_frame_baseline()'s payload is a plain dict
+        # of tensors), never a third-party file. Same fix as
+        # model_variants.py's ridge-map load.
+        ridge_payload = torch.load(ridge_path, map_location=device, weights_only=True)
         ridge_A = ridge_payload['A'].to(device=device, dtype=torch.float32)
         expected_d = Config.NUM_X * Config.LATENT_DIM
         if tuple(ridge_A.shape) != (expected_d + 1, expected_d):
@@ -3855,7 +3897,7 @@ def train(args, log=print):
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        loss_acc = primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = 0.0
+        primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = 0.0
         last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
@@ -3880,7 +3922,14 @@ def train(args, log=print):
                 pred_lat = to_per_token_latent(pred, Config)
                 tgt_lat = to_per_token_latent(tgt, Config)
                 loss = centroid_velocity_loss(pred_lat, tgt_lat, Config)
-                primary_acc += loss.item()
+                # Accumulate as a GPU tensor, NOT via .item() here -- .item()
+                # forces a CUDA sync that drains the whole queue and stalls
+                # the GPU until the CPU catches up, `accum_steps` times per
+                # optimizer step if done in this loop. Materialized to a
+                # Python float exactly once below, after the loop, which is
+                # the only place a float is actually needed every step (for
+                # best["train_loss"]/checkpoint gating).
+                primary_acc = primary_acc + loss.detach()
                 last_pred, last_tgt = pred_lat.detach(), tgt_lat.detach()
                 # Ridge-distillation term: one matmul against a frozen buffer,
                 # no sequential loop -- cheap enough to run on EVERY
@@ -3892,7 +3941,10 @@ def train(args, log=print):
                     ridge_inp = to_per_token_latent(batch[:, :-1, :Config.LATENT_DIM], Config)
                     ridge_tgt_lat = ridge_distill_targets(ridge_inp, ridge_A, Config)
                     distill = centroid_velocity_loss(pred_lat, ridge_tgt_lat, Config)
-                    distill_acc += distill.item()
+                    # Same sync-avoidance as primary_acc above -- distill_acc
+                    # is log-only (see the LOG_EVERY_STEPS-gated block below),
+                    # so it never needs a Python float on non-logging steps.
+                    distill_acc = distill_acc + distill.detach()
                     loss = loss + distill_w * distill
                 # The auxiliary loss is sequential and by far the most expensive
                 # part of a step, so it runs on the first micro-batch only.
@@ -3915,13 +3967,12 @@ def train(args, log=print):
                             # term too -- one weight per concern, not a
                             # third independent knob.
                             gt_aux, ridge_ar_aux = aux
-                            ar_acc = gt_aux.item()
-                            ridge_ar_distill_acc = ridge_ar_aux.item()
+                            ar_acc = gt_aux.detach()
+                            ridge_ar_distill_acc = ridge_ar_aux.detach()
                             loss = loss + ar_w * gt_aux + distill_w * ridge_ar_aux
                         else:
-                            ar_acc = aux.item()
+                            ar_acc = aux.detach()
                             loss = loss + ar_w * aux
-                loss_acc += loss.item()
                 loss = loss / accum_steps
 
             if use_scaler:
@@ -3958,7 +4009,10 @@ def train(args, log=print):
         scheduler.step()
         step += 1
 
-        train_loss = primary_acc / accum_steps
+        # The one sync per optimizer step that's actually unavoidable: this
+        # value is needed as a Python float every step (best["train_loss"]
+        # tracking, checkpoint-save gating below), not just on logging steps.
+        train_loss = (primary_acc / accum_steps).item()
         prev_train_best = best["train_loss"]
         best["train_loss"] = min(best["train_loss"], train_loss)
         # Save a train-best checkpoint on any real improvement so a run that
@@ -3990,13 +4044,22 @@ def train(args, log=print):
                 with torch.no_grad():
                     dim_err = centroid_per_dim_errors(last_pred, last_tgt, Config)
                 payload.update({f"train/{k}": v for k, v in dim_err.items()})
+            # ar_acc/distill_acc/ridge_ar_distill_acc are GPU tensors when
+            # their loss was actually computed this step (else the 0.0
+            # float init from above, when e.g. run_ar was False) -- only
+            # materialized to a Python float here, on the LOG_EVERY_STEPS
+            # cadence, never per-micro-batch (see the accumulation loop
+            # above for why that sync matters).
             if run_ar:
-                payload["ar_loss"] = ar_acc
+                payload["ar_loss"] = ar_acc.item() if torch.is_tensor(ar_acc) else ar_acc
                 payload["ar_frames_current"] = current_ar_frames
                 if distill_w > 0:
-                    payload["ridge_ar_distill_loss"] = ridge_ar_distill_acc
+                    payload["ridge_ar_distill_loss"] = (
+                        ridge_ar_distill_acc.item()
+                        if torch.is_tensor(ridge_ar_distill_acc) else ridge_ar_distill_acc)
             if ridge_A is not None:
-                payload["ridge_distill_loss"] = distill_acc / accum_steps
+                payload["ridge_distill_loss"] = (distill_acc / accum_steps).item() \
+                    if torch.is_tensor(distill_acc) else distill_acc / accum_steps
                 payload["ridge_distill_weight"] = distill_w
             if torch.cuda.is_available():
                 payload["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9

@@ -4188,3 +4188,256 @@ attribution tradeoff, not something to forget when reading the result.
 - `h1_ar_freq2` through `h10_ridge_residual`, `s7_h9_scaled`, and `s8_
   h9_moreseqs_scaled` are all unchanged.
 - `WANDB_PROJECT` stays `NI_Review_v6` -- still within the v6.x line.
+
+## 34. v6.4 -- the §33.5 device-mismatch bug actually fixed, `screen`/`croc` added to bootstrap, and `train_80.h5`/`val_80.h5` re-exported uncompressed
+
+The real CUDA run against Experiment A (`r2_h11_ridge_distill`, round
+2) hit exactly the failure §33.5 predicted was latent, but in its CUDA
+form: `RuntimeError: Expected all tensors to be on the same device, but
+found at least two devices, cpu and cuda:0!` during `save_scripted_
+model()`'s CPU-roundtrip verification. Root cause and fix below. While
+retrieving that run's artifacts before deciding whether to terminate
+the pod, also found and fixed two deploy-tooling gaps and a real
+load-time bottleneck.
+
+### 34.1 The device-mismatch fix
+
+`model_variants.py`'s `_ridge_anchor()` built its ones-tensor as
+`torch.ones(B, n_complete, 1, dtype=frames.dtype, device=frames.device)`.
+Under `torch.jit.script`, `device=frames.device` gets compiled as a
+**compile-time constant** captured at script time -- i.e. whatever
+device the model was on when `save_scripted_model()` called
+`torch.jit.script(model)`, which is `cuda:0` for any real run. That
+same function then moves the scripted module to CPU for its roundtrip
+check, so the *scripted* `_ridge_anchor()` tries to build a CPU input
+tensor as `cuda:0`, and PyTorch (correctly) refuses to mix devices in a
+Python 3.14/CUDA multi_matmul path. Fixed by switching to
+`torch.ones_like(frames[..., :1])`, which reads device/dtype off the
+actual runtime tensor rather than a separately-scripted attribute --
+this is the same class of bug the MPS case (§31.4/§33.5) surfaced, just
+manifesting on CUDA at the point an MPS run never actually reaches.
+
+Verification caveats, stated plainly: this machine's Python 3.14 +
+torch-nightly combination cannot run `torch.jit.script` at all (a
+separate, pre-existing, already-documented incompatibility -- fails
+with an unrelated "Unsupported value kind: Tensor" error regardless of
+this fix). Verified instead via `torch.jit.trace` on the same
+`_ridge_anchor()` code path (trace → move to CPU → forward), which now
+succeeds where the equivalent pattern failed before this change, and
+via the full test suite (78 tests, all passing). Full confirmation that
+the CUDA `script`-mode roundtrip itself now succeeds still needs the
+next real pod run -- as before, this only affects the *verification*
+step; the state-dict `.pt` remains the authoritative artifact and
+training was never blocked by this.
+
+### 34.2 `screen` and `croc` added to `bootstrap_remote.sh`
+
+A live pod check during this incident found `screen` itself **missing**
+from the pod image -- the entire named-screen workflow
+(`singleshot/README.md`'s bootstrap/exp-a/exp-b table) would have
+silently failed to start without it. Added alongside the already-
+planned `mc` (midnight commander) in the same `apt-get install` line.
+
+Also added `croc` (schollz/croc -- relay-based, end-to-end encrypted,
+multi-connection file transfer; not in apt, installed via the official
+`curl https://getcroc.schollz.com | bash`), specifically to speed up
+**both directions** of the large-file transfer: pushing `train_80.h5`/
+`val_80.h5` to a fresh pod, and pulling checkpoints/results back before
+terminating one. On a link with real symmetric bandwidth (e.g. ~2.5
+Gbps), `croc`'s default multi-connection behavior consistently beats a
+single-stream `scp`/`rsync` for these specific files, since they
+bottleneck on one stream's throughput rather than per-file overhead.
+`singleshot/README.md`'s "Other transfer options" section now documents
+both directions with exact commands.
+
+### 34.3 `train_80.h5`/`val_80.h5` re-exported with `compression=None`
+
+While diagnosing why loading these files felt slow ("does the h5 file
+take a long time to deserialize"), traced it to `TransformerDataset.
+__init__`'s single `f['data'][:self.length]` read: `prepare_data.py`
+wrote these with `compression='gzip'`, one full sequence per chunk
+(`chunks=(1, NUM_TIME_NEW, NUM_X, 52)`), and HDF5's gzip filter
+decompresses via **single-threaded** zlib, on every chunk, every load.
+
+The number that made the trade obviously bad: `val_80.h5` was 3.66 GB
+compressed vs. ~3.9 GB decompressed raw -- gzip was only buying a ~13%
+size reduction on this float32 physics data, while still costing the
+*full* single-threaded decompression time on ~4-9 GB every single load.
+
+Fix: `decompress_h5.py` (new, one-off utility, kept in-repo since the
+same conversion may be needed again) streams each file's `data`
+dataset + attrs into a fresh file with `compression=None`, batched at
+512 rows so memory stays bounded regardless of file size, verifies row
+count + full byte-for-byte equality against the original before
+atomically replacing it. Both files converted and verified:
+- `val_80.h5`: 3.66 GB → 4.23 GB
+- `train_80.h5`: 8.53 GB → 9.87 GB
+
+`prepare_data.py`'s `_stream_sequences_to_hdf5()` (both `create_dataset`
+call sites -- the streaming-write path and the empty-dataset fallback)
+now writes `compression=None` from the start, so any future full
+regeneration of this cohort doesn't reintroduce the same bottleneck.
+The older 40-frame cohort (`train_40.h5`/`val_40.h5`) was deliberately
+**not** touched -- it's not part of any current training path.
+`tests/test_data_files_size_parity.py` updated to expect `None` for the
+80-frame cohort and `gzip` for the 40-frame cohort (was a single
+blanket "must be gzip" assertion for all four files).
+
+### 34.4 What v6.4 does NOT change
+
+- No claim about whether items 1-3 (§33) actually help -- still open,
+  still needs a real CUDA run (this incident's run got cut short by
+  the device-mismatch investigation, not by a conclusive result).
+- The `r2_h11_ridge_distill` run's step-500 eval (`rollout_mse` ~59,437%
+  worse than persistence) was checked, not explained: every recursive
+  `model(...)` call site was re-verified to correctly pass `force_
+  persistence_anchor=True` (§33.5's mechanism is NOT reproducing), but
+  whether the bad number is early-training noise (`AR_LOSS_WEIGHT` was
+  still ramping at step 500/2500) or something else is unresolved --
+  needs more steps or a dedicated look, not fixed here.
+- `WANDB_PROJECT` stays `NI_Review_v6`.
+
+## 35. v6.5 -- the §34.4 rollout catastrophe explained (not noise -- a real anchor-mismatch bug), plus a `torch.compile` recompile storm found and fixed
+
+§34.4 left the `r2_h11_ridge_distill` run's step-500 eval (~594x worse than
+persistence) as "unresolved, maybe early-training noise." It was not
+noise. Root-caused this session and fixed.
+
+### 35.1 The real bug: train-time anchor != eval-time anchor
+
+`h11_ridge_distill`'s v6.3 config combined `PREDICT_DELTA=True`,
+`DELTA_ANCHOR='ridge'` (the network's `output_head` predicts a
+RESIDUAL, added to an anchor -- `model_variants.py`'s `forward()`)
+with the `force_persistence_anchor` split (§33.5, menu item 3):
+plain persistence for every recursive call, the ridge anchor only for
+`teacher_forced()`'s single non-recursive call. This correctly
+prevented `h10_ridge_residual`'s exact failure mode (the ridge anchor
+sitting inside a feedback loop, v4.6 §26.2) -- confirmed again this
+session by re-grepping every `model(...)` call site.
+
+But it introduced a DIFFERENT bug with the same magnitude of damage.
+`output_head`'s weights are the same regardless of which anchor gets
+added after it. `teacher_forced()` -- the dominant training signal by
+raw call count (every micro-batch, `accum_steps` times per optimizer
+step, vs. the AR loss's once-per-step) -- trains `output_head` so that
+`ridge_anchor + output_head(x) ≈ true`, i.e. `output_head(x) →
+true - ridge_anchor`. But `rollout_frames()` (real eval) and
+`frame_ar_loss()`'s own recursive chain both call the SAME
+`output_head` with `force_persistence_anchor=True`, computing
+`persistence_anchor + output_head(x)`. Substituting:
+
+```
+eval_prediction ≈ persistence_anchor + (true - ridge_anchor)
+                 = true + (persistence_anchor - ridge_anchor)
+```
+
+The systematic bias at every position is exactly the GAP between the
+two anchors -- and that bias gets fed back into `curr` for the next AR
+step, compounding through the recursive chain. This is consistent with
+the pulled-back `_status.json`'s own numbers getting WORSE with frame
+index (`improvement_pct_frame1=-249%` vs. `improvement_pct_frame_last
+=-108990%`) -- a growing, compounding bias, not flat noise.
+
+Reproduced in isolation (no real data, no pod needed): a tiny
+`BaseTransformer` trained for 300 steps purely via the ridge-anchored
+forward call, then evaluated both ways on the same input --
+`force_persistence_anchor=True` eval was **~5700x** worse (MSE) than
+the ridge-anchored eval on the exact same trained weights. Same
+mechanism, same order-of-magnitude-of-damage as the real run's ~594x.
+
+### 35.2 The fix
+
+`h11_ridge_distill`'s overrides no longer set `PREDICT_DELTA`/
+`DELTA_ANCHOR` at all (both fall back to `Config`'s defaults: `False`/
+`'persistence'`). Ridge's influence on this arm is now **purely**
+through the anchor-agnostic distillation LOSS terms
+(`ridge_distill_targets()`/`ridge_rollout_targets()`, §31/§33.2) --
+matching v6.1's original, simpler design, before v6.3's third menu
+item added the architectural anchor on top. This is not a partial
+mitigation: with `DELTA_ANCHOR` back at `'persistence'`,
+`force_persistence_anchor` becomes a no-op for this arm (`forward()`
+only branches on it when `delta_anchor_kind == 'ridge'`) -- train-time
+and eval-time calls are now IDENTICAL in every case, for every arm,
+exactly like every other non-ridge-anchor arm in this sweep (`h1`
+through `h9`, `s7`, `s8`) always was. **Non-ridge-anchor arms were
+never exposed to this bug in the first place** -- `DELTA_ANCHOR`
+defaults to `'persistence'` and none of them override it.
+
+The `force_persistence_anchor` mechanism itself is NOT removed --
+it's still correct and still the right tool if a future arm wants to
+try an architectural ridge (or any non-persistence) anchor again. The
+lesson from both `h10` and this incident together: an anchor that's
+allowed to differ between the DOMINANT training signal and the
+eval/inference path is unsafe, independent of whether it's also inside
+a recursive loop. Any future architectural-anchor experiment needs
+BOTH properties checked, not just the recursion one.
+
+**Consequence for in-flight artifacts**: the existing
+`saved_models/r2_h11_ridge_distill_latest.pt` (the MPS baseline made
+for the two-experiment CUDA comparison, §33 follow-up, also already
+uploaded to the pod's `saved_models/`) was trained under the OLD,
+buggy `PREDICT_DELTA=True`/`DELTA_ANCHOR='ridge'` architecture. It is
+now stale relative to the corrected arm and should not be used to
+warm-start it -- the delta head's learned semantics no longer match
+what the corrected forward pass expects. A fresh baseline (or a
+`--fresh --no-warm-start` run) is needed under the corrected config
+before any further warm-start comparison.
+
+### 35.3 A second, independent issue: `torch.compile` recompile storm
+
+A live CUDA run's log also showed:
+```
+torch._dynamo hit config.cache_size_limit (8)
+   function: 'forward' (model_variants.py:546)
+   last reason: 0/0: tensor 'L['x']' size mismatch at index 0. expected 2, actual 32
+```
+The same compiled model (`torch.compile(model)`, CUDA-only) is called
+from both `teacher_forced()` (fixed shape: `micro_batch` x full
+`SEQ_LEN`, e.g. batch=32) and the AR-rollout loop (`frame_ar_loss`/
+`rollout_frames`), whose batch is much smaller (`AR_SEQS`, e.g. 2) AND
+whose sequence length grows by one token/frame on every one of up to
+`AR_FRAMES * NUM_X` iterations, from a randomized starting context
+picked fresh each call. Without `dynamic=True`, `torch.dynamo`
+specializes a separate compiled graph per exact shape it sees, blows
+through the default `cache_size_limit` (8) almost immediately once AR
+runs, and silently falls back to eager for every shape past that limit
+-- while the recompilation attempts themselves are real, CPU-bound
+wall-clock cost paid mid-step, compounding the GPU-idle gaps §34's
+`.item()`-sync investigation already found. Not a correctness bug
+(training continued fine, no wrong numbers) -- a real, avoidable
+efficiency loss.
+
+Fixed: `torch.compile(model)` -> `torch.compile(model, dynamic=True)`.
+This line is arm-agnostic and unconditional -- every CUDA arm that
+enables `torch.compile` benefits, not just `h11`.
+
+### 35.4 What v6.5 does NOT change
+
+- The `.item()`-sync-avoidance fix (§34's investigation, landed just
+  before this section) and this section's `dynamic=True` fix both live
+  in shared, arm-agnostic code (the main `train()` loop's accumulation
+  logic; the one `torch.compile(...)` call site) -- they apply to
+  every past and future arm automatically, ridge-related or not, with
+  no per-arm wiring needed.
+- `h1_ar_freq2` through `h9_ar_freq1`, `h10_ridge_residual` (still
+  abandoned), `s7_h9_scaled`, and `s8_h9_moreseqs_scaled` are
+  unchanged -- none of them ever set `DELTA_ANCHOR='ridge'`, so none
+  of them were exposed to §35.1's bug.
+- `WANDB_PROJECT` stays `NI_Review_v6`.
+
+### 35.5 Future work: KV-caching for the AR-rollout loop
+
+Flagged, not started. `frame_ar_loss()`/`rollout_frames()`'s inner
+loop recomputes a full forward pass over the ENTIRE growing `curr`
+sequence at every one of up to `AR_FRAMES * NUM_X` steps -- attention
+over positions 0..t is fully recomputed at step t+1 instead of reusing
+step t's key/value projections for the already-seen positions. This is
+the standard reason autoregressive transformer inference implements a
+KV cache (store each position's K/V once, only compute the new
+token's), and it's a likely next lever if the AR-rollout portion of a
+step remains a disproportionate share of wall-clock/GPU-idle time
+after the `.item()`-sync (§34) and `torch.compile(dynamic=True)`
+(§35.3) fixes. Not attempted here -- would need genuine surgery in
+`BaseTransformer`'s attention blocks (cache plumbing through
+`forward()`, invalidation on a fresh rollout), a bigger change than
+anything else in this section.

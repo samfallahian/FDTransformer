@@ -46,6 +46,26 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo ""
 fi
 
+echo "apt-get update + installing midnight commander (mc, a terminal file"
+echo "manager) and screen (found MISSING on a real pod image this session --"
+echo "the whole 'run bootstrap/exp-a/exp-b in named screens over one SSH"
+echo "connection' workflow in singleshot/README.md silently doesn't work"
+echo "without this)..."
+apt-get update -qq
+apt-get install -y -qq mc screen
+echo ""
+
+echo "Installing croc (schollz/croc -- relay-based, end-to-end encrypted"
+echo "file transfer; not in apt, using the official installer)..."
+echo "See singleshot/README.md's 'Other transfer options' for why this can"
+echo "beat scp for the large train_80.h5/val_80.h5 transfer specifically."
+if command -v croc >/dev/null 2>&1; then
+  echo "  already installed: $(croc --version 2>&1 | head -1)"
+else
+  curl -s https://getcroc.schollz.com | bash
+fi
+echo ""
+
 echo "Creating venv at $VENV_DIR..."
 "$PYTHON_BIN" -m venv "$VENV_DIR"
 # shellcheck disable=SC1091
@@ -95,15 +115,16 @@ echo " Bootstrap done. Two manual steps left:"
 echo "=================================================================="
 echo ""
 echo "1) Log in to wandb (interactive -- opens a browser or asks you to"
-echo "   paste an API key from https://wandb.ai/authorize):"
+echo "   paste an API key from https://wandb.ai/authorize), ONLY if you"
+echo "   want telemetry for this run -- skip this and pass --no-wandb if not:"
 echo ""
 echo "     source $VENV_DIR/bin/activate"
 echo "     wandb login"
 echo ""
-echo "2) Smoke-test before spending real GPU time, then launch:"
+echo "2) Smoke-test before spending real GPU time, then launch -- see"
+echo "   singleshot/README.md's screen-session table for the exact"
+echo "   commands (bootstrap/exp-a/exp-b, each in its own named screen):"
 echo ""
 echo "     cd $REPO_ROOT/transformer_neurIPS"
 echo "     python train_production_transformer_deep_dive.py \\"
-echo "       --arm s8_h9_moreseqs_scaled --round 2 --smoke-test"
-echo ""
-echo "     bash run_sweep_h300_production_8h.sh   # the real 8h production run"
+echo "       --arm h11_ridge_distill --round 2 --smoke-test"

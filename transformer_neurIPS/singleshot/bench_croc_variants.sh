@@ -31,6 +31,11 @@
 # USAGE
 # =====
 #   bash singleshot/bench_croc_variants.sh
+#   bash singleshot/bench_croc_variants.sh --split-only   # skip the
+#     4-variant benchmark, validate ONLY the split-lanes approach
+#     against a real file (see "--split-only" below)
+#   bash singleshot/bench_croc_variants.sh --iperf3        # skip croc
+#     entirely, raw-network diagnostic (see "--iperf3" below)
 #
 # This script creates and DELETES a real billed pod. Read the printed
 # cost-per-hour before confirming, and expect the whole run (pod boot +
@@ -47,9 +52,9 @@
 #                      Override if unavailable -- check BOTH fields
 #                      with:
 #                        runpodctl gpu list -o json | jq -r '.[] | "\(.gpuId)\t\(.securePricePerHr)\t\(.stockStatus)"' | sort -n -k2
-#   CONTAINER_DISK_GB  default 20 -- only a ~100MB test file per
-#                      variant is ever created, no real training data
-#                      touches this pod
+#   CONTAINER_DISK_GB  default 20 -- only a ~1GB test file per variant
+#                      is ever created, no real training data touches
+#                      this pod
 #   WAIT_TIMEOUT       seconds to wait for SSH to come up before giving
 #                      up on pod creation entirely (default 60 -- 20s,
 #                      then 35s, both proved too tight: real pods that
@@ -57,11 +62,19 @@
 #                      their SSH port allocated, seen up to ~33s on
 #                      one CA-MTL-1 attempt and a full timeout at 35s
 #                      on another)
-#   TRANSFER_TIMEOUT   per-variant hard cutoff in seconds (default 30
-#                      -- if a 100MB transfer isn't done in 30s at
-#                      ANY of these settings, on a same-datacenter
-#                      link, it isn't going to be)
-#   FILE_SIZE_MB       size of the random test file (default 100)
+#   TRANSFER_TIMEOUT   per-variant hard cutoff in seconds (default 60 --
+#                      confirmed runs at 1GB have all finished in
+#                      11-19s per self-hosted variant and ~26s for the
+#                      public-relay baseline; 60s is real margin above
+#                      that without being an excessive wait on a
+#                      genuine hang)
+#   FILE_SIZE_MB       size of the random test file (default 1024,
+#                      i.e. 1GB -- bumped from the original 100MB once
+#                      the self-hosted relay was confirmed actually
+#                      working (2x the public relay in a real run:
+#                      50.0 vs 25.0 MB/s), to see if that holds at a
+#                      size closer to the real train_80.h5/val_80.h5
+#                      payload instead of just a quick sanity check)
 #   CROC_RELAY_PORT    base port for the self-hosted relay, as seen by
 #                      croc AND by this machine (default 9019). Only
 #                      ever bound to localhost on both ends now -- see
@@ -76,20 +89,184 @@
 #                      this no longer touches the pod's exposed-ports
 #                      list at all for anything beyond SSH.
 #   RELAY_TRANSFERS    how many extra ports the self-hosted relay
-#                      opens beyond the base port (default 16, so all
-#                      concurrent variants below have separate ports
-#                      to multiplex over -- see `croc relay --help`).
-#                      Each one gets its own `-L` forward in the SSH
-#                      tunnel below.
+#                      opens beyond the base port (default 8, i.e. 9
+#                      ports total). NOT bumped to 99/100 despite an
+#                      earlier plan to do exactly that -- confirmed
+#                      directly against croc v11.5.2's own source
+#                      (github.com/schollz/croc, src/croc/croc.go,
+#                      `activateRelayDataChannels`: `limit :=
+#                      min(len(c.Options.RelayPorts), 8)`, and the
+#                      matching `index >= 8` guard) that croc hard-caps
+#                      REAL parallel data connections at 8 per
+#                      transfer, no matter how many ports the relay
+#                      offers or `--transfers` requests. Opening more
+#                      than 9 ports (and tunneling them) would be pure
+#                      waste -- confirmed the "100 ports = 100 workers"
+#                      premise was simply wrong before spending a pod
+#                      rental finding that out the hard way. Each port
+#                      gets its own `-L` forward in the SSH tunnel
+#                      below.
 #   SSH_KEY            default: ~/.runpod/ssh/runpodctl-ssh-key
 #   KEEP_POD           set to 1 to skip the final `pod delete`
 #   POD_ID             reuse an already-running pod instead of
 #                      creating one
+#   SPLIT_LANES        (default 10, matching the --iperf3 mode's
+#                      IPERF3_LANES default -- that mode confirmed 10
+#                      genuinely independent concurrent SSH tunnels hit
+#                      268.3 MB/s raw, close to the ~312 MB/s link
+#                      ceiling). After the main 4-variant benchmark,
+#                      runs ONE additional phase: split the test file
+#                      into this many pieces, send each through its OWN
+#                      independent relay+tunnel pair (own local ports,
+#                      own SSH process), running all lanes truly
+#                      concurrently, then reassemble and verify. This
+#                      is the lever for approaching that same real link
+#                      ceiling with actual croc file transfers, not just
+#                      raw iperf3 -- more connections through ONE shared
+#                      tunnel twice measured WORSE, not better (see
+#                      CROC_JOURNEY.md), so this uses genuinely separate
+#                      tunnels instead. Set to 0 to skip this phase
+#                      entirely.
+#   SPLIT_BASE_PORT     base port for lane 0's relay (default 9500,
+#                       deliberately far from CROC_RELAY_PORT's range
+#                       to avoid any overlap)
+#   SPLIT_PORT_STRIDE   ports between each lane's base (default 20,
+#                       comfortably more than one lane's 9-port range)
+#   SPLIT_TRANSFER_TIMEOUT  per-lane hard cutoff in seconds for the
+#                       split-lanes receive step (default 90 -- was
+#                       hardcoded to 60 before, not configurable at all;
+#                       raised slightly since a 10-lane run divides
+#                       throughput 10 ways per lane, unlike the 4-lane
+#                       case this was first tuned against)
+#
+# --iperf3 (a MODE SWITCH, not an env var -- pass it as an argument)
+#   Skips croc entirely. The split-lanes phase above (genuinely
+#   independent SSH tunnels, not just more multiplexed streams through
+#   one) STILL measured worse than a single tunnel (53.9 vs 85.3 MB/s),
+#   which raised the question of whether croc/SSH have a real
+#   single-threaded bottleneck even with idle cores on both ends, or
+#   whether the ~85 MB/s ceiling is actually the network path/provider
+#   itself and croc has nothing to do with it. This mode answers that
+#   by tunneling raw `iperf3` traffic through the SAME SSH mechanism
+#   croc uses (RunPod's Secure Cloud pods don't expose arbitrary ports
+#   directly -- confirmed above, so this is the only way to reach the
+#   pod for anything other than SSH), installing iperf3 on both ends if
+#   missing, then running exactly ONE test: IPERF3_LANES independent
+#   SSH tunnels + iperf3 servers, all launched concurrently, each doing
+#   a single stream -- mirrors the split-lanes phase (genuinely
+#   separate ssh processes, not more multiplexed streams through one).
+#   No single-tunnel or low-lane-count variant is run here anymore --
+#   this mode exists specifically to see what IPERF3_LANES fully
+#   concurrent independent tunnels can do against the real link ceiling
+#   (confirmed 2.5 Gb symmetric = ~312 MB/s).
+#   IPERF3_PORT     base port for the per-lane ports (default 9520)
+#   IPERF3_LANES    number of independent concurrent tunnels (default 10)
+#   IPERF3_DURATION seconds per iperf3 run (default 10)
+#   IPERF3_LOCAL_INSTALL_TIMEOUT
+#                   hard cutoff in seconds for a local `brew install
+#                   iperf3` if it's missing on this machine (default
+#                   180 -- brew installs are slower than apt, given
+#                   more margin, but still must not hang forever)
+#   IPERF3_INSTALL_TIMEOUT
+#                   hard cutoff in seconds for the remote `apt-get
+#                   install iperf3` step (default 60). Found the hard
+#                   way: iperf3's Debian postinst script asks a
+#                   debconf question (whether to auto-start the iperf3
+#                   server on boot); without DEBIAN_FRONTEND=
+#                   noninteractive forced, `apt-get install -y` does
+#                   NOT reliably suppress this over a non-TTY SSH
+#                   command, and it hung indefinitely waiting on a
+#                   prompt nothing could ever answer. Now this always
+#                   forces DEBIAN_FRONTEND=noninteractive AND wraps the
+#                   whole install in run_with_timeout, so a repeat of
+#                   this failure mode fails loud within this many
+#                   seconds instead of hanging the script forever. Also
+#                   now explicitly checks for an already-installed
+#                   iperf3 FIRST and skips the install step entirely if
+#                   found, rather than relying on apt's own no-op
+#                   behavior for an already-satisfied package.
+#
+# --split-only (a MODE SWITCH, not an env var -- pass it as an argument)
+#   Skips the main 4-variant benchmark entirely and goes straight from
+#   pod prep to the split-lanes phase below (SPLIT_LANES independent
+#   relay+tunnel pairs, real file, reassembled and size-verified). Use
+#   this to validate the split-lanes approach on its own budget instead
+#   of burning most of GLOBAL_TIMEOUT_SECS on the 4-variant benchmark
+#   first -- confirmed the hard way: with defaults, that benchmark's own
+#   deadline (TRANSFER_TIMEOUT * 4 + 20 = 260s) plus pod boot plus
+#   SPLIT_LANES-many relay/tunnel startups left too little of a 300s
+#   GLOBAL_TIMEOUT_SECS for the split-lanes phase to ever finish, and it
+#   got SIGTERM'd mid-transfer instead of producing a real number.
+#
+# GLOBAL_TIMEOUT_SECS  Hard wall-clock cap on the ENTIRE script
+#                   (default 600 = 10 minutes, raised from an original
+#                   300 after that default proved too tight for even
+#                   ONE full run with the split-lanes phase enabled --
+#                   see "--split-only" just above), no matter which
+#                   phase gets stuck -- iperf3 install, tunnel setup, a
+#                   hung `ssh`, anything. Every individual step above
+#                   already has its own timeout, but auditing every
+#                   single command in this file for one is exactly
+#                   the whack-a-mole that already bit twice (the
+#                   iperf3-install debconf hang, then a bare `wait`
+#                   blocking on long-lived tunnel processes) -- a
+#                   real pod sat there billing until killed by hand
+#                   both times. See "GLOBAL TIMEOUT WRAPPER" below for
+#                   the mechanism and its two independent layers.
 
 set -uo pipefail  # NOT -e: this script's whole point is comparing
                    # variants where some are EXPECTED to fail/timeout;
                    # a failing variant must not abort the others or
                    # skip the summary table.
+
+# ---------------------------------------------------------------- #
+# GLOBAL TIMEOUT WRAPPER -- two independent layers, because a stuck
+# pod is real money and this has already needed a manual kill twice:
+#
+#   Layer 1: this process re-execs ITSELF as a backgrounded child,
+#   then a watchdog subshell sleeps GLOBAL_TIMEOUT_SECS and, if the
+#   child is still alive, sends SIGTERM (confirmed locally: bash DOES
+#   still run its EXIT trap -- i.e. `cleanup()`, which deletes the pod
+#   -- on SIGTERM, this is not a bypass), waits 10s of grace, then
+#   SIGKILL as a last resort. This bounds the SCRIPT's own execution,
+#   whatever it happens to be stuck on.
+#
+#   Layer 2: a fully DETACHED (`disown`ed) background job, started
+#   independently once POD_ID is known (see below, near "SSH:
+#   root@..."), that unconditionally calls `runpodctl pod delete` at a
+#   fixed deadline slightly AFTER layer 1's. This is the actual belt-
+#   and-suspenders part: if layer 1's SIGTERM->cleanup->pod-delete path
+#   ever fails for any reason (a hung `ssh` inside cleanup() itself,
+#   for instance), this is a completely independent process that does
+#   not depend on this script's signal handling, job control, or
+#   control flow at all -- it only needs runpodctl and the pod id.
+#
+# The re-exec only happens ONCE: _BENCH_INNER marks "this is the real
+# work", so the child doesn't re-wrap itself again.
+# ---------------------------------------------------------------- #
+GLOBAL_TIMEOUT_SECS="${GLOBAL_TIMEOUT_SECS:-600}"
+if [[ -z "${_BENCH_INNER:-}" ]]; then
+  export _BENCH_INNER=1
+  "$0" "$@" &
+  _inner_pid=$!
+  (
+    sleep "$GLOBAL_TIMEOUT_SECS"
+    if kill -0 "$_inner_pid" 2>/dev/null; then
+      echo "" >&2
+      echo "[FAIL] GLOBAL ${GLOBAL_TIMEOUT_SECS}s TIMEOUT HIT -- sending SIGTERM (10s grace for pod cleanup via the EXIT trap, then SIGKILL)." >&2
+      kill -TERM "$_inner_pid" 2>/dev/null
+      sleep 10
+      kill -KILL "$_inner_pid" 2>/dev/null
+    fi
+  ) &
+  _watchdog_pid=$!
+  wait "$_inner_pid" 2>/dev/null
+  _rc=$?
+  kill "$_watchdog_pid" 2>/dev/null
+  wait "$_watchdog_pid" 2>/dev/null
+  exit "$_rc"
+fi
+SCRIPT_START_TS=$(date +%s)
 
 # ---------------------------------------------------------------- #
 # Colors (respects NO_COLOR / non-tty, matching this repo's existing
@@ -109,14 +286,44 @@ warn() { printf '%s\n' "${C_YELLOW}[WARN]${C_RESET} $1"; }
 err()  { printf '%s\n' "${C_RED}[FAIL]${C_RESET} $1" >&2; }
 info() { printf '%s\n' "${C_BLUE}[..]${C_RESET} $1"; }
 
+MODE_IPERF3=0
+MODE_SPLIT_ONLY=0
+for _arg in "$@"; do
+  case "$_arg" in
+    --iperf3) MODE_IPERF3=1 ;;
+    --split-only) MODE_SPLIT_ONLY=1 ;;
+    *) echo "Unknown argument: $_arg (only --iperf3 or --split-only are supported)" >&2; exit 1 ;;
+  esac
+done
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib_croc.sh
+source "$HERE/lib_croc.sh"
+
 RUNPODCTL="${RUNPODCTL:-$HOME/.local/bin/runpodctl}"
 if ! command -v "$RUNPODCTL" >/dev/null 2>&1; then
   err "runpodctl not found at $RUNPODCTL -- see singleshot/README.md's 'RunPod agent setup'."
   exit 1
 fi
-if ! command -v croc >/dev/null 2>&1; then
-  err "croc not installed locally. brew install croc (macOS) or: curl https://getcroc.schollz.com | bash"
-  exit 1
+if [[ "$MODE_IPERF3" == "1" ]]; then
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    info "iperf3 not found locally -- installing via Homebrew (${IPERF3_LOCAL_INSTALL_TIMEOUT:-180}s timeout)..."
+    if ! command -v brew >/dev/null 2>&1; then
+      err "Homebrew not found locally -- install iperf3 manually (brew install iperf3) and retry."
+      exit 1
+    fi
+    if ! run_with_timeout "${IPERF3_LOCAL_INSTALL_TIMEOUT:-180}" brew install iperf3; then
+      err "brew install iperf3 failed or timed out -- install manually and retry."
+      exit 1
+    fi
+  fi
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    err "iperf3 still not found locally after the install step completed."
+    exit 1
+  fi
+  ok "iperf3 present locally"
+else
+  croc_require_local_binary
 fi
 if ! command -v jq >/dev/null 2>&1; then
   err "jq not installed locally (needed to parse runpodctl's JSON output)."
@@ -126,30 +333,20 @@ fi
 GPU_ID="${GPU_ID:-NVIDIA A40}"
 CONTAINER_DISK_GB="${CONTAINER_DISK_GB:-20}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-60}"
-TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-30}"
-FILE_SIZE_MB="${FILE_SIZE_MB:-100}"
+TRANSFER_TIMEOUT="${TRANSFER_TIMEOUT:-60}"
+FILE_SIZE_MB="${FILE_SIZE_MB:-1024}"
 CROC_RELAY_PORT="${CROC_RELAY_PORT:-9019}"
-RELAY_TRANSFERS="${RELAY_TRANSFERS:-16}"
+RELAY_TRANSFERS="${RELAY_TRANSFERS:-8}"
 SSH_KEY="${SSH_KEY:-$HOME/.runpod/ssh/runpodctl-ssh-key}"
 KEEP_POD="${KEEP_POD:-0}"
-
-# ---------------------------------------------------------------- #
-# Portable per-command timeout -- macOS has no `timeout(1)` by
-# default. Background watchdog: sleep N, then kill the target pid if
-# it's still alive. `wait` for the target's real exit code either way.
-# ---------------------------------------------------------------- #
-run_with_timeout() {
-  local secs="$1"; shift
-  "$@" &
-  local target=$!
-  ( sleep "$secs"; kill -9 "$target" 2>/dev/null ) &
-  local watchdog=$!
-  local rc=0
-  wait "$target" 2>/dev/null || rc=$?
-  kill "$watchdog" 2>/dev/null
-  wait "$watchdog" 2>/dev/null
-  return "$rc"
-}
+SPLIT_LANES="${SPLIT_LANES:-10}"
+SPLIT_BASE_PORT="${SPLIT_BASE_PORT:-9500}"
+SPLIT_PORT_STRIDE="${SPLIT_PORT_STRIDE:-20}"
+SPLIT_TRANSFER_TIMEOUT="${SPLIT_TRANSFER_TIMEOUT:-90}"
+IPERF3_PORT="${IPERF3_PORT:-9520}"
+IPERF3_LANES="${IPERF3_LANES:-10}"
+IPERF3_DURATION="${IPERF3_DURATION:-10}"
+IPERF3_INSTALL_TIMEOUT="${IPERF3_INSTALL_TIMEOUT:-60}"
 
 hdr "Preflight: RunPod credentials"
 AUTH_CHECK="$("$RUNPODCTL" user -o json 2>&1 || true)"
@@ -166,15 +363,8 @@ echo ""
 POD_ID="${POD_ID:-}"
 CREATED_POD=0
 cleanup() {
-  if [[ -n "${TUNNEL_PID:-}" ]]; then
-    kill "$TUNNEL_PID" 2>/dev/null || true
-  fi
-  if [[ -n "${RELAY_PID:-}" ]]; then
-    # Kill by exact pid, NEVER `pkill -f "croc relay"` -- see
-    # scp_data_files.sh's croc_cleanup_relay() comment for why that
-    # self-destructed an entire SSH session when tried.
-    ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "kill $RELAY_PID 2>/dev/null; true" 2>/dev/null || true
-  fi
+  croc_tunnel_stop
+  croc_relay_stop
   if [[ "$CREATED_POD" == "1" && -n "$POD_ID" ]]; then
     if [[ "$KEEP_POD" == "1" ]]; then
       warn "KEEP_POD=1 -- leaving pod $POD_ID running. Terminate yourself: runpodctl pod delete $POD_ID"
@@ -288,6 +478,30 @@ fi
 ok "SSH: root@$POD_HOST:$POD_PORT"
 echo ""
 
+# Layer 2 of the global timeout (see "GLOBAL TIMEOUT WRAPPER" near the
+# top of this file): a fully detached backup that deletes THIS pod at
+# a fixed deadline no matter what happens to the rest of this script
+# -- it does not depend on cleanup()'s trap firing, this shell's job
+# control, or anything else in this process. Deadline is set slightly
+# AFTER layer 1's own SIGTERM/SIGKILL deadline, so the normal cleanup
+# path gets a real chance to run first; this only actually deletes
+# anything if that path somehow failed.
+#
+# Only armed when this script actually OWNS the pod's lifecycle
+# (CREATED_POD=1, KEEP_POD unset) -- matching cleanup()'s own guard
+# exactly. A reused pod (POD_ID passed in by the caller) or one the
+# caller explicitly asked to keep must never get auto-deleted out from
+# under them just because this run happened to also touch it.
+if [[ "$CREATED_POD" == "1" && "$KEEP_POD" != "1" ]]; then
+  SAFETY_NET_SECS=$(( GLOBAL_TIMEOUT_SECS + 30 - ($(date +%s) - SCRIPT_START_TS) ))
+  [[ "$SAFETY_NET_SECS" -lt 1 ]] && SAFETY_NET_SECS=1
+  ( sleep "$SAFETY_NET_SECS"; "$RUNPODCTL" pod delete "$POD_ID" >/dev/null 2>&1 ) &
+  disown 2>/dev/null || true
+  info "backup pod-deletion safety net armed: $POD_ID will be deleted in ${SAFETY_NET_SECS}s regardless, unless cleanup already ran"
+else
+  info "backup pod-deletion safety net skipped (reused/kept pod -- not this script's responsibility to delete)"
+fi
+
 SSH_OPTS=(-p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
 
 hdr "Waiting for sshd to actually accept connections"
@@ -308,37 +522,149 @@ if [[ "$SSHD_READY" != "1" ]]; then
 fi
 echo ""
 
+if [[ "$MODE_IPERF3" == "1" ]]; then
+  hdr "iperf3 diagnostic mode (skips croc entirely)"
+  info "Tunnels raw iperf3 traffic through the same SSH mechanism croc uses"
+  info "(RunPod doesn't expose arbitrary ports directly -- confirmed earlier)."
+  info "Single test: $IPERF3_LANES independent tunnels, launched fully concurrently"
+  info "(mirrors the split-lanes phase: genuinely separate ssh processes)."
+  echo ""
+
+  info "checking whether iperf3 is already installed on the pod..."
+  if ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "command -v iperf3" >/dev/null 2>&1; then
+    ok "iperf3 already present on pod -- skipping install"
+  else
+    info "not present -- installing (DEBIAN_FRONTEND=noninteractive, ${IPERF3_INSTALL_TIMEOUT}s timeout)..."
+    # DEBIAN_FRONTEND=noninteractive is REQUIRED here, not cosmetic:
+    # iperf3's Debian postinst asks a debconf question (auto-start on
+    # boot?) that apt-get -y alone does not suppress over a non-TTY
+    # SSH command -- confirmed the hard way, it hung indefinitely.
+    # run_with_timeout (lib_croc.sh) bounds the whole thing so a repeat
+    # of that failure mode fails loud instead of hanging forever.
+    if ! run_with_timeout "$IPERF3_INSTALL_TIMEOUT" ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
+        "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3" \
+        >/dev/null 2>&1; then
+      err "iperf3 install failed or timed out after ${IPERF3_INSTALL_TIMEOUT}s on the pod."
+      err "If this keeps happening: ssh in and run"
+      err "  'DEBIAN_FRONTEND=noninteractive dpkg --configure -a'"
+      err "to clear any half-configured package state left behind by a"
+      err "killed/timed-out install before retrying."
+      exit 1
+    fi
+    if ! ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "command -v iperf3" >/dev/null 2>&1; then
+      err "iperf3 still not found on the pod after the install step completed."
+      exit 1
+    fi
+    ok "iperf3 installed on pod"
+  fi
+  echo ""
+
+  # Mirrors croc_relay_start_lane's setsid pattern (lib_croc.sh) -- a
+  # plain `ssh host "cmd &"` gets SIGHUP'd the instant that ssh
+  # command's own shell exits, so backgrounding needs setsid nested
+  # inside `bash -c '... &'`. Kills by exact pid only, never `pkill -f`
+  # (see croc_relay_stop's docstring for why that's dangerous).
+  iperf3_server_start() {
+    local port="$1" outvar="$2" pid
+    pid="$(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
+      "rm -f /tmp/iperf3_server_$port.log; bash -c 'setsid iperf3 -s -p $port -B 127.0.0.1 </dev/null >/tmp/iperf3_server_$port.log 2>&1 & echo \$!'" \
+      2>/dev/null || true)"
+    if [[ -z "$pid" ]]; then
+      err "iperf3 server on port $port did not start"
+      return 1
+    fi
+    sleep 1
+    eval "$outvar=\"\$pid\""
+  }
+  iperf3_server_stop() {
+    local pid="$1"
+    [[ -z "$pid" ]] && return 0
+    ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "kill $pid 2>/dev/null; true" 2>/dev/null || true
+  }
+
+  # IPERF3_CLIENT_TIMEOUT bounds every iperf3 client below (iperf3's own
+  # -t is a target TEST duration, not a hard process-kill guarantee -- a
+  # client stuck before the connection ever completes its handshake
+  # would otherwise hang past -t indefinitely). Margin over IPERF3_DURATION
+  # covers connection setup + JSON teardown, not just the raw test window.
+  IPERF3_CLIENT_TIMEOUT=$((IPERF3_DURATION + 15))
+
+  hdr "Test: $IPERF3_LANES independent tunnels, concurrent single streams"
+  # NOTE: each lane's tunnel setup (croc_tunnel_start_lane) reachability
+  # probe is a bare `echo >/dev/tcp/...` -- fine against croc's relay
+  # (tolerates garbage connections), but iperf3's server does NOT: it
+  # logs a one-time "unable to receive cookie" error for that probe
+  # before going back to listening normally. Harmless, but expect to
+  # see exactly one such line per lane in /tmp/iperf3_server_*.log on
+  # the pod -- confirmed by hand, not a sign anything actually failed.
+  declare -a T3_TUNNEL_PIDS=() T3_SERVER_PIDS=() T3_PORTS=() T3_LOGS=() T3_CLIENT_PIDS=()
+  T3_OK=1
+  for i in $(seq 0 $((IPERF3_LANES - 1))); do
+    p=$((IPERF3_PORT + 100 + i * 10))
+    T3_PORTS[$i]="$p"
+    if ! iperf3_server_start "$p" "T3_SERVER_PIDS[$i]"; then T3_OK=0; break; fi
+    if ! croc_tunnel_start_lane "$p" 0 "T3_TUNNEL_PIDS[$i]"; then T3_OK=0; break; fi
+  done
+
+  T3_MBPS="FAILED"
+  if [[ "$T3_OK" == "1" ]]; then
+    ok "all $IPERF3_LANES lanes' tunnels established"
+    for i in $(seq 0 $((IPERF3_LANES - 1))); do
+      p="${T3_PORTS[$i]}"
+      log="$(mktemp)"
+      T3_LOGS[$i]="$log"
+      ( run_with_timeout "$IPERF3_CLIENT_TIMEOUT" iperf3 -c localhost -p "$p" -t "$IPERF3_DURATION" -J >"$log" 2>&1 ) &
+      T3_CLIENT_PIDS[$i]=$!
+    done
+    # `wait` with NO arguments waits for every background job of this
+    # shell, not just the lanes just launched -- and the SSH TUNNEL
+    # processes above are ALSO background jobs of this same shell,
+    # deliberately long-lived for the rest of this phase. A bare `wait`
+    # here hung forever on those tunnels even after all iperf3
+    # clients had already finished (confirmed live: pod-side logs
+    # showed completed tests + errors, zero iperf3 client processes
+    # left running locally, yet the script sat at "all lanes'
+    # tunnels established" indefinitely). Wait on the exact client PIDs
+    # only, never a bare `wait`, in a section that also has tunnels
+    # backgrounded.
+    for i in $(seq 0 $((IPERF3_LANES - 1))); do
+      wait "${T3_CLIENT_PIDS[$i]}" 2>/dev/null || true
+    done
+    T3_TOTAL="0"
+    for i in $(seq 0 $((IPERF3_LANES - 1))); do
+      mb="$(jq -r '.end.sum_received.bits_per_second / 8 / 1048576' "${T3_LOGS[$i]}" 2>/dev/null)"
+      [[ -z "$mb" || "$mb" == "null" ]] && mb="0"
+      T3_TOTAL="$(awk -v a="$T3_TOTAL" -v b="$mb" 'BEGIN{printf "%.1f", a+b}')"
+    done
+    T3_MBPS="$T3_TOTAL"
+  else
+    err "one or more lane tunnels failed to establish -- see errors above."
+  fi
+  ok "Test ($IPERF3_LANES independent tunnels, concurrent): ${T3_MBPS} MB/s aggregate"
+
+  for i in $(seq 0 $((IPERF3_LANES - 1))); do
+    croc_stop_lane "${T3_TUNNEL_PIDS[$i]:-}"
+    iperf3_server_stop "${T3_SERVER_PIDS[$i]:-}"
+  done
+
+  echo ""
+  hdr "IPERF3 DIAGNOSTIC RESULTS"
+  printf '%-60s %10s\n' "test" "MB/s"
+  printf '%s\n' "${C_DIM}------------------------------------------------------------------${C_RESET}"
+  printf '%-60s %10s\n' "$IPERF3_LANES independent tunnels, concurrent (aggregate)" "$T3_MBPS"
+  echo ""
+  info "compare against croc's own confirmed numbers (CROC_JOURNEY.md):"
+  info "  public-relay-baseline ~40 MB/s, self-hosted-default ~85-93 MB/s,"
+  info "  split-lanes ~54 MB/s aggregate. Real link ceiling: ~312 MB/s"
+  info "  (2.5 Gb symmetric)."
+  echo ""
+  info "(pod teardown happens next, via the EXIT trap, unless KEEP_POD=1)"
+  exit 0
+fi
 
 hdr "Preparing the pod (croc present, classic mode, test file)"
-# Bad assumption fixed: an earlier pod happened to have croc baked into
-# its image, but that isn't guaranteed -- mirror bootstrap_remote.sh's
-# already-proven install step (official installer, not apt) instead of
-# just hoping it's there.
-if ! ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "command -v croc" >/dev/null 2>&1; then
-  info "croc not found on the pod -- installing via the official installer"
-  info "(same command as singleshot/bootstrap_remote.sh)..."
-  if ! ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "curl -s https://getcroc.schollz.com | bash" >/dev/null 2>&1; then
-    err "croc install failed on the pod."
-    exit 1
-  fi
-  if ! ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "command -v croc" >/dev/null 2>&1; then
-    err "croc still not found on the pod after running the installer."
-    exit 1
-  fi
-  ok "croc installed"
-fi
-ok "croc present on pod: $(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "croc --version" 2>/dev/null)"
-
-FLAG="$(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "cat /root/.config/croc/classic_enabled 2>/dev/null || echo missing")"
-if [[ "$FLAG" != "enabled" ]]; then
-  ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "printf 'y\\n' | croc --classic" >/dev/null 2>&1 || true
-  FLAG="$(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "cat /root/.config/croc/classic_enabled 2>/dev/null || echo missing")"
-  if [[ "$FLAG" != "enabled" ]]; then
-    err "could not enable croc's classic mode on the pod (needed for a scripted receive)."
-    exit 1
-  fi
-fi
-ok "croc classic mode enabled on pod"
+croc_ensure_installed_remote
+croc_ensure_classic_mode_remote
 
 REMOTE_DIR="/tmp/croc_bench"
 ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "mkdir -p $REMOTE_DIR && rm -f $REMOTE_DIR/*"
@@ -348,54 +674,30 @@ LOCAL_FILE="$LOCAL_DIR/bench_${FILE_SIZE_MB}mb.bin"
 info "generating a random ${FILE_SIZE_MB}MB local test file (random, not zeros --"
 info "avoids flattering any compression) ..."
 dd if=/dev/urandom "of=$LOCAL_FILE" bs=1m count="$FILE_SIZE_MB" 2>/dev/null
-ok "test file ready: $LOCAL_FILE"
+EXPECTED_BYTES="$(stat -f%z "$LOCAL_FILE" 2>/dev/null || stat -c%s "$LOCAL_FILE")"
+ok "test file ready: $LOCAL_FILE ($EXPECTED_BYTES bytes)"
 echo ""
 
+BEST_MBPS="0"; BEST_NAME="none"
+if [[ "$MODE_SPLIT_ONLY" == "1" ]]; then
+  info "--split-only: skipping the 4-variant benchmark entirely (and its"
+  info "single shared relay/tunnel, only needed by that benchmark) --"
+  info "going straight to the $SPLIT_LANES-lane split phase below so it"
+  info "gets the full GLOBAL_TIMEOUT_SECS budget to itself."
+  echo ""
+else
+
 hdr "Starting the self-hosted relay on the pod"
-RELAY_PID="$(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
-  "rm -f /tmp/croc_relay.log; bash -c 'setsid croc relay --port $CROC_RELAY_PORT --transfers $RELAY_TRANSFERS </dev/null >/tmp/croc_relay.log 2>&1 & echo \$!'" \
-  2>/dev/null || true)"
-sleep 2
-if [[ -z "$RELAY_PID" ]]; then
-  err "relay did not start -- see /tmp/croc_relay.log on the pod."
-  exit 1
-fi
-ok "relay running, pid=$RELAY_PID, ports $CROC_RELAY_PORT-$((CROC_RELAY_PORT + RELAY_TRANSFERS))"
+croc_relay_start "$CROC_RELAY_PORT" "$RELAY_TRANSFERS"
 echo ""
 
 hdr "Establishing SSH tunnel for the relay's port range"
-# Forwards EVERY relay port from this machine's localhost, through the
-# pod's SSH connection, to localhost on the pod -- i.e. exactly where
-# the relay above is listening. Needs NOTHING from RunPod beyond the
-# SSH port that's worked all along; sidesteps the whole custom-TCP-
-# port-exposure question entirely instead of relying on RunPod ever
-# actually mapping $CROC_RELAY_PORT the way earlier attempts assumed.
-TUNNEL_FLAGS=()
-for i in $(seq 0 "$RELAY_TRANSFERS"); do
-  p=$((CROC_RELAY_PORT + i))
-  TUNNEL_FLAGS+=(-L "$p:localhost:$p")
-done
-ssh -N -o ExitOnForwardFailure=yes "${SSH_OPTS[@]}" "${TUNNEL_FLAGS[@]}" "root@$POD_HOST" &
-TUNNEL_PID=$!
-sleep 2
-if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-  err "SSH tunnel process exited immediately -- ExitOnForwardFailure means"
-  err "at least one of the $((RELAY_TRANSFERS + 1)) local port forwards"
-  err "couldn't bind (maybe already in use on THIS machine -- check for"
-  err "another process on $CROC_RELAY_PORT-$((CROC_RELAY_PORT + RELAY_TRANSFERS))"
-  err "locally, e.g. 'lsof -i :$CROC_RELAY_PORT')."
-  exit 1
-fi
-ok "tunnel established, pid=$TUNNEL_PID, forwarding localhost:$CROC_RELAY_PORT-$((CROC_RELAY_PORT + RELAY_TRANSFERS)) -> pod"
-
-if ! run_with_timeout 5 bash -c "echo >/dev/tcp/localhost/$CROC_RELAY_PORT" 2>/dev/null; then
-  err "cannot reach localhost:$CROC_RELAY_PORT even through the SSH tunnel --"
-  err "the tunnel process is alive but the actual forward isn't answering."
-  err "Aborting here rather than spending more time/money on self-hosted"
-  err "variants that are now confirmed doomed."
-  exit 1
-fi
-ok "port $CROC_RELAY_PORT reachable via the tunnel from this machine"
+# See lib_croc.sh's croc_tunnel_start docstring for the full "why" --
+# in short, this sidesteps RunPod's custom-TCP-port-exposure question
+# entirely (5 real pods proved it doesn't work the way earlier
+# attempts assumed) by tunneling through the SSH port that's always
+# worked instead.
+croc_tunnel_start "$CROC_RELAY_PORT" "$RELAY_TRANSFERS"
 echo ""
 
 # ---------------------------------------------------------------- #
@@ -424,31 +726,56 @@ echo ""
 # never local-network discovery.
 #
 # Columns: (name, uses-self-hosted-relay [0/1], --no-compress [0/1],
-# send-only extra flags). The relay ADDRESS itself is deliberately NOT
-# baked in here as one shared string -- the send side (this machine)
-# must reach it via the pod's PUBLIC IP, but the receive side (running
-# ON the pod, over ssh) must use "localhost", not its own public IP
-# back at itself. Collapsing those into one shared flag was a real bug
-# the first time this ran: the receive side tried to dial
-# $POD_HOST:$CROC_RELAY_PORT (its own public address) and got
-# "i/o timeout" on EVERY self-hosted variant -- exactly the
-# public-vs-localhost distinction scp_data_files.sh/
-# tests/test_croc_transfer_speed.py already got right. Resolved to the
-# correct address per-side, per-variant, in the loop below instead.
+# send-only extra flags, MUST_BE_SEQUENTIAL [0/1]). HISTORICAL NOTE,
+# now moot but worth keeping: an earlier version had send and receive
+# reach the relay via DIFFERENT addresses (send: the pod's public IP;
+# receive: localhost), which was a real bug -- the receive side
+# (already running ON the pod) tried to dial its own public IP back
+# at itself and got "i/o timeout" on every self-hosted variant. Now
+# that both sides tunnel through SSH (see croc_tunnel_start above),
+# they use the IDENTICAL "localhost:$CROC_RELAY_PORT" flag -- no more
+# asymmetry to get wrong.
+#
+# MUST_BE_SEQUENTIAL: all self-hosted variants share the SAME single
+# SSH tunnel (one TCP connection to the pod). At the original 100MB
+# test size this never mattered -- transfers finished in ~2s, no time
+# for contention to bite. At the real 1GB size it did: 3 self-hosted
+# variants launched concurrently moved a combined ~5.4 MB/s (each
+# stuck around 1.7-1.8 MB/s, all killed by TRANSFER_TIMEOUT at ~31%),
+# drastically worse than the ~50 MB/s a SINGLE self-hosted transfer
+# got in an earlier, uncontended run. Production only ever sends 2
+# real files concurrently (train_80.h5 + val_80.h5), never 3+
+# redundant copies of the same file through different settings, so
+# comparing these settings fairly means giving each the FULL tunnel to
+# itself -- hence sequential. The public-relay baseline uses a
+# completely separate path (never touches our tunnel), so it stays
+# concurrent with whichever self-hosted variant is currently running.
 # ---------------------------------------------------------------- #
-declare -a V_NAME=() V_USE_RELAY=() V_NO_COMPRESS=() V_SEND_ONLY_FLAGS=()
+declare -a V_NAME=() V_USE_RELAY=() V_NO_COMPRESS=() V_SEND_ONLY_FLAGS=() V_SEQUENTIAL=()
 
-V_NAME+=("public-relay-baseline");   V_USE_RELAY+=("0"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local")
-V_NAME+=("self-hosted-default");     V_USE_RELAY+=("1"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local")
-V_NAME+=("self-hosted-transfers16"); V_USE_RELAY+=("1"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local --transfers 16")
-V_NAME+=("self-hosted-no-compress"); V_USE_RELAY+=("1"); V_NO_COMPRESS+=("1"); V_SEND_ONLY_FLAGS+=("--no-local")
+# "self-hosted-default" leaves --transfers at croc's own send-side
+# default (4) -- which is what actually produced the earlier confirmed
+# 2.0x result, NOT the relay's port count. "self-hosted-transfers8"
+# explicitly requests the real, confirmed cap (8, see RELAY_TRANSFERS
+# above) to test the one axis of real, not-yet-measured upside: going
+# from croc's default 4 real connections to its actual maximum of 8.
+V_NAME+=("public-relay-baseline");   V_USE_RELAY+=("0"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local");               V_SEQUENTIAL+=("0")
+V_NAME+=("self-hosted-default");     V_USE_RELAY+=("1"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local");               V_SEQUENTIAL+=("1")
+V_NAME+=("self-hosted-transfers8");  V_USE_RELAY+=("1"); V_NO_COMPRESS+=("0"); V_SEND_ONLY_FLAGS+=("--no-local --transfers 8"); V_SEQUENTIAL+=("1")
+V_NAME+=("self-hosted-no-compress"); V_USE_RELAY+=("1"); V_NO_COMPRESS+=("1"); V_SEND_ONLY_FLAGS+=("--no-local");               V_SEQUENTIAL+=("1")
 
 N="${#V_NAME[@]}"
 LOGDIR="$(mktemp -d)"
-declare -a SEND_PID=() WATCHER_PID=() RESULT_MBPS=() RESULT_STATUS=() START_TS=()
-
-hdr "Launching $N variants CONCURRENTLY against $LOGDIR"
+declare -a SEND_PID=() WATCHER_PID=() RESULT_MBPS=() RESULT_STATUS=() START_TS=() LAUNCHED=()
 for i in $(seq 0 $((N - 1))); do
+  RESULT_STATUS[$i]="queued"
+  RESULT_MBPS[$i]="-"
+  LAUNCHED[$i]=0
+  WATCHER_PID[$i]=0
+done
+
+launch_variant() {
+  local i="$1" name relay_flag send_relay recv_relay nocompress sonly slog rlog
   name="${V_NAME[$i]}"
   # Both sides now say "localhost" -- send connects to the tunnel's
   # local end on THIS machine, receive connects to the pod's own
@@ -464,47 +791,61 @@ for i in $(seq 0 $((N - 1))); do
   rlog="$LOGDIR/$name.recv.log"
   : >"$slog"; : >"$rlog"
   info "[$name] sending..."
-  # shellcheck disable=SC2086
-  croc --yes $send_relay $nocompress send $sonly "$LOCAL_FILE" >"$slog" 2>&1 &
+  croc_send "$send_relay" "$nocompress" "$sonly" "$LOCAL_FILE" "$slog"
   SEND_PID[$i]=$!
   START_TS[$i]=$(date +%s)
-  WATCHER_PID[$i]=0
   RESULT_STATUS[$i]="running"
-  RESULT_MBPS[$i]="-"
   ( # background: wait for the code, then run the timed receive
-    code=""
-    for _ in $(seq 1 15); do
-      if grep -q "run:" "$slog" 2>/dev/null; then
-        code="$(grep -A1 "run:" "$slog" | tail -1 | sed -E 's/^\s*croc\s+//; s/\s*\(.*$//' | awk '{print $NF}')"
-        [[ -n "$code" ]] && break
-      fi
-      sleep 1
-    done
+    code="$(croc_parse_code_from_log "$slog" 15)"
     if [[ -z "$code" ]]; then
       echo "NEVER_GOT_CODE" >>"$rlog"
       exit 1
     fi
-    t0=$(date +%s)
-    # shellcheck disable=SC2086
-    run_with_timeout "$TRANSFER_TIMEOUT" \
-      ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
-      "cd $REMOTE_DIR && rm -f $(basename "$LOCAL_FILE") && croc --yes $recv_relay $nocompress '$code'" \
-      >>"$rlog" 2>&1
-    rc=$?
-    elapsed=$(( $(date +%s) - t0 ))
-    echo "RC=$rc ELAPSED=$elapsed" >>"$rlog"
+    # A UNIQUE remote dir per variant, not one shared "$REMOTE_DIR" --
+    # concurrent variants receiving into the same path were racing
+    # each other's `rm -f` + write with zero isolation, and nothing
+    # before EXPECTED_BYTES/SIZE_OK below would ever have caught it (a
+    # passing exit code only means croc's protocol thought it
+    # finished, not that the bytes are actually right).
+    croc_receive "$TRANSFER_TIMEOUT" "$REMOTE_DIR/$name" "$(basename "$LOCAL_FILE")" \
+      "$recv_relay" "$nocompress" "$code" "$rlog" "$EXPECTED_BYTES"
   ) &
   WATCHER_PID[$i]=$!  # reuse WATCHER_PID[] to hold the background-wrapper's own pid
+  LAUNCHED[$i]=1
+}
+
+hdr "Launching variants ($((N - 1)) self-hosted ones run SEQUENTIALLY against $LOGDIR)"
+SEQ_QUEUE=()
+for i in $(seq 0 $((N - 1))); do
+  if [[ "${V_SEQUENTIAL[$i]}" == "1" ]]; then
+    SEQ_QUEUE+=("$i")
+  else
+    launch_variant "$i"
+  fi
 done
+SEQ_POS=0
+if [[ "${#SEQ_QUEUE[@]}" -gt 0 ]]; then
+  launch_variant "${SEQ_QUEUE[0]}"
+fi
 echo ""
 
 hdr "Live status (refreshing every 5s, ${TRANSFER_TIMEOUT}s hard cutoff per variant)"
-DEADLINE=$(( $(date +%s) + TRANSFER_TIMEOUT + 20 ))
+# Budget: every sequential variant may need up to TRANSFER_TIMEOUT,
+# one after another, plus the concurrent one, plus a flat buffer --
+# NOT just TRANSFER_TIMEOUT+20 like a single-round benchmark would
+# need (that was fine for 4 truly-concurrent variants; it is not
+# enough once 3 of them run one after another).
+DEADLINE=$(( $(date +%s) + TRANSFER_TIMEOUT * (${#SEQ_QUEUE[@]} + 1) + 20 ))
 while true; do
   all_done=1
   printf '%s\n' "${C_DIM}$(date '+%H:%M:%S')${C_RESET}"
   for i in $(seq 0 $((N - 1))); do
     name="${V_NAME[$i]}"
+    if [[ "${LAUNCHED[$i]}" != "1" ]]; then
+      all_done=0
+      printf '  %-28s %s(queued)%s\n' "$name" "$C_DIM" "$C_RESET"
+      continue
+    fi
     rlog="$LOGDIR/$name.recv.log"
     if kill -0 "${WATCHER_PID[$i]}" 2>/dev/null; then
       all_done=0
@@ -515,7 +856,12 @@ while true; do
       if [[ "${RESULT_STATUS[$i]}" == "running" ]]; then
         if grep -q "NEVER_GOT_CODE" "$rlog" 2>/dev/null; then
           RESULT_STATUS[$i]="FAILED (no send code)"
-        elif grep -q "RC=0 " "$rlog" 2>/dev/null; then
+        elif grep -q "SIZE_MISMATCH" "$rlog" 2>/dev/null; then
+          # A passing croc exit code alone doesn't mean the bytes that
+          # arrived actually match what was sent -- see croc_receive's
+          # docstring. Never skip this check just because RC=0 looked fine.
+          RESULT_STATUS[$i]="FAILED (size mismatch, see $rlog)"
+        elif grep -q "RC=0 " "$rlog" 2>/dev/null && grep -q "SIZE_OK" "$rlog" 2>/dev/null; then
           elapsed="$(grep -oE 'ELAPSED=[0-9]+' "$rlog" | head -1 | cut -d= -f2)"
           [[ -z "$elapsed" || "$elapsed" == "0" ]] && elapsed=1
           mbps=$(awk -v s="$FILE_SIZE_MB" -v t="$elapsed" 'BEGIN{printf "%.1f", s/t}')
@@ -523,6 +869,16 @@ while true; do
           RESULT_MBPS[$i]="$mbps"
         else
           RESULT_STATUS[$i]="FAILED (see $rlog)"
+        fi
+        # This variant JUST finished -- if it was the current head of
+        # the sequential queue, launch whatever's next in that queue
+        # (giving it the tunnel to itself, per this section's own
+        # reason for existing).
+        if [[ "$SEQ_POS" -lt "${#SEQ_QUEUE[@]}" && "${SEQ_QUEUE[$SEQ_POS]}" == "$i" ]]; then
+          SEQ_POS=$((SEQ_POS + 1))
+          if [[ "$SEQ_POS" -lt "${#SEQ_QUEUE[@]}" ]]; then
+            launch_variant "${SEQ_QUEUE[$SEQ_POS]}"
+          fi
         fi
       fi
       color="$C_GREEN"; [[ "${RESULT_STATUS[$i]}" != "OK" ]] && color="$C_RED"
@@ -534,13 +890,16 @@ while true; do
   if [[ $(date +%s) -gt $DEADLINE ]]; then
     warn "global deadline hit -- killing anything still running."
     for i in $(seq 0 $((N - 1))); do
-      kill -9 "${WATCHER_PID[$i]}" 2>/dev/null
-      kill -9 "${SEND_PID[$i]}" 2>/dev/null
+      # Queued-but-never-launched variants (deadline hit before their
+      # turn in the sequential queue) never got a SEND_PID -- ":-"
+      # keeps this a no-op kill instead of an unbound-variable error.
+      kill -9 "${WATCHER_PID[$i]:-}" 2>/dev/null
+      kill -9 "${SEND_PID[$i]:-}" 2>/dev/null
       # Without this, a variant killed by the deadline (rather than
       # finishing/failing on its own) would stay stuck at "running"
       # forever in the final table below -- caught by a local dry run
       # against fake background jobs before ever touching a real pod.
-      [[ "${RESULT_STATUS[$i]}" == "running" ]] && RESULT_STATUS[$i]="FAILED (global timeout)"
+      [[ "${RESULT_STATUS[$i]}" == "running" || "${RESULT_STATUS[$i]}" == "queued" ]] && RESULT_STATUS[$i]="FAILED (global timeout)"
     done
     break
   fi
@@ -548,13 +907,12 @@ while true; do
 done
 
 for i in $(seq 0 $((N - 1))); do
-  kill "${SEND_PID[$i]}" 2>/dev/null
+  kill "${SEND_PID[$i]:-}" 2>/dev/null
 done
 
 hdr "FINAL RESULTS"
 printf '%-28s %-22s %10s\n' "variant" "status" "MB/s"
 printf '%s\n' "${C_DIM}------------------------------------------------------------${C_RESET}"
-BEST_MBPS="0"; BEST_NAME="none"
 for i in $(seq 0 $((N - 1))); do
   name="${V_NAME[$i]}"
   color="$C_GREEN"; [[ "${RESULT_STATUS[$i]}" != "OK" ]] && color="$C_RED"
@@ -582,4 +940,121 @@ else
 fi
 echo ""
 info "raw logs kept at: $LOGDIR"
-info "(pod teardown happens next, via the EXIT trap, unless KEEP_POD=1)"
+
+fi  # MODE_SPLIT_ONLY
+
+if [[ "$SPLIT_LANES" == "0" ]]; then
+  info "SPLIT_LANES=0 -- skipping the multi-lane phase."
+  info "(pod teardown happens next, via the EXIT trap, unless KEEP_POD=1)"
+else
+  echo ""
+  hdr "EXPERIMENTAL: $SPLIT_LANES independent lanes (own relay+tunnel each)"
+  warn "Not yet confirmed at any scale -- see CROC_JOURNEY.md before trusting this number."
+
+  SPLIT_DIR="$(mktemp -d)"
+  PIECE_BYTES=$(( (EXPECTED_BYTES + SPLIT_LANES - 1) / SPLIT_LANES ))
+  info "splitting $LOCAL_FILE into $SPLIT_LANES pieces (~$((PIECE_BYTES / 1048576)) MB each)..."
+  split -b "$PIECE_BYTES" -d -a 2 "$LOCAL_FILE" "$SPLIT_DIR/piece_"
+
+  SPLIT_REMOTE_DIR="$REMOTE_DIR/split-lanes"
+  ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "mkdir -p '$SPLIT_REMOTE_DIR' && rm -f '$SPLIT_REMOTE_DIR'/*"
+
+  declare -a LANE_RELAY_PIDS=() LANE_TUNNEL_PIDS=() LANE_SEND_PIDS=() LANE_SEND_LOGS=()
+  LANES_OK=1
+
+  info "starting $SPLIT_LANES independent relay+tunnel pairs..."
+  for i in $(seq 0 $((SPLIT_LANES - 1))); do
+    lane_port=$((SPLIT_BASE_PORT + i * SPLIT_PORT_STRIDE))
+    if ! croc_relay_start_lane "$lane_port" 8 "LANE_RELAY_PIDS[$i]"; then
+      LANES_OK=0
+      break
+    fi
+    if ! croc_tunnel_start_lane "$lane_port" 8 "LANE_TUNNEL_PIDS[$i]"; then
+      LANES_OK=0
+      break
+    fi
+  done
+
+  if [[ "$LANES_OK" == "1" ]]; then
+    ok "all $SPLIT_LANES lanes' relay+tunnel established"
+    info "sending all $SPLIT_LANES pieces CONCURRENTLY..."
+    SPLIT_T0=$(date +%s)
+    for i in $(seq 0 $((SPLIT_LANES - 1))); do
+      lane_port=$((SPLIT_BASE_PORT + i * SPLIT_PORT_STRIDE))
+      piece_file="$SPLIT_DIR/piece_$(printf '%02d' "$i")"
+      slog="$(mktemp)"
+      LANE_SEND_LOGS[$i]="$slog"
+      croc_send "--relay localhost:$lane_port" "" "--no-local" "$piece_file" "$slog"
+      LANE_SEND_PIDS[$i]=$!
+    done
+
+    declare -a LANE_RECV_WATCHER_PIDS=() LANE_RECV_LOGS=()
+    for i in $(seq 0 $((SPLIT_LANES - 1))); do
+      lane_port=$((SPLIT_BASE_PORT + i * SPLIT_PORT_STRIDE))
+      piece_file="$SPLIT_DIR/piece_$(printf '%02d' "$i")"
+      piece_name="piece_$(printf '%02d' "$i")"
+      piece_bytes="$(stat -f%z "$piece_file" 2>/dev/null || stat -c%s "$piece_file")"
+      code="$(croc_parse_code_from_log "${LANE_SEND_LOGS[$i]}" 15)"
+      rlog="$(mktemp)"
+      LANE_RECV_LOGS[$i]="$rlog"
+      if [[ -z "$code" ]]; then
+        # No process backgrounded for this lane -- leave its watcher
+        # pid empty rather than capturing a stale/wrong $! from a
+        # PRIOR iteration (or an unset one on the very first lane).
+        echo "NEVER_GOT_CODE" >>"$rlog"
+        LANE_RECV_WATCHER_PIDS[$i]=""
+      else
+        ( croc_receive "$SPLIT_TRANSFER_TIMEOUT" "$SPLIT_REMOTE_DIR" "$piece_name" "--relay localhost:$lane_port" "" \
+            "$code" "$rlog" "$piece_bytes" ) &
+        LANE_RECV_WATCHER_PIDS[$i]=$!
+      fi
+    done
+    for i in $(seq 0 $((SPLIT_LANES - 1))); do
+      wait "${LANE_RECV_WATCHER_PIDS[$i]:-}" 2>/dev/null || true
+    done
+    SPLIT_ELAPSED=$(( $(date +%s) - SPLIT_T0 ))
+
+    for i in $(seq 0 $((SPLIT_LANES - 1))); do
+      if grep -q "RC=0 " "${LANE_RECV_LOGS[$i]}" 2>/dev/null && grep -q "SIZE_OK" "${LANE_RECV_LOGS[$i]}" 2>/dev/null; then
+        ok "lane $i: OK"
+      else
+        LANES_OK=0
+        err "lane $i: FAILED -- $(cat "${LANE_RECV_LOGS[$i]}" 2>/dev/null | tail -3)"
+      fi
+      kill "${LANE_SEND_PIDS[$i]:-}" 2>/dev/null || true
+    done
+  fi
+
+  for i in $(seq 0 $((SPLIT_LANES - 1))); do
+    croc_stop_lane "${LANE_RELAY_PIDS[$i]:-}"
+    croc_stop_lane "${LANE_TUNNEL_PIDS[$i]:-}"
+  done
+
+  if [[ "$LANES_OK" == "1" ]]; then
+    info "reassembling $SPLIT_LANES pieces on the pod..."
+    ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
+      "cd '$SPLIT_REMOTE_DIR' && cat \$(ls piece_* | sort) > '$REMOTE_DIR/split_result.bin' && rm -f piece_*"
+    SPLIT_REMOTE_SIZE="$(ssh "${SSH_OPTS[@]}" "root@$POD_HOST" \
+      "stat -c%s '$REMOTE_DIR/split_result.bin' 2>/dev/null")"
+    if [[ "$SPLIT_REMOTE_SIZE" == "$EXPECTED_BYTES" ]]; then
+      SPLIT_MBPS=$(awk -v b="$EXPECTED_BYTES" -v s="$SPLIT_ELAPSED" 'BEGIN{ if (s<1) s=1; printf "%.1f", (b/1048576)/s }')
+      ok "reassembled size verified ($SPLIT_REMOTE_SIZE bytes)"
+      echo ""
+      ok "SPLIT RESULT: ${SPLIT_ELAPSED}s, ${SPLIT_MBPS} MB/s aggregate across $SPLIT_LANES lanes"
+      if [[ "$BEST_NAME" != "none" ]]; then
+        SPLIT_SPEEDUP=$(awk -v a="$SPLIT_MBPS" -v b="$BEST_MBPS" 'BEGIN{printf "%.1f", a/b}')
+        info "that is ${SPLIT_SPEEDUP}x the best single-tunnel result ($BEST_MBPS MB/s, $BEST_NAME)"
+      fi
+    else
+      err "reassembled size mismatch: got=${SPLIT_REMOTE_SIZE:-<none>} want=$EXPECTED_BYTES"
+    fi
+  else
+    err "split-lanes phase failed -- see errors above. Not falling back to"
+    err "anything; this phase is purely informational on top of the"
+    err "already-completed main benchmark above."
+  fi
+  rm -rf "$SPLIT_DIR"
+  ssh "${SSH_OPTS[@]}" "root@$POD_HOST" "rm -f '$REMOTE_DIR/split_result.bin'" 2>/dev/null || true
+  echo ""
+  info "(pod teardown happens next, via the EXIT trap, unless KEEP_POD=1)"
+fi

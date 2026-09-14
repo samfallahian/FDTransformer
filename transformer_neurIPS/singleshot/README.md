@@ -18,6 +18,9 @@ inside named `screen` sessions over a SINGLE SSH connection -- see
 | `scp_data_files.sh` | Run **locally**. Phase 2: sends `train_80.h5` (~9.2G) and `val_80.h5` (~3.9G) as two concurrent `scp` processes. Independent of phase 1 -- run it any time before, during, or after phase 1. Both files are stored uncompressed (`decompress_h5.py`, see below) -- slightly larger on disk/wire, but no more single-threaded gzip decompression cost on every load. |
 | `bootstrap_remote.sh` | Run **on the pod** (normally inside the `bootstrap` screen, see below). Creates a venv, installs pinned deps + `mc` (midnight commander) + `screen` + `croc` + the correct CUDA **stable** (not nightly) torch build, then stops and prints the `wandb login` step for you to run yourself -- never called non-interactively past that point unless `WANDB_API_KEY` is set. Only needs phase 1's files -- can run while phase 2 is still transferring. |
 | `requirements.txt` | Copy of `/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/requirements_sweep.txt` (the verified-minimal dependency set), kept self-contained here. |
+| `lib_croc.sh` | Sourceable library ("the reusable class" -- see its own header for why that phrase and not literally a class) of every proven-correct croc operation: remote install, classic-mode setup, self-hosted relay start/stop, SSH-tunnel start/stop, send/receive with size verification. `source` this rather than reimplementing any of it -- see `CROC_JOURNEY.md` for exactly how many real bugs that reimplementation risk already caused. |
+| `bench_croc_variants.sh` | Run **locally**. Spins up a cheap throwaway pod, benchmarks croc's public relay (running concurrently, its own separate network path) against several self-hosted-relay-via-SSH-tunnel settings (run sequentially against EACH OTHER -- they share one tunnel, and running them concurrently at real file sizes starves all of them), prints a live-refreshing colored status table. Uses `lib_croc.sh`. See `CROC_JOURNEY.md` for the full story and confirmed results: **2.4x at real 1GB-file scale**, now wired into `scp_data_files.sh`. 1GB/s+ is still the open target. |
+| `CROC_JOURNEY.md` | Rich narrative writeup of the croc self-hosted-relay investigation -- six real pod rentals, five real bugs, the RunPod custom-TCP-port wall, and the SSH-tunnel fix that actually worked. Read this before touching `lib_croc.sh`/`bench_croc_variants.sh` again. |
 
 ## Why not a tarball
 
@@ -331,48 +334,26 @@ fresh pod) or inbound (pulling checkpoints/results back before
 terminating a pod) direction. A few alternatives, roughly fastest to
 slowest for the ~11.3GB `train_80.h5`+`val_80.h5` pair specifically:
 
-1. **`croc`**, self-hosted relay -- `scp_data_files.sh` now has this
-   wired in as an opt-in (`TRANSFER_METHOD=croc bash scp_data_files.sh`,
-   or `TRANSFER_METHOD=croc bash provision_and_run.sh` for the full
-   lifecycle), falling back to `scp` automatically for any file it
-   doesn't get. **Status: confirmed the problem, NOT yet confirmed the
-   fix.** A live benchmark (`tests/test_croc_transfer_speed.py`,
-   POD_HOST/POD_PORT against a real pod) measured croc's DEFAULT
-   *public* relay (`schollz`'s) at ~18-21 MB/s moving a 100MB random
-   file -- matching the exact ceiling seen on real `train_80.h5`
-   uploads regardless of local link speed, and matching community
-   reports of that public relay's own shared bandwidth cap. The
-   intended fix -- self-hosting the relay ON THE POD, so traffic goes
-   straight over the same direct IP path SSH already uses instead of
-   through whichever datacenter hosts the public relay -- did NOT
-   complete in that same test: the receiver connected to its own
-   `localhost` relay fine, but the sender (this machine) never reached
-   it, and the pod was closed before the cause could be confirmed with
-   a raw port-reachability check. Leading theory: RunPod pods only
-   expose ports explicitly listed at `pod create` time, and the pod
-   used for that test predates `provision_and_run.sh`'s current
-   `--ports` line (added afterward specifically to fix this -- see
-   `CROC_RELAY_PORT` in that script's header) -- so this needs a fresh
-   pod and a re-run of that same test before treating it as confirmed.
-   Two real bugs found and fixed getting even the public-relay half of
-   that test working, worth knowing if you touch this again:
-   - `croc` 11.x refuses a receive code as a bare CLI argument by
-     default (a security change vs. older versions) -- needs its
-     "classic mode" persisted setting enabled once
-     (`~/.config/croc/classic_enabled` on whichever side receives).
-   - `croc relay &` run via a plain non-interactive `ssh host "cmd &"`
-     gets SIGHUP'd the instant that ssh command's own shell exits --
-     the process is simply gone half a second later. Needs `setsid`
-     inside a nested `bash -c '... &'` to actually survive.
-   - Do NOT clean up a self-hosted relay with `pkill -f "croc relay"`
-     if anything else follows it in the same ssh command string --
-     `pkill -f` scans every process's full command line, which
-     trivially includes the invoking shell's OWN command line (it
-     literally contains the pkill invocation's text), and pkill's
-     self-exclusion only covers the pkill process itself, not its
-     parent shell -- it silently kills the whole SSH session instead
-     (`ssh -v` shows `exit-signal`, not a clean exit code). Kill by the
-     exact pid captured at launch instead.
+1. **`croc`**, self-hosted relay, tunneled through SSH -- **confirmed
+   at real 1GB-file scale and wired into production**: 2.4x the public
+   relay (93.1 vs 39.4 MB/s), using croc's own default settings (going
+   beyond them, e.g. `--transfers 8`, measured SLOWER, not faster --
+   don't). Full story -- seven real pod rentals, six real bugs, the
+   RunPod networking wall that forced the SSH-tunnel approach, and the
+   "100 workers" plan that turned out to be wrong (croc hard-caps real
+   parallel connections at 8, confirmed from its own source) -- is
+   written up in [`CROC_JOURNEY.md`](CROC_JOURNEY.md); the reusable,
+   tested implementation is [`lib_croc.sh`](lib_croc.sh), used by both
+   `bench_croc_variants.sh` (the benchmark) and `scp_data_files.sh`'s
+   `TRANSFER_METHOD=croc` path (the real thing, sending `train_80.h5`/
+   `val_80.h5` sequentially to avoid the tunnel-sharing contention
+   `CROC_JOURNEY.md` documents). croc's DEFAULT *public* relay
+   (`schollz`'s, no extra setup) measured ~18-41 MB/s across every real
+   run so far -- matching the exact ceiling seen on `train_80.h5`
+   uploads regardless of local link speed -- so it is NOT what "croc"
+   should mean for a large transfer; always self-host per
+   `lib_croc.sh`. **Still open**: the real target is 1GB/s+, and 93.1
+   MB/s isn't there yet -- see `CROC_JOURNEY.md`'s "What's still open."
 2. **`runpodctl send` / `runpodctl receive`** -- RunPod's own tool
    (also built on `croc`, same relay network): NAT traversal + relay,
    no SSH key/port juggling. Already installed locally at

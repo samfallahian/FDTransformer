@@ -82,23 +82,23 @@
 #   SSH_KEY             local private key to use (default ~/.ssh/id_ed25519
 #                       -- must match a key added via `runpodctl ssh add-key`
 #                       or already present on the pod's image)
-#   TRANSFER_METHOD     "scp" (default, proven) or "croc" (EXPERIMENTAL,
-#                       UNVERIFIED end to end -- see scp_data_files.sh's
-#                       header comment for the full story: a live test
-#                       confirmed croc's default public relay caps out
-#                       around 18-21 MB/s, the same ceiling seen in real
-#                       uploads, but the self-hosted-relay fix for that
-#                       never completed a transfer before the test pod
-#                       was closed, likely because the ports it needs
-#                       weren't exposed at pod-creation time -- this
-#                       script now requests them (see CROC_RELAY_PORT),
-#                       but that fix itself hasn't been tested yet
-#                       either). Falls back to scp automatically for
-#                       any file croc doesn't get, never fatal.
+#   TRANSFER_METHOD     "scp" (default) or "croc" -- CONFIRMED faster,
+#                       2.4x the public relay at real 1GB-file scale
+#                       (93.1 vs 39.4 MB/s), see scp_data_files.sh's
+#                       header comment and singleshot/CROC_JOURNEY.md
+#                       for the full story. Uses a self-hosted relay
+#                       tunneled through SSH -- needs NO extra ports
+#                       exposed on the pod (an earlier version of this
+#                       script requested CROC_RELAY_PORT's range at
+#                       `pod create` time on the theory that croc
+#                       needed them directly exposed; confirmed across
+#                       5 real pod rentals that RunPod's Secure Cloud
+#                       pods don't support that at all, which is why
+#                       this now tunnels through SSH instead and no
+#                       longer touches `--ports` for this). Deliberately
+#                       NO scp fallback -- fails loud instead.
 #   CROC_RELAY_PORT     base port for TRANSFER_METHOD=croc's self-hosted
-#                       relay (default 9019). Needs THIS port plus the
-#                       4 above it exposed as TCP ports on the pod --
-#                       this script's `pod create` call does that.
+#                       relay (default 9019, tunneled -- see above).
 #
 # WHY h11_ridge_distill BY DEFAULT
 # ==================================
@@ -194,26 +194,20 @@ else
     echo "Creating pod (gpu=$GPU_ID, template=$TEMPLATE_ID, disk=${CONTAINER_DISK_GB}GB)..."
     IMAGE_FLAGS=(--template-id "$TEMPLATE_ID")
   fi
-  # 22/tcp for SSH, plus CROC_RELAY_PORT's 5-port range (base + croc's
-  # default 4 "transfers" ports) so scp_data_files.sh's TRANSFER_METHOD
-  # =croc path (self-hosted relay ON the pod) has any chance of being
-  # reachable from the local machine -- RunPod pods only expose ports
-  # explicitly listed here, SSH's own mapping does not cover anything
-  # else. UNVERIFIED as of this writing whether this is sufficient
-  # (see scp_data_files.sh's header comment) -- the live test that
-  # would have confirmed it ran against a pod created before this line
-  # existed, so its self-hosted-relay half never had a reachable port
-  # to test in the first place.
-  CROC_PORTS="$CROC_RELAY_PORT/tcp"
-  for i in 1 2 3 4; do
-    CROC_PORTS="$CROC_PORTS,$((CROC_RELAY_PORT + i))/tcp"
-  done
+  # 22/tcp only -- TRANSFER_METHOD=croc's self-hosted relay is reached
+  # through an SSH tunnel now, not a directly-exposed pod port (see
+  # CROC_RELAY_PORT above). An earlier version of this line requested
+  # CROC_RELAY_PORT's range directly on the theory that croc needed it
+  # exposed that way; confirmed across 5 real pod rentals that RunPod's
+  # Secure Cloud pods don't support arbitrary custom TCP port exposure
+  # at all (see singleshot/CROC_JOURNEY.md), which is why the tunnel
+  # approach exists and this no longer requests anything beyond SSH.
   echo "This blocks until SSH actually answers (--wait), up to 10 minutes."
   POD_JSON="$("$RUNPODCTL" pod create \
     --gpu-id "$GPU_ID" \
     "${IMAGE_FLAGS[@]}" \
     --container-disk-in-gb "$CONTAINER_DISK_GB" \
-    --ports "22/tcp,$CROC_PORTS" \
+    --ports "22/tcp" \
     --public-ip \
     --wait --wait-timeout 10m \
     -o json)"
@@ -329,7 +323,7 @@ fi
 echo "  host=$POD_HOST port=$POD_PORT"
 echo ""
 
-export POD_HOST POD_PORT SSH_KEY TRANSFER_METHOD CROC_RELAY_PORT
+export POD_HOST POD_PORT SSH_KEY TRANSFER_METHOD CROC_RELAY_PORT RELAY_TRANSFERS
 echo "=================================================================="
 echo " Phase 1/2: env files (code, checkpoint, ridge map, AE decoder)"
 echo "=================================================================="

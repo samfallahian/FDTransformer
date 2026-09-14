@@ -4441,3 +4441,99 @@ after the `.item()`-sync (§34) and `torch.compile(dynamic=True)`
 `BaseTransformer`'s attention blocks (cache plumbing through
 `forward()`, invalidation on a fresh rollout), a bigger change than
 anything else in this section.
+
+## 36. v6.6 -- croc self-hosted-relay transfer confirmed working (2x), via SSH tunneling
+
+Six real pod rentals and five real bugs after first asking "why is
+`train_80.h5` stuck at ~20-30 MB/s regardless of local bandwidth,"
+croc's self-hosted relay is confirmed faster than its default public
+relay -- **2.0x** in a real run (50.0 MB/s vs. 25.0 MB/s) -- but only
+by tunneling the relay's ports through the pod's SSH connection
+instead of asking RunPod to expose them directly. RunPod's Secure
+Cloud pods do not expose arbitrary custom TCP ports the way this was
+first assumed, including the documented "request `70000+port` for a
+symmetric mapping" workaround, whose confirming env var never
+appeared even after a 30s retry loop against a real pod.
+
+Full narrative -- the timeline of all eight attempts, all five bugs
+(a `pkill -f` that silently kills its own SSH session, an SSH-
+backgrounded job that dies the instant its shell exits, croc's
+global-vs-subcommand flag split, concurrent local-relay port
+collisions, and a send/receive relay-address asymmetry), and the
+RunPod networking wall -- is in `singleshot/CROC_JOURNEY.md`, written
+with more room for context than code comments carry on their own.
+Deliberately not duplicated here; this section is the pointer.
+
+The reusable result: `singleshot/lib_croc.sh`, a sourceable function
+library ("the reusable class" for every proven-correct croc
+operation -- bash has no real classes and only bash 3.2 is available
+locally, so "instance state" is a documented set of well-known global
+variables instead of a nameref-based object). `singleshot/
+bench_croc_variants.sh` was refactored to call it instead of
+reimplementing any of this inline -- the whole point being that the
+next script needing self-hosted-relay transfers (most likely
+`scp_data_files.sh`'s existing `TRANSFER_METHOD=croc` path, which
+predates this fix and still assumes direct pod-IP reachability) reuses
+the same tested code path rather than risking bugs 1-5 all over again.
+
+Also added while refactoring, not yet exercised on a real pod: a
+size-verification step in `croc_receive()` (compares the received
+file's actual byte count against the sender's, since a passing croc
+exit code alone doesn't guarantee the bytes that arrived match what
+was sent) and per-variant unique remote directories in the benchmark
+(4 concurrent variants were previously receiving into the same shared
+remote path with no isolation, silently -- caught during this
+refactor, not by any test failure, since nothing was checking content
+correctness before this).
+
+**Update, same day**: the 100-port/1GB scale test surfaced a sixth
+real bug -- all self-hosted variants share the SAME single SSH
+tunnel, and running 3 of them concurrently at 1GB (long enough for
+sustained contention to matter, unlike the original 100MB sanity
+check) starved all three: combined ~5.4 MB/s, worse than a tenth of
+the uncontended single-variant 50 MB/s. Fixed by running self-hosted
+variants sequentially against each other (each gets the tunnel to
+itself) while the public-relay baseline -- a fully separate network
+path -- keeps running concurrently alongside them. Full writeup in
+`CROC_JOURNEY.md`'s bug #6; not yet re-confirmed against a real pod.
+
+**Second update, same day**: before spending a third real pod rental
+on the 100-port scale test, `croc` v11.5.2's own source was checked
+directly (`activateRelayDataChannels` in `src/croc/croc.go`, verified
+against the exact tagged release, not just `main`) -- it hard-caps
+real parallel data connections at **8 per transfer**, full stop,
+regardless of how many ports are offered or `--transfers` requests.
+The whole "100 ports = 100 workers" premise was wrong.
+`RELAY_TRANSFERS` corrected to `8` (9 ports, the real cap plus a
+1-port margin); the `self-hosted-transfers100` variant renamed to
+`self-hosted-transfers8` to test the one axis with genuine, unmeasured
+upside -- croc's own send-side default is `--transfers 4` (which is
+what actually produced the confirmed 2.0x, not the relay's port
+count), so 4->8 is still an open question, 4->100 never was one. Full
+writeup in `CROC_JOURNEY.md`'s "second wall" section.
+
+**Third update, same day -- CONFIRMED and wired into production**: the
+corrected scale test (`RELAY_TRANSFERS=8`, 1GB file, sequential
+self-hosted variants) ran cleanly: `self-hosted-default` (croc's own
+settings, no overrides) hit **93.1 MB/s -- 2.4x** the public-relay
+baseline (39.4 MB/s), every byte size-verified against the source.
+`self-hosted-transfers8` (8 connections) measured *slower* than the
+default's 4 -- second independent confirmation (after bug #6) that
+adding connections through one shared tunnel doesn't keep scaling.
+`scp_data_files.sh`'s `TRANSFER_METHOD=croc` path and
+`provision_and_run.sh`'s `pod create` call (no longer requests any
+custom port range -- SSH is the only port this ever needed) are now
+both updated to use `lib_croc.sh` and these confirmed settings. Full
+writeup in `CROC_JOURNEY.md`.
+
+**New open target, explicitly not yet met**: 1GB/s (1024 MB/s) or
+more. 93.1 MB/s is a confirmed, real 2.4x, but roughly 11x short of
+that target. The next lever isn't more connections through one
+tunnel (twice-confirmed not to help) -- it's genuinely parallel,
+independent network paths (split the file, multiple separate SSH
+tunnels, reassemble), not yet designed. See `CROC_JOURNEY.md`'s
+"What's still open."
+
+### 36.1 What v6.6 does NOT change
+
+- `WANDB_PROJECT` stays `NI_Review_v6`.

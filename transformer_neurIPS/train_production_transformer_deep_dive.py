@@ -731,6 +731,31 @@ class Config:
     # `{CHECKPOINT_DIR}/{run_name}_archive/` instead, pruned to this count.
     # 5 * ~57 MB is trivial disk cost for real rollback insurance.
     LATEST_ARCHIVE_KEEP = 5
+    # `None` (default) disables early stopping entirely -- existing behavior,
+    # unchanged, for any caller that doesn't opt in. When set to an int N,
+    # training stops once N STEPS (not evals -- deliberately step-denominated,
+    # like MAX_STEPS/CHECKPOINT_EVERY_STEPS/VAL_EVERY_STEPS, so the patience
+    # budget means the same thing regardless of --val-every) pass with no NEW
+    # PROMOTED rollout checkpoint (i.e. no eval both beats persistence AND
+    # clears the sane-RMS gate AND improves on the best-ever promoted
+    # rollout_mse -- the exact condition `_rollout_best.pt` is saved under,
+    # not just any self-relative low and not val_tf_mse, which `_best.pt`
+    # tracks instead and which several arms this session kept improving on
+    # even while the actual rollout-vs-persistence metric was getting
+    # steadily worse). An eval only happens every VAL_EVERY_STEPS, so the
+    # granularity of when this can actually fire is bounded by that -- e.g.
+    # PATIENCE_STEPS=500 with VAL_EVERY_STEPS=500 stops on the very next
+    # non-promoting eval after the last promotion, effectively a
+    # one-eval-of-slack patience; PATIENCE_STEPS smaller than VAL_EVERY_STEPS
+    # has no additional effect beyond that same one-eval floor.
+    # Added after three independent production-scale runs (s7_h9_scaled,
+    # h11_ridge_distill, s8_h9_moreseqs_scaled -- OVERVIEW.md v6.9/v7.0) all
+    # showed the identical pattern: peak somewhere around step 2000-4000,
+    # then decline for thousands of further steps while train_loss kept
+    # improving -- real pod-hours spent re-discovering the same peak instead
+    # of a lever that actually helps. This does not fix that underlying
+    # problem; it stops paying for it automatically.
+    EARLY_STOP_PATIENCE_STEPS = None
 
     # -- runtime ------------------------------------------------------------
     USE_TF32 = True
@@ -3641,6 +3666,16 @@ def train(args, log=print):
             # "found a new self-relative low" apart from "promoted a new
             # checkpoint".
             "promoted_rollout_mse": float('inf')}
+    # Early-stopping state (see Config.EARLY_STOP_PATIENCE_STEPS) -- the
+    # patience clock starts counting from THIS process's own resumed
+    # `step`, NOT from 0: a resume is itself a fresh operator decision to
+    # keep going, so it gets a fresh patience budget rather than
+    # inheriting however close to the limit a prior, separate process
+    # invocation happened to be (and starting from 0 while `step` is
+    # already, say, 4000 would immediately look like a 4000-step-stale
+    # promotion and falsely trigger on the very first eval).
+    last_promotion_step = step
+    early_stopped = False
 
     # THE mechanism that guarantees any future run picks up an existing
     # checkpoint from Config.CHECKPOINT_DIR rather than silently starting
@@ -4063,7 +4098,20 @@ def train(args, log=print):
                 payload["ridge_distill_weight"] = distill_w
             if torch.cuda.is_available():
                 payload["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
-            tel.log(payload)
+            # `step=step` EXPLICITLY -- without it, wandb auto-increments its
+            # own internal step counter by 1 PER CALL, independent of our
+            # real optimizer step. On any step that's also an eval step, this
+            # call AND the eval's tel.log() below both fire, advancing
+            # wandb's internal counter by 2 for that one real step -- over
+            # many eval cycles this drifts wandb's counter ahead of the real
+            # step count, so per_epoch_persistence_report's explicit
+            # `step=int(optimizer_step)` call later ends up logging to a step
+            # BEHIND wandb's already-drifted position, producing "Tried to
+            # log to step N that is less than the current step" warnings
+            # (confirmed happening on real runs, e.g. s8_h9_moreseqs_scaled).
+            # Every tel.log() call in this file must pass the SAME real step
+            # value -- never mix implicit (auto-increment) and explicit.
+            tel.log(payload, step=step)
             flag = ""
             if train_loss > floor:
                 flag = _c(f"  <-- WORSE THAN PREDICTING ZERO ({floor:.6f})", "red")
@@ -4146,7 +4194,12 @@ def train(args, log=print):
             for i in range(0, len(pf), 8):
                 wandb_payload[f"frame_improvement/f{i:02d}"] = pf[i]
             wandb_payload["rollout_rmse_mps"] = m["rollout_mse"] ** 0.5
-            tel.log(wandb_payload)
+            # `step=step` EXPLICITLY -- see the identical comment at the
+            # per-step tel.log(payload, step=step) call above for why mixing
+            # implicit and explicit step= across calls on the same wandb run
+            # drifts wandb's internal counter and causes spurious "step is
+            # less than current step" warnings/dropped data.
+            tel.log(wandb_payload, step=step)
 
             log(f"  [eval] step {step}: val_tf={m['val_tf_loss']:.6f} "
                 f"rollout_mse={m['rollout_mse']:.6f} pers_mse={m['persistence_mse']:.6f} "
@@ -4171,7 +4224,9 @@ def train(args, log=print):
             beats_persistence = m["improvement_pct"] > 0
             is_sane = rollout_rmse < Config.MAX_SANE_ROLLOUT_RMSE_MPS
             promotable = beats_persistence and is_sane
-            if found_new_low and promotable and m["rollout_mse"] < best["promoted_rollout_mse"]:
+            promoted_this_eval = (found_new_low and promotable
+                                   and m["rollout_mse"] < best["promoted_rollout_mse"])
+            if promoted_this_eval:
                 best["promoted_rollout_mse"] = m["rollout_mse"]
                 save_checkpoint(
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_rollout_best.pt"),
@@ -4222,6 +4277,29 @@ def train(args, log=print):
             tel.set_summary("best_rollout_mse", best["rollout_mse"])
             tel.set_summary("best_improvement_pct", best["improvement_pct"])
 
+            if promoted_this_eval:
+                last_promotion_step = step
+            if (Config.EARLY_STOP_PATIENCE_STEPS is not None
+                    and (step - last_promotion_step) >= Config.EARLY_STOP_PATIENCE_STEPS):
+                stalled_steps = step - last_promotion_step
+                stop_reason = (
+                    f"early stop: {stalled_steps} steps "
+                    f"(patience={Config.EARLY_STOP_PATIENCE_STEPS}) since the last new "
+                    f"promoted rollout checkpoint (step {last_promotion_step})")
+                log(_bold(
+                    f"  [early-stop] {stop_reason} -- best.promoted_rollout_mse="
+                    f"{best['promoted_rollout_mse']:.6g} "
+                    f"({best['improvement_pct']:+.2f}% vs persistence). "
+                    f"Stopping at step {step} instead of continuing to "
+                    f"Config.MAX_STEPS={Config.MAX_STEPS}.", "yellow"))
+                early_stopped = True
+                # Same treatment as a MAX_HOURS/MAX_STEPS stop: this
+                # iteration's checkpoint save (right below) and per-epoch
+                # report above are both gated on `hit_budget`, so this
+                # step's state gets saved as a real final state, not
+                # silently dropped between CHECKPOINT_EVERY_STEPS ticks.
+                hit_budget = True
+
         if step % Config.CHECKPOINT_EVERY_STEPS == 0 or hit_budget:
             save_checkpoint(latest_path, model, optimizer, step,
                             {'train_l2': train_loss, 'best': dict(best),
@@ -4237,6 +4315,9 @@ def train(args, log=print):
         if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS:
             stop_reason = f"wall-clock limit ({Config.MAX_HOURS}h)"
             log(f"  [train] stopping: {stop_reason}")
+            break
+
+        if early_stopped:
             break
 
     final = curves[-1] if curves else {}
@@ -4270,7 +4351,14 @@ def train(args, log=print):
         "final_val_tf_loss": last_metrics.get("val_tf_loss"),
     }
 
-    out_json = os.path.join(args.out_dir, f"{Config.ARM}.json")
+    # `run_name` (r{ROUND}_{ARM}), NOT bare Config.ARM -- an earlier
+    # version keyed this on ARM alone, so two ROUNDS of the SAME arm
+    # (e.g. r10/r11/r12 of s7_h9_scaled, run concurrently as an
+    # ablation) silently clobbered each other's final summary here,
+    # leaving only whichever one happened to finish last. Confirmed
+    # losing r11/r12's own stop_reason this way after a real 3-slot
+    # same-arm batch.
+    out_json = os.path.join(args.out_dir, f"{run_name}.json")
     os.makedirs(args.out_dir, exist_ok=True)
     with open(out_json, "w") as f:
         json.dump(result, f, indent=2, default=str)
@@ -4492,6 +4580,22 @@ def build_parser():
     p.add_argument("--max-steps", type=int, default=None)
     p.add_argument("--max-hours", type=float, default=None)
     p.add_argument("--val-every", type=int, default=None)
+    p.add_argument("--early-stop-patience-steps", type=int, default=None,
+                   help="stop after this many STEPS (not evals -- comparable to "
+                        "MAX_STEPS/VAL_EVERY_STEPS, independent of --val-every) "
+                        "with no new PROMOTED rollout checkpoint (beats "
+                        "persistence AND clears the sane-RMS gate AND improves "
+                        "on the best-ever promoted rollout_mse -- the exact "
+                        "_rollout_best.pt condition, not just any self-relative "
+                        "low). Actual granularity is bounded by --val-every "
+                        "(an eval only happens that often); a value smaller than "
+                        "--val-every has no additional effect beyond stopping on "
+                        "the very next non-promoting eval. Default None disables "
+                        "early stopping entirely, unchanged behavior. Added "
+                        "after OVERVIEW.md v6.9/v7.0's finding that every "
+                        "production-scale arm tried so far peaks around step "
+                        "2000-4000 then declines for thousands of further steps "
+                        "while train_loss keeps improving.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--accum", type=int, default=None)
@@ -4579,7 +4683,8 @@ def main(argv=None):
                         ("ACCUMULATION_STEPS", args.accum),
                         ("TRAIN_SUBSET_RATIO", args.subset_ratio),
                         ("VAL_ROLLOUT_SEQS", args.rollout_seqs),
-                        ("DEVICE", args.device)):
+                        ("DEVICE", args.device),
+                        ("EARLY_STOP_PATIENCE_STEPS", args.early_stop_patience_steps)):
         if value is not None:
             setattr(Config, attr, value)
     for item in args.set:

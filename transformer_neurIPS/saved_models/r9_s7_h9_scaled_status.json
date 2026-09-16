@@ -1,0 +1,36 @@
+{
+  "run_name": "r9_s7_h9_scaled",
+  "arm": "s7_h9_scaled",
+  "step": 975,
+  "max_steps": 6000,
+  "wall_seconds": 1795.0512363910675,
+  "eta_hours": 2.5698383085085794,
+  "train_loss_centroid_l2": 0.03160635381937027,
+  "best": {
+    "rollout_mse": 0.002142916840966791,
+    "improvement_pct": 24.646244795126172,
+    "val_tf_mse": 2.1035120967428123,
+    "train_loss": 0.014098026789724827,
+    "promoted_rollout_mse": 0.002142916840966791
+  },
+  "last_eval": {
+    "val_tf_loss": 0.03716251426139998,
+    "val_tf_mse": 2.1035120967428123,
+    "val_sequences_tf": 25410,
+    "rollout_sequences": 64,
+    "frames_scored": 68,
+    "rollout_mse": 0.002142916840966791,
+    "persistence_mse": 0.0028438089586737027,
+    "improvement_pct": 24.646244795126172,
+    "improvement_pct_frame1": -7567.335539279583,
+    "improvement_pct_frame_half": 38.066735840188684,
+    "improvement_pct_frame_last": 41.97190178133068,
+    "rollout_seconds": 17.198500394821167,
+    "step": 500,
+    "train_loss": 0.03978077322244644,
+    "lr": 0.0009927081166089397,
+    "wall_seconds": 1114.8747279644012,
+    "train_val_gap": -0.002618258961046463
+  },
+  "wall_time": "2026-09-15T16:11:05"
+}

@@ -8,15 +8,36 @@
 # while still costing full single-threaded zlib decompression on every
 # load, a bad trade).
 #
-# Default (TRANSFER_METHOD=scp): two CONCURRENT scp processes rather
-# than one after another -- if the bottleneck is per-connection
-# overhead/latency rather than raw link bandwidth, this gets both done
-# in roughly the time of the larger file instead of the sum of both.
+# Each file is split into LANES pieces (default 10) sent via LANES
+# CONCURRENT scp processes, reassembled and verified (size AND sha256)
+# on the far end -- see lib_scp.sh and bench_scp_variants.sh for the
+# full story. CONFIRMED in this session: 10 independent concurrent
+# scp/ssh connections hit 268.3 MB/s raw (iperf3) against this exact
+# pod infrastructure, close to the ~312 MB/s link ceiling -- far above
+# the flat ~85-93 MB/s a croc self-hosted relay topped out at. croc has
+# been dropped from this pipeline entirely: it pays for a PAKE
+# handshake and its own encryption layer ON TOP of the already-
+# encrypted SSH connection for no security benefit here, and its own
+# split-lanes benchmark measured far below plain scp at the same lane
+# count (see bench_croc_variants.sh/bench_scp_variants.sh headers for
+# the comparison, and singleshot/CROC_JOURNEY.md for the original
+# croc investigation this superseded).
 #
-# TRANSFER_METHOD=croc: CONFIRMED faster -- 2.4x the public relay at
-# real 1GB-file scale (singleshot/CROC_JOURNEY.md) -- but sequential
-# per file, not concurrent, since both would otherwise share one
-# relay/tunnel and starve each other (the journey doc's bug #6).
+# The two files' SENDS are still SEQUENTIAL (train_80.h5 fully split-
+# sent, THEN val_80.h5 starts sending), each getting the full LANES
+# upload-bandwidth budget to itself -- NOT two files x LANES lanes each
+# concurrently, which would just reintroduce the same connection-
+# contention problem this design exists to avoid.
+#
+# Reassembly/verification is DIFFERENT: it's remote CPU/disk work (a
+# `cat` + `stat` + `shasum` over ssh) that uses none of the local
+# upload bandwidth the NEXT file's send needs, so there's no reason to
+# block on it. Each file's reassembly/verify runs in the BACKGROUND as
+# soon as its own send finishes, overlapping with the next file's send
+# -- e.g. train_80.h5's ~9.9GB reassembly+sha256 (mostly remote CPU)
+# overlaps with val_80.h5's send (mostly local upload bandwidth)
+# instead of strictly happening before it. Both are awaited (and their
+# pass/fail checked) before this script reports done.
 #
 # USAGE
 # =====
@@ -29,39 +50,15 @@
 #   SSH_KEY       default: ~/.ssh/id_ed25519
 #   REMOTE_ROOT   default: /workspace  -- files land at
 #                 $REMOTE_ROOT/cgan/transformer_neurIPS/data/
-#   TRANSFER_METHOD  "scp" (default) or "croc". croc's DEFAULT public
-#                 relay is NOT what "croc" here means -- see below --
-#                 it self-hosts a relay ON THE POD, reached through an
-#                 SSH tunnel (never a direct connection to the pod's
-#                 public IP -- see lib_croc.sh). CONFIRMED at 1GB real-
-#                 file scale: 2.4x the public relay (93.1 vs 39.4
-#                 MB/s), using croc's own default settings -- see
-#                 singleshot/CROC_JOURNEY.md for the full story,
-#                 including why NOT to override --transfers (going
-#                 from croc's default of 4 real connections to its
-#                 hard-capped max of 8 measured SLOWER, not faster).
-#                 DELIBERATELY NO SCP FALLBACK: if TRANSFER_METHOD=croc
-#                 is requested and any step of it fails, this script
-#                 exits 1 with a diagnosis instead of silently sending
-#                 the same bytes over scp anyway -- a silent fallback
-#                 would hide exactly the signal needed to tell whether
-#                 the self-hosted-relay path is actually working.
-#                 The two files send SEQUENTIALLY under this method
-#                 (unlike the scp path below, which sends them
-#                 concurrently) -- they'd share the one relay/tunnel,
-#                 and CROC_JOURNEY.md's bug #6 confirmed concurrent
-#                 croc transfers sharing one tunnel starve each other
-#                 badly, worse than just doing them one at a time.
-#   CROC_RELAY_PORT  base port for the self-hosted relay (default 9019
-#                 -- deliberately not croc's own default 9009, to avoid
-#                 colliding with anything already using that).
-#   RELAY_TRANSFERS  how many extra ports the relay opens beyond the
-#                 base port (default 8, i.e. 9 ports total -- matches
-#                 croc's own confirmed hard cap of 8 real parallel
-#                 connections per transfer, see lib_croc.sh; opening
-#                 more would be pure waste, per CROC_JOURNEY.md).
-#                 Tunneled entirely through SSH -- no pod port
-#                 exposure needed beyond SSH itself.
+#   LANES         concurrent scp streams PER FILE (default 10 --
+#                 confirmed via iperf3 to approach this pod
+#                 infrastructure's real link ceiling; see lib_scp.sh).
+#                 Files still send one after another, each getting this
+#                 many lanes to itself -- see above for why.
+#   SCP_LANE_TIMEOUT  per-lane hard cutoff in seconds (default 600 --
+#                 generous margin: even train_80.h5's ~9.9GB split 10
+#                 ways is ~1GB/lane, which clears this at any
+#                 throughput above ~1.7 MB/s per lane)
 
 set -euo pipefail
 
@@ -69,25 +66,26 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRANSFORMER_DIR="$(dirname "$HERE")"
 REPO_ROOT="$(dirname "$TRANSFORMER_DIR")"
 
-# lib_croc.sh's functions print progress via these -- this script's own
-# convention is plain, uncolored echo (unlike bench_croc_variants.sh),
+# lib_scp.sh's functions print progress via these -- this script's own
+# convention is plain, uncolored echo (unlike bench_scp_variants.sh),
 # so match that instead of introducing color codes here.
 ok()   { echo "  [OK] $1"; }
 warn() { echo "  [WARN] $1"; }
 err()  { echo "  [FAIL] $1" >&2; }
 info() { echo "  [..] $1"; }
 
-# shellcheck source=./lib_croc.sh
-source "$HERE/lib_croc.sh"
+# shellcheck source=./lib_common.sh
+source "$HERE/lib_common.sh"
+# shellcheck source=./lib_scp.sh
+source "$HERE/lib_scp.sh"
 
 POD_HOST="${POD_HOST:-}"
 POD_PORT="${POD_PORT:-22}"
 POD_USER="${POD_USER:-root}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 REMOTE_ROOT="${REMOTE_ROOT:-/workspace}"
-TRANSFER_METHOD="${TRANSFER_METHOD:-scp}"
-CROC_RELAY_PORT="${CROC_RELAY_PORT:-9019}"
-RELAY_TRANSFERS="${RELAY_TRANSFERS:-8}"
+LANES="${LANES:-10}"
+SCP_LANE_TIMEOUT="${SCP_LANE_TIMEOUT:-600}"
 
 if [[ -z "$POD_HOST" ]]; then
   echo "POD_HOST is required, e.g.: POD_HOST=1.2.3.4 POD_PORT=22222 bash $0" >&2
@@ -123,114 +121,66 @@ SCP_OPTS=(-P "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new)
 REMOTE_DATA_DIR="$REMOTE_ROOT/cgan/transformer_neurIPS/data"
 ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "mkdir -p '$REMOTE_DATA_DIR'"
 
-# Safety net for an interrupted run (Ctrl-C mid-transfer, etc.) -- both
-# functions are no-ops if TRANSFER_METHOD=scp never set RELAY_PID/
-# TUNNEL_PID in the first place.
-trap 'croc_tunnel_stop; croc_relay_stop' EXIT
+echo "Sending train_80.h5, then val_80.h5, each via $LANES concurrent scp"
+echo "streams (sends are sequential per file; each file's reassembly/"
+echo "verify overlaps with the NEXT file's send instead of blocking it"
+echo "-- see this script's header for why that's safe)..."
+echo ""
 
-croc_fail() {
-  echo "" >&2
-  echo "==================================================================" >&2
-  echo " TRANSFER_METHOD=croc FAILED -- $1" >&2
-  echo "==================================================================" >&2
-  echo "$2" >&2
-  echo "" >&2
-  echo "NOT falling back to scp (by design -- see this script's header" >&2
-  echo "comment). Re-run with TRANSFER_METHOD=scp if you want the data" >&2
-  echo "moved right now regardless; otherwise fix the issue above first." >&2
-  croc_tunnel_stop
-  croc_relay_stop
-  exit 1
+# reassemble_verify_async REMOTE_FILENAME SCRATCH BYTES SHA PIECES_DIR OUTVAR_PID
+# Backgrounds scp_reassemble_verify, tagging its output so it stays
+# distinguishable from whatever the next file's send is printing at the
+# same time. `set -o pipefail` INSIDE the subshell (not just this
+# script's own top-level `set -euo pipefail`) makes the subshell's own
+# exit status reflect scp_reassemble_verify's real result rather than
+# `awk`'s (which basically never fails) -- same pattern, and the same
+# reason, as provision_and_run.sh's launch_training.
+reassemble_verify_async() {
+  local remote_filename="$1" scratch="$2" bytes="$3" sha="$4" pieces_dir="$5" outvar="$6"
+  local tag="[reassemble $remote_filename]"
+  (
+    set -o pipefail
+    scp_reassemble_verify "$REMOTE_DATA_DIR" "$remote_filename" "$scratch" "$bytes" "$sha" "$pieces_dir" \
+      2>&1 | awk -v tag="$tag" '{print tag, $0; fflush()}'
+  ) &
+  eval "$outvar=\$!"
 }
 
-if [[ "$TRANSFER_METHOD" == "croc" ]]; then
-  echo "TRANSFER_METHOD=croc -- self-hosted relay via SSH tunnel, sequentially"
-  echo "per file (no scp fallback). See CROC_JOURNEY.md for why: confirmed"
-  echo "2.4x the public relay at 1GB scale (93.1 vs 39.4 MB/s)."
-  echo ""
-  croc_require_local_binary
-  croc_ensure_installed_remote
-  croc_ensure_classic_mode_remote
-  croc_relay_start "$CROC_RELAY_PORT" "$RELAY_TRANSFERS"
-  croc_tunnel_start "$CROC_RELAY_PORT" "$RELAY_TRANSFERS"
+TRAIN_SCRATCH=""; TRAIN_PIECES=""; TRAIN_BYTES=""; TRAIN_SHA=""; TRAIN_VERIFY_PID=""
+VAL_SCRATCH=""; VAL_PIECES=""; VAL_BYTES=""; VAL_SHA=""; VAL_VERIFY_PID=""
 
-  for f in "${FILES[@]}"; do
-    src_path="$REPO_ROOT/transformer_neurIPS/data/$f"
-    expected_bytes="$(stat -f%z "$src_path" 2>/dev/null || stat -c%s "$src_path")"
-    echo "  [croc] sending $f ($expected_bytes bytes)..."
-    slog="$(mktemp)"
-    # No --transfers override on either side -- croc's own default (4
-    # real connections) is the CONFIRMED-fastest setting at real file
-    # size; going to its hard-capped max of 8 measured SLOWER, not
-    # faster (CROC_JOURNEY.md's "second wall" section).
-    croc_send "--relay localhost:$CROC_RELAY_PORT" "" "--no-local" "$src_path" "$slog"
-    send_pid=$!
-    code="$(croc_parse_code_from_log "$slog" 30)"
-    if [[ -z "$code" ]]; then
-      send_output="$(cat "$slog")"
-      kill "$send_pid" 2>/dev/null || true
-      rm -f "$slog"
-      croc_fail "$f: croc send never printed a code within 30s" "$send_output"
-    fi
-    rlog="$(mktemp)"
-    croc_receive 300 "$REMOTE_DATA_DIR" "$f" "--relay localhost:$CROC_RELAY_PORT" "" \
-      "$code" "$rlog" "$expected_bytes"
-    if grep -q "RC=0 " "$rlog" && grep -q "SIZE_OK" "$rlog"; then
-      elapsed="$(grep -oE 'ELAPSED=[0-9]+' "$rlog" | head -1 | cut -d= -f2)"
-      [[ -z "$elapsed" || "$elapsed" == "0" ]] && elapsed=1
-      mb_per_s=$(awk -v b="$expected_bytes" -v s="$elapsed" 'BEGIN{printf "%.1f", (b/1048576)/s}')
-      echo "  [croc] $f: OK -- ${elapsed}s, ${mb_per_s} MB/s, size verified"
-    else
-      recv_output="$(cat "$rlog")"
-      kill "$send_pid" 2>/dev/null || true
-      rm -f "$slog" "$rlog"
-      croc_fail "$f: receive failed, timed out, or size mismatch" "$recv_output"
-    fi
-    kill "$send_pid" 2>/dev/null || true
-    rm -f "$slog" "$rlog"
-  done
-  croc_tunnel_stop
-  croc_relay_stop
-  echo ""
-else
-  echo "Sending train_80.h5 and val_80.h5 via scp, concurrently..."
-  echo ""
-
-  pids=()
-  for f in "${FILES[@]}"; do
-    (
-      scp "${SCP_OPTS[@]}" "$REPO_ROOT/transformer_neurIPS/data/$f" \
-        "$POD_USER@$POD_HOST:$REMOTE_DATA_DIR/"
-    ) &
-    pids+=("$!")
-  done
-
-  fail=0
-  for pid in "${pids[@]}"; do
-    wait "$pid" || fail=1
-  done
-  if [[ "$fail" -ne 0 ]]; then
-    echo "" >&2
-    echo "At least one transfer failed -- re-run this script (scp overwrites" >&2
-    echo "partial files on retry, it does not resume them)." >&2
-    exit 1
-  fi
+echo "  [scp] sending train_80.h5 via $LANES concurrent streams..."
+if ! scp_send_pieces "$REPO_ROOT/transformer_neurIPS/data/train_80.h5" "$REMOTE_DATA_DIR" \
+    "$LANES" "$SCP_LANE_TIMEOUT" TRAIN_SCRATCH TRAIN_PIECES TRAIN_BYTES TRAIN_SHA; then
+  echo "" >&2
+  echo "train_80.h5 failed to send -- re-run this script (scp overwrites" >&2
+  echo "partial files on retry, it does not resume them)." >&2
+  exit 1
 fi
+reassemble_verify_async "train_80.h5" "$TRAIN_SCRATCH" "$TRAIN_BYTES" "$TRAIN_SHA" "$TRAIN_PIECES" TRAIN_VERIFY_PID
+
+echo "  [scp] sending val_80.h5 via $LANES concurrent streams (train_80.h5's"
+echo "        reassembly/verify above is running concurrently with this)..."
+if ! scp_send_pieces "$REPO_ROOT/transformer_neurIPS/data/val_80.h5" "$REMOTE_DATA_DIR" \
+    "$LANES" "$SCP_LANE_TIMEOUT" VAL_SCRATCH VAL_PIECES VAL_BYTES VAL_SHA; then
+  echo "" >&2
+  echo "val_80.h5 failed to send -- re-run this script (scp overwrites" >&2
+  echo "partial files on retry, it does not resume them)." >&2
+  wait "$TRAIN_VERIFY_PID" || true
+  exit 1
+fi
+reassemble_verify_async "val_80.h5" "$VAL_SCRATCH" "$VAL_BYTES" "$VAL_SHA" "$VAL_PIECES" VAL_VERIFY_PID
 
 echo ""
-echo "Verifying sizes on both ends..."
-for f in "${FILES[@]}"; do
-  local_size="$(stat -f%z "$REPO_ROOT/transformer_neurIPS/data/$f" 2>/dev/null || stat -c%s "$REPO_ROOT/transformer_neurIPS/data/$f" 2>/dev/null)"
-  remote_size="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" \
-    "stat -c%s '$REMOTE_DATA_DIR/$f' 2>/dev/null || stat -f%z '$REMOTE_DATA_DIR/$f'")"
-  if [[ "$local_size" != "$remote_size" ]]; then
-    echo "  SIZE MISMATCH on $f: local=$local_size remote=$remote_size" >&2
-    exit 1
-  fi
-  echo "  OK -- $f ($remote_size bytes)"
-done
+echo "Waiting for both files' reassembly/verification to finish..."
+TRAIN_OK=1; wait "$TRAIN_VERIFY_PID" || TRAIN_OK=0
+VAL_OK=1; wait "$VAL_VERIFY_PID" || VAL_OK=0
 
 echo ""
+if [[ "$TRAIN_OK" != "1" || "$VAL_OK" != "1" ]]; then
+  echo "AT LEAST ONE FILE FAILED reassembly/verification -- see errors above." >&2
+  echo "Re-run this script (scp overwrites partial files on retry, it does" >&2
+  echo "not resume them)." >&2
+  exit 1
+fi
 echo "Done. Data files are at ${REMOTE_DATA_DIR}/."
-echo "If bootstrap_remote.sh (phase 1's follow-up) has already finished in"
-echo "your other session, you're ready to smoke-test / launch training."

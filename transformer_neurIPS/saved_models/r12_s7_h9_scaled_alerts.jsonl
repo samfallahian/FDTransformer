@@ -1,0 +1,1 @@
+{"step": 500, "type": "rollout_not_promoted", "rollout_mse": 0.004490748910671648, "rollout_rmse_mps": 0.06701305030120362, "improvement_pct": -57.91317122043649, "beats_persistence": false, "is_sane": true, "reason": "loses to persistence (-57.91%)", "wall_time": "2026-09-15T21:59:39"}

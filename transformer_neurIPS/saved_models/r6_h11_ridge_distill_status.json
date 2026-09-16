@@ -1,0 +1,36 @@
+{
+  "run_name": "r6_h11_ridge_distill",
+  "arm": "h11_ridge_distill",
+  "step": 3350,
+  "max_steps": 6000,
+  "wall_seconds": 1798.4196195602417,
+  "eta_hours": 0.3951751237010481,
+  "train_loss_centroid_l2": 0.01198455411940813,
+  "best": {
+    "rollout_mse": 0.001784114066086819,
+    "improvement_pct": 37.2632236417341,
+    "val_tf_mse": 2.1747203706615976,
+    "train_loss": 0.007297106247278862,
+    "promoted_rollout_mse": 0.001784114066086819
+  },
+  "last_eval": {
+    "val_tf_loss": 0.01694101582184897,
+    "val_tf_mse": 2.2164792138542166,
+    "val_sequences_tf": 25410,
+    "rollout_sequences": 64,
+    "frames_scored": 68,
+    "rollout_mse": 0.002051850610501681,
+    "persistence_mse": 0.0028438089586737027,
+    "improvement_pct": 27.848507385773573,
+    "improvement_pct_frame1": -2127.228540395979,
+    "improvement_pct_frame_half": 35.94015813275252,
+    "improvement_pct_frame_last": 28.751198293059986,
+    "rollout_seconds": 6.307164192199707,
+    "step": 3000,
+    "train_loss": 0.010380968451499939,
+    "lr": 0.0005337954888360798,
+    "wall_seconds": 1546.2169897556305,
+    "train_val_gap": 0.006560047370349032
+  },
+  "wall_time": "2026-09-15T14:55:02"
+}

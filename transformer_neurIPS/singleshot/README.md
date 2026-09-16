@@ -15,12 +15,13 @@ inside named `screen` sessions over a SINGLE SSH connection -- see
 |---|---|
 | `provision_and_run.sh` | Run **locally**. The full lifecycle in one command: create a pod via `runpodctl`, wait for SSH, send env files, bootstrap the pod WHILE the data files transfer in the background, run a time-boxed training job, pull the new artifacts back (retried a few times, with progress printed for every attempt), terminate the pod -- but only if that pull-back actually succeeded; a genuine failure (as opposed to "no files matched") leaves the pod running rather than risk deleting undelivered results (`FORCE_TERMINATE_ON_PULL_FAILURE=1` overrides this). See "Fully automated lifecycle" below. |
 | `scp_env_files.sh` | Run **locally**. Phase 1: sends code, the recovered checkpoint(s) (including the MPS baseline for Experiment A below), the ridge map, the AE decoder, and this directory's own `requirements.txt`/`bootstrap_remote.sh` -- everything except the large data files. Small, finishes in seconds. |
-| `scp_data_files.sh` | Run **locally**. Phase 2: sends `train_80.h5` (~9.2G) and `val_80.h5` (~3.9G) as two concurrent `scp` processes. Independent of phase 1 -- run it any time before, during, or after phase 1. Both files are stored uncompressed (`decompress_h5.py`, see below) -- slightly larger on disk/wire, but no more single-threaded gzip decompression cost on every load. |
-| `bootstrap_remote.sh` | Run **on the pod** (normally inside the `bootstrap` screen, see below). Creates a venv, installs pinned deps + `mc` (midnight commander) + `screen` + `croc` + the correct CUDA **stable** (not nightly) torch build, then stops and prints the `wandb login` step for you to run yourself -- never called non-interactively past that point unless `WANDB_API_KEY` is set. Only needs phase 1's files -- can run while phase 2 is still transferring. |
+| `scp_data_files.sh` | Run **locally**. Phase 2: splits `train_80.h5` (~9.9G) and `val_80.h5` (~4.2G) into `LANES` pieces each (default 10) and sends them sequentially per file, `LANES` pieces concurrently within each file, via plain `scp`/ssh -- **confirmed** to hit 268.3 MB/s raw at 10 lanes (iperf3), close to this link's ~312 MB/s ceiling. Verifies size AND sha256 on reassembly. Independent of phase 1 -- run it any time before, during, or after phase 1. Both files are stored uncompressed (`decompress_h5.py`, see below) -- slightly larger on disk/wire, but no more single-threaded gzip decompression cost on every load. |
+| `bootstrap_remote.sh` | Run **on the pod** (normally inside the `bootstrap` screen, see below). Creates a venv, installs pinned deps + `mc` (midnight commander) + `screen` + the correct CUDA **stable** (not nightly) torch build. Does NOT run `wandb login` for you if run standalone/by hand -- but `provision_and_run.sh --wandb=KEY` handles that non-interactively itself right before launching training, no manual step needed on that path. Only needs phase 1's files -- can run while phase 2 is still transferring. |
 | `requirements.txt` | Copy of `/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/requirements_sweep.txt` (the verified-minimal dependency set), kept self-contained here. |
-| `lib_croc.sh` | Sourceable library ("the reusable class" -- see its own header for why that phrase and not literally a class) of every proven-correct croc operation: remote install, classic-mode setup, self-hosted relay start/stop, SSH-tunnel start/stop, send/receive with size verification. `source` this rather than reimplementing any of it -- see `CROC_JOURNEY.md` for exactly how many real bugs that reimplementation risk already caused. |
-| `bench_croc_variants.sh` | Run **locally**. Spins up a cheap throwaway pod, benchmarks croc's public relay (running concurrently, its own separate network path) against several self-hosted-relay-via-SSH-tunnel settings (run sequentially against EACH OTHER -- they share one tunnel, and running them concurrently at real file sizes starves all of them), prints a live-refreshing colored status table. Uses `lib_croc.sh`. See `CROC_JOURNEY.md` for the full story and confirmed results: **2.4x at real 1GB-file scale**, now wired into `scp_data_files.sh`. 1GB/s+ is still the open target. |
-| `CROC_JOURNEY.md` | Rich narrative writeup of the croc self-hosted-relay investigation -- six real pod rentals, five real bugs, the RunPod custom-TCP-port wall, and the SSH-tunnel fix that actually worked. Read this before touching `lib_croc.sh`/`bench_croc_variants.sh` again. |
+| `lib_common.sh` | Sourceable library of generic helpers (currently just `run_with_timeout`) with no dependency on any particular transfer method. |
+| `lib_scp.sh` | Sourceable library of the parallel-scp split/send/reassemble/verify logic (`scp_send_split`) -- the actual production data-transfer mechanism, used by both `scp_data_files.sh` (the real thing) and `bench_scp_variants.sh` (the benchmark/smoke-test), so the two can't drift apart. |
+| `bench_scp_variants.sh` | Run **locally**. Defaults to a LOCAL smoke test (no pod, no cost) against `localhost` via a real ssh connection, validating the split/concurrent-launch/reassemble/verify logic; point it at a real pod (`POD_HOST=...`) to benchmark for real. See its header for the full croc-vs-scp comparison story. |
+| `lib_croc.sh` / `bench_croc_variants.sh` / `CROC_JOURNEY.md` | **Historical -- croc has been dropped from this pipeline entirely.** croc's own split-lanes phase measured far below plain scp at the same lane count (PAKE handshake + its own encryption layer on top of the already-encrypted SSH connection, for no security benefit here). Kept only as a record of that investigation and for `bench_croc_variants.sh` if you ever want to re-confirm the comparison; `bootstrap_remote.sh` no longer installs croc, and neither `scp_data_files.sh` nor `provision_and_run.sh` reference it. |
 
 ## Why not a tarball
 
@@ -180,11 +181,12 @@ directly comparable to both `h9` (no distillation) and `h10`
 costs little before ever considering scaling it.
 
 **If you're watching the console output live**: right after bootstrap
-finishes, you'll see `bootstrap_remote.sh`'s standalone-usage message
-("Two manual steps left: 1) wandb login, 2) smoke-test/launch") --
-**ignore it and don't interrupt anything.** That text always prints
-(it's shared with the manual workflow below), but in this automated
-path the pipeline does not actually stop there.
+finishes, you'll see `bootstrap_remote.sh` print a note about logging in
+to wandb yourself -- that note is scoped to running `bootstrap_remote.sh`
+standalone/by hand. In this automated path, passing `--wandb=KEY` (or
+`WANDB_API_KEY=KEY`) to `provision_and_run.sh` already handles wandb
+login non-interactively, right before training launches -- **ignore
+that note and don't interrupt anything.**
 
 ### What you do vs. what the script does
 
@@ -192,22 +194,24 @@ You do exactly one thing before running it (the API key, above), and
 run exactly one command. Everything else happens automatically:
 
 1. create pod, wait for SSH
-2. send env files (phase 1)
-3. **in parallel**: send data files (phase 2, background) WHILE
-   bootstrapping the pod (venv, deps, stable torch) over a second
-   connection
-4. wait for the data transfer to finish, then run training, capped at
+2. **in parallel**: send data files (phase 2, background, starts
+   IMMEDIATELY -- it only needs SSH, no dependency on phase 1) WHILE
+   sending env files (phase 1) THEN bootstrapping the pod (venv, deps,
+   stable torch) over a second connection -- bootstrap itself DOES need
+   phase 1 done first, since `bootstrap_remote.sh`/`requirements.txt`
+   are among the files phase 1 ships
+3. wait for the data transfer to finish, then run training, capped at
    30 min AND 2500 steps
-5. **rsync the new checkpoint + logs back to this machine** -- automatic,
+4. **rsync the new checkpoint + logs back to this machine** -- automatic,
    not a step you do afterward
-6. **terminate the pod** (`runpodctl pod delete`) -- also automatic,
-   right after step 5, unless `KEEP_POD=1`
+5. **terminate the pod** (`runpodctl pod delete`) -- also automatic,
+   right after step 4, unless `KEEP_POD=1`
 
 **This is not a background/fire-and-forget job.** Your machine has to
 stay connected and the script has to keep running for the whole
-duration. The parallelism in step 3 shortens the wall-clock cost
-somewhat (bootstrap and the ~11GB data transfer overlap instead of
-stacking), but total wall time is still meaningfully longer than 30
+duration. The parallelism in step 2 shortens the wall-clock cost
+somewhat (env files, bootstrap, and the ~14GB data transfer all overlap
+instead of stacking), but total wall time is still meaningfully longer than 30
 minutes -- add however long the data transfer takes on your connection,
 plus a few minutes of pod boot.
 
@@ -221,11 +225,18 @@ script's linear order) -- the pod still gets deleted, but that run's
 results would be lost with it. Set `KEEP_POD=1` if you'd rather recover
 manually than risk that.
 
-Every knob is an env var -- different arm, different budget, different
-GPU, reuse an existing pod, or keep the pod alive after the run for
-debugging. See the script's own header comment for the full list
-(`ARM`, `MAX_HOURS`, `MAX_STEPS`, `GPU_ID`, `TEMPLATE_ID`, `IMAGE`,
-`POD_ID`, `KEEP_POD`, `WANDB_API_KEY`, ...). Pod image defaults to the
+Most knobs are env vars; `--wandb=KEY`, `--round=N`, `--arm=NAME`, and
+`--fresh` are also available as CLI flags (equivalent to `WANDB_API_KEY`,
+`ROUND`, `ARM`, and `FRESH=1` respectively) -- different arm, different
+round/budget, different GPU, reuse an existing pod, or keep the pod
+alive after the run for debugging. e.g. to run `h11_ridge_distill`'s
+cold-start control (exp-b) with wandb telemetry, all in one command:
+```bash
+bash singleshot/provision_and_run.sh --wandb=abc123yourkeyhere --round=3 --fresh
+```
+See the script's own header comment for the full list (`ARM`, `ROUND`,
+`FRESH`, `MAX_HOURS`, `MAX_STEPS`, `GPU_ID`, `TEMPLATE_ID`, `IMAGE`,
+`POD_ID`, `KEEP_POD`, `WANDB_API_KEY`, `LANES`, ...). Pod image defaults to the
 `runpod-torch-v280` template (verified via `runpodctl template search
 pytorch` to actually exist -- `bootstrap_remote.sh` installs its own
 venv + torch on top regardless, so any real, working CUDA+Python3
@@ -235,9 +246,17 @@ first with `runpodctl template search <name>` or `runpodctl template
 list --type official`.
 
 **wandb**: unattended by design, so this can't do an interactive
-`wandb login`. Without `WANDB_API_KEY` set, the run passes `--no-wandb`.
-Set `WANDB_API_KEY=<key>` (same "never in chat" rule as the RunPod key)
-to get telemetry for this run via wandb's own non-interactive login path.
+`wandb login`. Without `WANDB_API_KEY`/`--wandb=KEY` set, the run passes
+`--no-wandb`. Pass `--wandb=KEY` on the command line (unquoted, e.g.
+`--wandb=abc123`) or set `WANDB_API_KEY=<key>` as an env var instead if
+you'd rather it not sit in shell history -- either way, the key is
+`export`ed into the remote training script's own environment, which the
+wandb SDK reads directly at `wandb.init()` time. (An earlier version of
+this only exported the key for a separate `wandb login --relogin`
+command, which didn't persist far enough for the actual `python`
+process to see it -- confirmed the hard way via a real failed run:
+"wandb: ERROR ... No API key configured" despite the key being passed.
+Fixed by exporting it for the whole remote script instead.)
 
 **Honesty note on the RunPod JSON parsing**: `provision_and_run.sh`'s
 parsing of `gpu list` / `pod create` / `ssh info` JSON output tries
@@ -327,33 +346,27 @@ a Claude Code session instead of via these scripts.
 
 `scp` (what these scripts use) needs no setup beyond SSH access and
 works with any provider, not just RunPod -- that's why it's the default
-here. `croc` is now pre-installed on the pod by `bootstrap_remote.sh`
-(right after the `apt-get update`/`mc`/`screen` step), so it's ready to
-use with zero extra setup on either the outbound (pushing data to a
-fresh pod) or inbound (pulling checkpoints/results back before
-terminating a pod) direction. A few alternatives, roughly fastest to
-slowest for the ~11.3GB `train_80.h5`+`val_80.h5` pair specifically:
+here, split into `LANES` (default 10) concurrent streams per file. This
+is now the **confirmed-fastest** option measured against this
+infrastructure: 268.3 MB/s raw at 10 independent concurrent connections
+(iperf3), close to the ~312 MB/s real link ceiling -- see
+`bench_scp_variants.sh`. A few alternatives, for context:
 
-1. **`croc`**, self-hosted relay, tunneled through SSH -- **confirmed
-   at real 1GB-file scale and wired into production**: 2.4x the public
-   relay (93.1 vs 39.4 MB/s), using croc's own default settings (going
-   beyond them, e.g. `--transfers 8`, measured SLOWER, not faster --
-   don't). Full story -- seven real pod rentals, six real bugs, the
-   RunPod networking wall that forced the SSH-tunnel approach, and the
-   "100 workers" plan that turned out to be wrong (croc hard-caps real
-   parallel connections at 8, confirmed from its own source) -- is
-   written up in [`CROC_JOURNEY.md`](CROC_JOURNEY.md); the reusable,
-   tested implementation is [`lib_croc.sh`](lib_croc.sh), used by both
-   `bench_croc_variants.sh` (the benchmark) and `scp_data_files.sh`'s
-   `TRANSFER_METHOD=croc` path (the real thing, sending `train_80.h5`/
-   `val_80.h5` sequentially to avoid the tunnel-sharing contention
-   `CROC_JOURNEY.md` documents). croc's DEFAULT *public* relay
-   (`schollz`'s, no extra setup) measured ~18-41 MB/s across every real
-   run so far -- matching the exact ceiling seen on `train_80.h5`
-   uploads regardless of local link speed -- so it is NOT what "croc"
-   should mean for a large transfer; always self-host per
-   `lib_croc.sh`. **Still open**: the real target is 1GB/s+, and 93.1
-   MB/s isn't there yet -- see `CROC_JOURNEY.md`'s "What's still open."
+1. **`croc`, self-hosted relay, tunneled through SSH -- TRIED AND
+   DROPPED.** Was briefly the production default (2.4x the public relay
+   at real 1GB-file scale, 93.1 vs 39.4 MB/s), but its own split-lanes
+   phase (real file, N independent relay+tunnel pairs) measured far
+   below plain scp at the same lane count: it pays for a PAKE handshake
+   and its own encryption layer ON TOP of the already-encrypted SSH
+   connection, for no security benefit on a link you already control via
+   SSH, plus compression/hashing overhead scp doesn't have. `bootstrap_
+   remote.sh` no longer installs it, and neither `scp_data_files.sh` nor
+   `provision_and_run.sh` reference it. Kept for the record: the full
+   investigation (seven real pod rentals, six real bugs, the RunPod
+   networking wall that forced the SSH-tunnel approach) is in
+   [`CROC_JOURNEY.md`](CROC_JOURNEY.md); the implementation is
+   [`lib_croc.sh`](lib_croc.sh)/`bench_croc_variants.sh`, both historical
+   now.
 2. **`runpodctl send` / `runpodctl receive`** -- RunPod's own tool
    (also built on `croc`, same relay network): NAT traversal + relay,
    no SSH key/port juggling. Already installed locally at

@@ -61,6 +61,45 @@ FILES=(
   # Only the plain state-dict is needed -- load_resume_checkpoint() never
   # reads the _scripted twin, so it's deliberately not listed here.
   "transformer_neurIPS/saved_models/r2_h11_ridge_distill_latest.pt:transformer_neurIPS/saved_models"
+  # s8_h9_moreseqs_scaled, the standing production candidate (OVERVIEW.md
+  # v3.x/v6.7 -- v3_h9_moreseqs's exact config at production scale): this
+  # is its last known checkpoint, step 4000/45000 (+22-27%, noisy, never
+  # completed). Resuming with --round 2 --max-steps 45000 continues from
+  # here rather than restarting from scratch. Plain state-dict only, same
+  # reason as h11 above.
+  "transformer_neurIPS/saved_models/r2_s8_h9_moreseqs_scaled_latest.pt:transformer_neurIPS/saved_models"
+  # s7_h9_scaled, round 5: h9_ar_freq1's exact config, a clean/unconfounded
+  # cold-start production-scale run (started this session -- the earlier
+  # round-2 confounded number came from an accidental cold-restart glued
+  # onto a resumed run). Currently the strongest live lead (+40.2% at just
+  # step 2425/20000). Resume target for continuing it further.
+  "transformer_neurIPS/saved_models/r5_s7_h9_scaled_latest.pt:transformer_neurIPS/saved_models"
+  # ROUND 6 for both s8 and h11 -- NOT their `_latest.pt` progress, their
+  # `_best.pt` (the checkpoint actually keyed to peak rollout performance,
+  # never re-derived once training moved past that point). Both r2 runs
+  # showed the SAME pattern: train_loss kept improving while the actual
+  # rollout-vs-persistence metric got steadily WORSE the longer they ran
+  # (s8: 28.5% best -> 16.4% latest at step 6500; h11: 37.3% best,
+  # unchanged since step 2500 -> 23.3% latest at step 5000) -- textbook
+  # overfitting/rollout-drift, and every resume so far has been
+  # continuing from the increasingly-degraded `_latest.pt`, not the true
+  # peak. Round 6 resumes from each arm's actual best instead, to see
+  # whether continuing from the peak (rather than past it) can push
+  # further without the same drift.
+  "transformer_neurIPS/saved_models/r6_s8_h9_moreseqs_scaled_latest.pt:transformer_neurIPS/saved_models"
+  "transformer_neurIPS/saved_models/r6_h11_ridge_distill_latest.pt:transformer_neurIPS/saved_models"
+  # Rounds 7/8/9: s7_h9_scaled x3, FRESH cold starts, identical config
+  # except WD/dropout 0 / 0.05 / 0.10 -- a controlled A/B/C testing
+  # whether regularization prevents the overfitting/rollout-drift
+  # pattern common to every arm tried so far (OVERVIEW.md v6.9). Only
+  # reached step ~900-1000 of 6000 in the first 0.5h window (3-way
+  # same-arm GPU contention costs ~2.4x the throughput of 3 different
+  # arms, v6.9 section 39.1) -- these resume targets continue that same
+  # comparison, NOT restart it; --max-steps must stay 6000 on every
+  # future resume too (v6.7's LR-schedule-on-resume bug).
+  "transformer_neurIPS/saved_models/r7_s7_h9_scaled_latest.pt:transformer_neurIPS/saved_models"
+  "transformer_neurIPS/saved_models/r8_s7_h9_scaled_latest.pt:transformer_neurIPS/saved_models"
+  "transformer_neurIPS/saved_models/r9_s7_h9_scaled_latest.pt:transformer_neurIPS/saved_models"
   "transformer_neurIPS/saved_models/ridge_frame_map.pt:transformer_neurIPS/saved_models"
   "encoder/autoencoderGEN3/saved_models_production/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt:encoder/autoencoderGEN3/saved_models_production"
   "transformer_neurIPS/singleshot/requirements.txt:transformer_neurIPS/singleshot"

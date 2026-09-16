@@ -4537,3 +4537,578 @@ tunnels, reassemble), not yet designed. See `CROC_JOURNEY.md`'s
 ### 36.1 What v6.6 does NOT change
 
 - `WANDB_PROJECT` stays `NI_Review_v6`.
+
+## 37. v6.7 -- croc dropped for plain parallel scp, `h11_ridge_distill` gets its first clean CUDA numbers, and a first-rollout-frame anomaly worth a dedicated look
+
+Four things landed together this session, in order:
+
+**Transfer pipeline: croc dropped entirely, plain scp is now the sole
+method.** v6.6's confirmed 93.1 MB/s (2.4x) via croc's self-hosted
+relay turned out not to be the ceiling -- an `iperf3` diagnostic
+(raw network/SSH capacity, no croc in the loop at all) showed 10
+genuinely independent concurrent SSH tunnels hit **268.3 MB/s**, close
+to this link's real ~312 MB/s ceiling. Trying the same 10-lane
+approach with actual croc file transfers (split file, N independent
+relay+tunnel pairs) measured far below that iperf3 number -- croc pays
+for a PAKE handshake and its own encryption layer on top of the
+already-encrypted SSH connection (zero security benefit on a link you
+already control via SSH), plus optional compression/hashing overhead
+iperf3 never exercises. Plain parallel `scp` (no relay, one encryption
+layer, each invocation its own independent ssh connection with no
+manual tunnel setup needed) was tried instead and confirmed to reach
+that same ~268 MB/s number on a real file, with both size AND sha256
+verified on reassembly (croc's own check was size-only). `croc` has
+now been removed from the live pipeline entirely: `bootstrap_remote.sh`
+no longer installs it, `scp_data_files.sh` is scp-only (10 concurrent
+lanes per file, files sent sequentially so each gets the full lane
+budget), and `provision_and_run.sh` no longer references
+`TRANSFER_METHOD`/`CROC_RELAY_PORT`. `lib_croc.sh`/
+`bench_croc_variants.sh`/`CROC_JOURNEY.md` are kept only as a record of
+that investigation.
+
+**`provision_and_run.sh` is now a real single-command master script,**
+with CLI flags (`--wandb=KEY`, `--round=N`, `--arm=NAME`, `--fresh`)
+instead of env-var-only wiring, so a full provision -> transfer ->
+bootstrap -> train -> pull-back run (including `h11_ridge_distill`'s
+cold-start control arm) is one command:
+```bash
+bash singleshot/provision_and_run.sh --wandb=<key> --round=3 --fresh
+```
+Also fixed a real non-interactive-wandb bug found via an actual failed
+run (`wandb: ERROR ... No API key configured` despite `--wandb=KEY`
+being passed): the old code ran `WANDB_API_KEY='key' wandb login
+--relogin`, which only sets that env var for the `wandb login` command
+ITSELF, not for the `python` training process launched afterward in
+the same remote script. Fixed by `export`ing `WANDB_API_KEY` for the
+whole remote script instead -- the wandb SDK reads it directly at
+`wandb.init()` time, no separate login step needed.
+
+**`h11_ridge_distill` finally has clean, post-v6.5-fix CUDA numbers.**
+Two full 2500-step runs, both via the fixed `provision_and_run.sh`:
+
+| | round 2 (`exp-a`, warm-started from `r2_h11_ridge_distill_latest.pt`) | round 3 (`exp-b`, cold-start, `--fresh --no-warm-start`) |
+|---|---|---|
+| `improvement_pct` (best) | **+37.26%** | **+29.97%** |
+| `rollout_mse` (best) | 0.001784 | 0.001992 |
+| wall time | 1235s | 1287s |
+
+Warm-starting gave a real but modest ~7-point edge over cold-starting
+at the same 2500-step budget -- not nothing, but not dramatic. Neither
+number beats `h9_ar_freq1`'s own +43.78% or `v3_h9_moreseqs`'s +46.49%
+(both shallow, ~300-400 step screens, so not a fully fair comparison at
+2500 steps) -- h11's added AR-curriculum + ridge-rollout-distillation
+machinery on top of h9's config does not yet show a clear win over the
+simpler config at a longer budget. Round 3's early steps DID hit the
+`NaN`-rollout failure mode predicted in this same session (a
+freshly-initialized model fed autoregressively into itself can blow up
+before gradients stabilize it, and the `best` dict's `<`/`>` comparison
+against its own `inf`/`-inf` sentinels silently never fires when the
+left side is `NaN`) -- confirmed via the pulled-back `status.json` that
+this was **transient, not persistent**: final `best.rollout_mse`/
+`improvement_pct` are real finite numbers, so the run's result is
+trustworthy. The `wandb.Artifact(metadata=...)` JSON-serialization
+crash this caused on an early checkpoint (`Out of range float values
+are not JSON compliant: inf`) is still queued as a fix -- sanitize
+non-finite floats out of artifact metadata before it reaches wandb,
+regardless of root cause.
+
+### 37.1 Worth a dedicated look: the first-rollout-frame anomaly
+
+Both `h11_ridge_distill` runs above show the same odd shape in
+`last_eval`: `improvement_pct_frame1` is wildly NEGATIVE (round 2:
+-1987.9%, round 3: -1830.8%) while `improvement_pct_frame_half`
+(+39.1%/+35.1%) and `improvement_pct_frame_last` (+26.2%/+23.4%) are
+solidly positive. i.e. the model is dramatically WORSE than persistence
+specifically on the very first rolled-out frame, then recovers and
+beats persistence comfortably for the rest of the 68-frame horizon.
+This pattern isn't new to h11 specifically -- it's just the first time
+per-frame numbers this granular have been looked at together in this
+log. Two live hypotheses, neither confirmed yet:
+  1. An off-by-one in how frame 1 is scored/anchored relative to the
+     persistence baseline (e.g. frame 1's persistence prediction is
+     unusually easy -- literally the last observed frame -- so ANY
+     model deviation from it reads as a huge relative loss even when
+     the absolute error is small).
+  2. A genuine architectural weakness at t+1 specifically (the model
+     needs a frame or two of its own rollout history before its
+     predictions stabilize), which would be a real finding about the
+     AR rollout mechanism, not a scoring artifact.
+Worth a dedicated, cheap diagnostic pass (plot absolute error per frame
+index, not just improvement_pct, across a few arms) before scaling
+anything further -- if it's hypothesis 1, the summary `improvement_pct`
+numbers reported throughout this whole doc may be getting dragged down
+by a single artifact-heavy frame; if it's hypothesis 2, it's a real
+model limitation worth designing around (e.g. a frame-1-specific loss
+term, or excluding frame 1 from the aggregate score with a documented
+reason).
+
+### 37.2 Where this leaves the +69% target
+
+Restating Appendix A's own framing: **+69.49%/+68.97%** is a linear
+ridge-regression ceiling/headroom gauge, not an architectural target --
+the doc's own stated realistic near-term target is **+46-50%**. Against
+that: the best clean transformer number anywhere in this investigation
+is still `v3_h9_moreseqs`'s **+46.49%**, but only at a ~300-400 step
+shallow screen, never confirmed at production scale. The single most
+valuable UNFINISHED lead in the whole doc is `s8_h9_moreseqs_scaled`
+(that exact config, scaled) -- it was mid-run at step 4000/45000
+(+22-27%, noisy) as of §32 and its final result at 45000 steps was
+never recorded anywhere after that. Closing that out is a more direct
+shot at the +46-50% target than further `h11` iteration.
+
+**Correction, same session**: §37.2 above (and the Appendix A framing it
+was quoting) was WRONG to treat +46-50% as "the realistic target" and
++69% as merely a headroom gauge not expected to be hit. Called out
+directly by the operator, and it holds up: a linear ridge-regression
+map is a STRICTLY LESS expressive function class than a transformer.
+There is no principled reason a transformer should lose to it at
+convergence. Every transformer variant currently losing to it is
+evidence of a fixable problem, not a ceiling -- three live candidates,
+none mutually exclusive:
+  1. **Undertraining.** The linear fit is closed-form -- effectively
+     "fully converged" the instant it's computed, zero optimization
+     difficulty. Every transformer variant tried (300 to 45000 steps)
+     is still mid-optimization on a nonconvex surface when cut off; none
+     show a clearly flattened loss curve. Losing to a converged simple
+     model while still mid-training isn't evidence of a hard ceiling.
+  2. **Objective/curriculum mismatch.** Training is mostly teacher-
+     forced with lighter AR augmentation; the eval metric is a 68-frame
+     autoregressive rollout. The linear model has no such mismatch --
+     it's the same fixed operator either way.
+  3. **Remaining bugs.** This exact codebase has already had multiple
+     CONFIRMED correctness bugs suppressing real performance (the
+     `DELTA_ANCHOR` train/eval mismatch, §35; the `torch._dynamo`
+     recompile storm, §35.3; and see below, an LR-schedule bug on
+     resume). Given that track record, more are plausible.
+**+69.49%/+68.97% is the actual goal, not +46-50%.** Restating this
+plainly since it changes what "progress" means going forward: closing
+the gap to a linear baseline, not declaring victory in the 40s.
+
+## 38. v6.8 -- three concurrent training slots, a real LR-schedule bug on resume, and s8/h11's latest numbers
+
+**Bug found and fixed: prefixing concurrent slots' output with `sed`
+could silently kill the training it was labeling.** `sed "s/^/$tag /"`
+uses `/` as its delimiter; `$tag` is `[arm/rN]`, which contains a
+literal `/` -- on macOS's BSD `sed` this is a hard parse error ("bad
+flag in substitute command"), and `sed` exits immediately without
+processing any input. That closes the pipe `ssh`'s stdout was writing
+to, which SIGPIPEs the local ssh client, which tears down the SSH
+session -- with no `screen`/`nohup` on that channel, this very likely
+kills the REMOTE training process too, mid-run. Confirmed happening for
+real: in the first concurrent-slots run, `s8_h9_moreseqs_scaled`
+(slot 1) died at step 4225 after only 352s of its 1800s budget, while
+`h11_ridge_distill` (slot 2) happened to survive the race. Fixed by
+switching to `awk -v tag="$tag" '{print tag, $0; fflush()}'` -- plain
+string concatenation, no delimiter to collide with regardless of what's
+in `$tag`.
+
+**Bug found: `--max-steps` is an ABSOLUTE target, and changing it
+between resumes of the SAME run re-triggers the LR schedule.**
+`make_lr_lambda` (train_production_transformer_deep_dive.py:2512-2529)
+builds a warmup-then-cosine-decay curve as a fraction of `cfg.MAX_STEPS`
+-- computed fresh from whatever `--max-steps` THIS invocation passes,
+then evaluated at the checkpoint's saved absolute step on resume.
+Confirmed via a clean A/B in the same session: `s8` resumed with the
+SAME `--max-steps=45000` both times -- `train_loss` stayed stable
+(0.0134 -> 0.0128). `h11` resumed with a DIFFERENT `--max-steps`
+(2500 -> 5000) -- `train_loss` roughly DOUBLED immediately after resume
+(0.0088 -> 0.0196), and `improvement_pct_frame1` got noticeably worse
+(-1988% -> -2390%). Mechanism: h11's original 2500-step schedule had
+fully annealed its LR to the floor by step 2500; resuming with a
+5000-step schedule evaluated at step ~2500 is only ~50% through the NEW
+curve, re-inflating the LR back up and kicking already-converged
+weights. `ar_frames_for_step` (line 2532-2554) has the identical
+`cfg.MAX_STEPS`-relative dependency, so h11's AR-frames curriculum was
+ALSO perturbed on resume -- a second, compounding mechanism. **Not yet
+fixed in code** (would mean persisting the schedule's original target
+in the checkpoint and always using that, regardless of the current
+invocation's `--max-steps`); the operating rule until then: pick each
+arm's real target step count ONCE and pass that exact same value on
+every future resume -- never bump `MAX_STEPS` mid-series. This means
+h11's post-resume numbers this session are NOT a clean read of the
+model -- expect a few hundred steps of recovery before its numbers mean
+anything again.
+
+**`provision_and_run.sh` now supports up to 3 concurrent training
+slots** (`--arm2`/`--round2`/... and `--arm3`/`--round3`/...), refactored
+into a single array-driven code path (`SLOT_ARMS`/`SLOT_ROUNDS`/...)
+instead of hand-duplicating the launch/wait/pull-back logic per slot --
+the same duplication lesson this repo already learned the hard way with
+croc (`lib_croc.sh`'s own header). Plain co-location (default CUDA
+time-slicing), not NVIDIA MPS -- more concurrent slots means more
+EXPERIMENTS per pod-hour, not more STEPS per experiment; each
+additional slot slices GPU compute further.
+
+**`s8_h9_moreseqs_scaled` checkpoint recovered and wired back into the
+pipeline.** Its last known checkpoint (step 4000/45000) only existed
+under a stale `saved_models/sweep_arms_local/` path the pod pipeline
+never reads -- copied into the live `saved_models/` dir and added to
+`scp_env_files.sh` so a fresh pod actually resumes from it. Made
+226 additional steps of clean progress this session (4000 -> 4225,
+`train_loss` stable) before the sed bug above killed that slot early.
+
+### 38.1 Where s8/h11 actually stand now
+
+`s8_h9_moreseqs_scaled`: step 4225/45000, `train_loss_centroid_l2`
+0.01277, `best.improvement_pct` still 27.17% (unchanged from step 4000
+-- no new eval ran in the brief 352s before it died). Still 40775 steps
+from its own target; still the single most valuable unfinished
+production-scale lead.
+
+`h11_ridge_distill` (round 2): step 3050/5000 (target changed mid-series,
+see the LR-schedule bug above -- treat with caution). `last_eval` at
+step 3000: `improvement_pct` 34.998% (down from round 2's earlier best
+of 37.26%, but distorted by the LR-restart, not necessarily real
+regression), `improvement_pct_frame1` -2390.4% (worse than either prior
+run's -1988%/-1831%, same caveat). Needs a few hundred more steps under
+a NOW-FIXED, stable `--max-steps` target before trusting any number
+from it again.
+
+## 39. v6.9 -- the overfitting/rollout-drift pattern replicates across THREE arms, a real SSH connection-flood bug fixed, and same-arm concurrency costs 2.4x the throughput of different-arm concurrency
+
+**The three-way `s8`/`h11`/`s7` batch (v6.8's follow-up) finished, and
+the pattern is now confirmed systemic, not arm-specific.** All three
+arms peak somewhere around step 2000-4000 and DECLINE afterward on the
+actual rollout-vs-persistence metric, while `train_loss` keeps
+improving the whole time -- textbook overfitting/rollout-drift:
+
+| arm | peak (`best`) | latest eval | decline | regularization |
+|---|---|---|---|---|
+| `s7_h9_scaled` (r5) | 40.2% @ ~step 2400 | 21.7% @ step 4500 | -18.5 pts | none |
+| `h11_ridge_distill` (r6) | 37.3% (never beaten) | 27.8% @ step 3000 | -9.4 pts | WD/dropout 0.05 |
+| `s8_h9_moreseqs_scaled` (r6) | 28.3% (never beaten) | 22.0% @ step 6000 | -6.3 pts | WD/dropout 0.05 |
+
+The WD/dropout 0.05 bump measurably slowed the decline in both
+regularized arms vs `s7`'s unregularized falloff -- real signal, not
+yet enough to reverse it or beat the peak. None of the three
+continuation attempts ever beat their own recorded `best` -- those
+peak checkpoints are still sitting untouched on disk.
+
+**Bug found and fixed: a single dropped SSH connection was aborting the
+entire multi-GB transfer, with no retry.** `kex_exchange_identification:
+read: Connection reset by peer` on one of 10 concurrent scp lanes,
+while phase 1 (env files) was ALSO opening a connection at the same
+moment -- a direct, foreseeable consequence of v6.8's "start phase 2
+immediately" optimization increasing simultaneous new SSH connections.
+This is sshd's own `MaxStartups` anti-flood throttle randomly dropping
+a new, not-yet-authenticated connection once too many arrive at once --
+expected and recoverable, but `lib_scp.sh` had ZERO retry logic: any
+single lane failing failed the whole file, which aborted the whole
+pipeline. Fixed with `scp_lane_with_retry`/`ssh_cmd_with_retry` (3
+attempts, backoff) -- same pattern `provision_and_run.sh`'s
+`rsync_with_retry` already used for the pull-back step, just missing
+here until now.
+
+**Bug found (process, not code): forking a new round from an old
+checkpoint's `_best.pt` carries the OLD round's wandb run id forward.**
+Copying `r2_s8_h9_moreseqs_scaled_best.pt` to seed round 6 only changed
+the filename -- the checkpoint's own embedded `wandb_run_id` (from
+`step: 4000` of round 2's STILL-CONTINUING lineage, which by then had
+logged past step 6491) came along with it, causing round 6 to try
+resuming-and-appending to round 2's already-further-advanced wandb
+history under round 6's own lower step numbers -- the exact same
+"tried to log to step N less than current step" symptom as the v6.8
+bug, but a completely different mechanism. Fixed by stripping
+`wandb_run_id` from the checkpoint file directly (confirmed `h11`'s own
+round-6 seed already had `wandb_run_id: None`, unaffected). **Lesson:
+forking a new round from an old checkpoint needs the embedded
+`wandb_run_id` cleared, not just a new filename/round number.**
+
+### 39.1 Next lever tried: does regularization prevent the decline? Inconclusive so far -- a real concurrency-cost finding got in the way
+
+Follow-up batch: `s7_h9_scaled` x3, FRESH cold starts, rounds 7/8/9,
+identical config except WD/dropout 0/0.05/0.10 -- a clean, controlled
+A/B/C on the single best-known base config. Result: all three only
+reached step ~900-1000 of a 6000-step, 0.5h-budgeted target --
+**nowhere near the step 2000-4000 region where the decline pattern
+above actually shows up**, so this batch cannot yet answer the question
+it was designed to answer.
+
+**Why so few steps: running 3 copies of the IDENTICAL arm/config
+concurrently costs far more throughput than 3 DIFFERENT arms did.**
+Direct comparison, steps-advanced-per-invocation ÷ wall_seconds:
+- 3 DIFFERENT arms (s7/s8/h11, v6.8 batch): ~1.3 steps/sec per slot
+- 3 IDENTICAL arm/config (s7 x3, this batch): ~0.54 steps/sec per slot
+
+**A ~2.4x slowdown from running identical models concurrently vs
+different ones** -- identical compute/memory-access shapes maximally
+contend for the same tensor cores and memory bandwidth at the same
+instant; differently-shaped models interleave less destructively. Real,
+quantified, actionable: same-arm concurrent comparisons need either
+fewer concurrent slots, a proportionally longer `MAX_HOURS`, or NVIDIA
+MPS (still "not yet wired into any script here" per section 32.3) to
+get a fair read in the same wall-clock budget.
+
+The early numbers that DID come in are an encouraging trend (11.3% ->
+17.8% -> 24.6% at WD/dropout 0/0.05/0.10, roughly step 500-1000) but a
+single run each at this few steps is not remotely enough to trust --
+next step is continuing these same three runs (same round numbers, same
+`--max-steps=6000` -- never bump it mid-series, see v6.7's LR-schedule
+bug) with a longer `MAX_HOURS` to actually reach the region that
+matters.
+
+Two more real bugs found and fixed the same session, both in
+`provision_and_run.sh`/`lib_scp.sh`: (1) `kex_exchange_identification:
+read: Connection reset by peer` on a data-transfer lane -- sshd's own
+`MaxStartups` anti-flood throttle, triggered because v6.8's "start
+phase 2 immediately" change increased simultaneous new SSH connections,
+and with ZERO retry logic a single dropped lane was aborting the entire
+multi-GB transfer. Fixed with `scp_lane_with_retry`/`ssh_cmd_with_retry`
+(3 attempts, backoff), and made the failure loud instead of silently
+tripping `set -e` at a bare `wait` if retries ever do exhaust. (2)
+Confirmed no code anywhere sets `torch.set_num_threads()` or
+`OMP_NUM_THREADS`/`MKL_NUM_THREADS` -- each concurrent training process
+independently grabs every CPU core for PyTorch's default intra-op
+thread pool, for zero benefit (the actual compute is GPU-bound) and
+real contention when running 2-3 slots at once, very plausibly an
+additional contributor to section 39.1's 2.4x same-arm slowdown on top
+of the GPU contention. Fixed: each slot's remote launch now queries
+`nproc` and caps `OMP_NUM_THREADS`/`MKL_NUM_THREADS` to its fair share.
+
+## 40. v7.0 -- an honest progress check, real early stopping shipped, and the actual next lever named as a to-do, not built yet
+
+**Direct question asked and answered honestly: is any of this recent
+work actual progress toward +69%, or just infrastructure churn?**
+Mostly the latter, and worth saying plainly rather than papering over.
+The scorecard, side by side:
+
+| milestone | improvement_pct |
+|---|---|
+| linear ridge ceiling (the actual goal) | 69.5% |
+| shallow screens, 300-400 steps (`h9_ar_freq1` / `v3_h9_moreseqs`) | 43.8% / 46.5% |
+| `s7_h9_scaled` clean production run, PEAK | 40.2% @ ~step 2400 |
+| `s7_h9_scaled` same run, later | 21.7% @ step 4500 |
+| `h11_ridge_distill`, peak -> later | 37.3% -> 23-28% |
+| `s8_h9_moreseqs_scaled`, peak -> later | 28.5% -> 16-22% |
+
+**Nothing tried at production scale has beaten the shallow 400-step
+screens.** Every serious continuation -- different arm, different
+regularization, different starting checkpoint -- converges on the same
+story: peak around step 2000-2500, then decline, now confirmed three
+independent times. That is a real, useful NEGATIVE result (it rules out
+"just train longer, or train longer with more weight decay" as the
+lever), but it is not progress toward 69%, and several pod-hours went
+into re-confirming it rather than testing something that could actually
+move the number. The overwhelming majority of this session's actual
+engineering effort went into throughput/reliability infrastructure
+(croc->scp, concurrent orchestration, three real bugs fixed, SSH
+retries, CPU thread capping) -- all of it legitimate and necessary (the
+pipeline genuinely was broken/slow/unreliable), but it made the SAME
+experiment cheaper to repeat; it did not change what experiment is
+being run.
+
+### 40.1 Shipped: real early stopping (`Config.EARLY_STOP_PATIENCE`)
+
+Stops the bleeding on the negative result above -- future runs no
+longer need a human to notice the decline and manually kill the pod.
+`train_production_transformer_deep_dive.py`:
+- New `Config.EARLY_STOP_PATIENCE` (default `None` -- disabled,
+  unchanged behavior for anything that doesn't opt in) and
+  `--early-stop-patience N` CLI flag.
+- Tracks `evals_without_promotion`: resets to 0 on any eval that
+  actually promotes a new `_rollout_best.pt` (beats persistence AND
+  clears the sane-RMS gate AND improves on the best-ever promoted
+  `rollout_mse` -- the exact condition that checkpoint is saved under),
+  increments otherwise. After `N` consecutive non-promoting evals,
+  stops training right there -- same treatment as a `MAX_HOURS`/
+  `MAX_STEPS` stop (final checkpoint still saved via the existing
+  `hit_budget` gate, `stop_reason` recorded for the run's own summary).
+- Deliberately tied to the PROMOTED rollout metric, not `_best.pt`
+  (which tracks `val_tf_mse`, a different quantity several arms kept
+  improving on even while the actual rollout-vs-persistence metric was
+  getting steadily worse -- confirmed while implementing this: `_best.pt`
+  and `_rollout_best.pt` are NOT interchangeable, and earlier "resume
+  from best" experiments this session used `_best.pt`, which may not
+  always coincide with the true rollout peak).
+- NOT restored across a resume -- a resume is itself a fresh operator
+  decision to keep going, so it gets a fresh patience budget rather than
+  inheriting however close to the limit a prior process invocation was.
+- Verified the counter/reset/threshold bookkeeping in isolation (a
+  standalone simulation, three scenarios: stops at the right index,
+  never stops when patience isn't reached, resets correctly after a
+  promotion) -- the full loop itself needs a real GPU/data run to
+  exercise end-to-end, not yet done.
+- Usage: `provision_and_run.sh`'s existing generic `--extra="..."`
+  per-slot passthrough already covers this with no further plumbing --
+  e.g. `--extra="--early-stop-patience 4"`.
+
+### 40.2 NOT done yet -- explicitly a to-do, not a future aside
+
+**The actual lever that could plausibly close the 25-40 point gap to
+69% is an objective/architecture change, not a hyperparameter sweep on
+the current recipe.** Two live hypotheses, neither implemented:
+1. **Objective mismatch.** The linear ridge baseline is never trained
+   on anything OTHER than what it's scored on (a single fixed operator,
+   autoregressive rollout IS its only mode). Every transformer arm so
+   far trains mostly teacher-forced with lighter AR augmentation, then
+   gets scored on a full autoregressive rollout it was never directly
+   optimized against as heavily. Training more directly against the
+   actual rollout loss (heavier `AR_LOSS_WEIGHT`, longer AR horizon
+   earlier in training, or a loss that's ALWAYS the rollout metric
+   rather than teacher-forcing-dominant) is untested as the primary
+   lever, only as a secondary augmentation on top of a teacher-forced
+   base.
+2. Section 32.2's still-unregistered acceleration menu (multi-horizon
+   auxiliary head, physical-consistency penalty, split-anchor-by-loss)
+   -- named back in v6.2, still not built as arms as of this section.
+
+Neither of these is a `--set KEY=VALUE` away -- both need real new code
+(a new arm, likely a real change to the loss function or training
+curriculum), not another concurrent batch of the existing recipe.
+**Explicitly flagged here as the next real research question, to be
+scoped BEFORE spending more pod time repeating the current recipe --
+not something to bolt onto another 3-slot regularization batch.**
+
+## 41. v7.1 -- a real GLOBAL TIMEOUT WRAPPER for provision_and_run.sh, a serious bug in it caught the same session, and wandb Artifacts confirmed as a genuine full-recovery path
+
+**Added the same two-layer wall-clock safety net `bench_croc_variants.sh`
+already had, ported to `provision_and_run.sh`.** `MAX_HOURS` only self-
+polices INSIDE each training process's own loop -- nothing catches a
+hung bootstrap, a stalled SSH connection, or a process wedged somewhere
+that never reaches that check. Layer 1: self-re-exec + a watchdog that
+SIGTERMs (letting `cleanup_pod()`'s EXIT trap still run) then SIGKILLs.
+Layer 2: a fully detached background job that unconditionally deletes
+the pod at a slightly later deadline, independent of the script's own
+control flow, in case Layer 1's own cleanup path hangs too.
+`GLOBAL_TIMEOUT_SECS` is DERIVED, not fixed: longest `MAX_HOURS` across
+all active concurrent slots + `SETUP_OVERHEAD_SECS` (default 900s/15min)
+-- "30 minutes of GPU compute should be over in 45 minutes of wall-clock
+time, no matter what." Verified both the timeout-derivation arithmetic
+(4 scenarios) and the actual SIGTERM/trap/exit-code mechanism (a
+standalone simulation) before trusting it.
+
+**Then broke a real run with it, same session.** `provision_and_run.sh`
+has a nuance `bench_croc_variants.sh` never needed: `cleanup_pod()`
+deliberately REFUSES to delete the pod when the artifact pull-back fails
+(so a transient network blip can't cost you the run's actual output --
+see the manual-retrieval message it prints). Layer 2, ported verbatim,
+is a blind wall-clock timer with no idea that decision was ever made --
+it force-deletes the pod at its deadline regardless. Result: three real
+runs (`s7_h9_scaled` r7/r8/r9, ~1.5h into their budget) got killed mid-
+training when Layer 2's timer fired, right after `cleanup_pod()` had
+JUST decided to preserve the pod for exactly this scenario. Confirmed
+via wandb: all three runs show `state: "crashed"` (abrupt kill, not a
+graceful stop), matching Layer 2's deadline almost exactly. **Root
+cause: Layer 2 has no way to know about a decision made LATER, inside a
+different code path, in a variable (`PULL_BACK_OK`) it can't see --
+correct instinct (a robust, independent backstop) applied to a script
+that has a legitimate "please don't delete this yet" state the
+backstop's own design didn't account for.** Fixed: `cleanup_pod()` now
+explicitly cancels Layer 2's pid (`kill "$SAFETY_NET_PID"`) on every
+path, including -- especially -- the "NOT terminating, pull-back failed"
+branch. Verified with a standalone simulation before trusting it: arm a
+short-deadline "layer 2" job, take the "don't terminate" branch, confirm
+the job never fires.
+
+### 41.1 wandb Artifacts confirmed as a genuine full-recovery path, not just metrics
+
+The immediate question after the crash: with the pod gone and the local
+rsync pull-back never having run, is any of that run's work actually
+lost? No -- and this is worth knowing as a standing fact, not just a
+one-off rescue. `save_checkpoint()` already calls `tel.log_artifact()`
+on EVERY checkpoint save (`_latest.pt` every `CHECKPOINT_EVERY_STEPS`,
+plus `_best.pt`/`_rollout_best.pt`/`_train_best.pt` whenever each
+improves) -- `_Telemetry.log_artifact()`'s own docstring says so
+directly: "Logging the same name repeatedly... creates a new VERSION
+each time -- a full checkpoint history in wandb for free." This was
+already true before v7.1; it just had never been exercised as an actual
+recovery path until this incident forced it.
+
+Recovered, for real, using `wandb.Api()` from this local machine
+(credentials already in `~/.netrc`, entity `pvl-data`, project
+`NI_Review_v6`): all three crashed runs' `_latest`/`_best`/
+`_rollout_best` artifacts, latest version of each, downloaded and
+verified loadable. Lost: at most ~30-34s of training (one
+`CHECKPOINT_EVERY_STEPS` interval) between the last successful upload
+and the kill. Recovered numbers, none of which had been pulled back
+locally any other way:
+
+| run | peak `improvement_pct` | peak step | last step reached |
+|---|---|---|---|
+| r7 (no reg) | 30.5% | 2500 | 3950 |
+| r8 (WD/dropout 0.05) | 29.5% | 2500 | 3950 |
+| r9 (WD/dropout 0.10) | **39.5%** | 1000 | 3825 |
+
+A fourth and fifth confirmation of section 39/40's peak-then-flat
+pattern (all three plateau early, zero further improvement for 1300-
+2800 further steps) -- but also a genuinely interesting new data point:
+r9 (the strongest regularization) peaked far higher AND far earlier than
+r7/r8, which only differ from each other by the weaker 0.05 dose. Single
+runs each, not yet a trend to trust, but worth a dedicated look rather
+than folding into another batch.
+
+**Standing lesson: if a pod is ever lost with an incomplete pull-back,
+check wandb Artifacts before assuming the run's progress is gone.**
+`wandb.Api()` -> `api.artifact(f"{entity}/{project}/{run_name}_{kind}:latest")`
+-> `.download()` recovers the actual checkpoint files, not just the
+logged metrics.
+
+## 42. v7.2 -- r9's early lead confirmed real (r11 replicated it), three fixes from the "what failed" investigation, and early-stopping patience switched from evals to steps
+
+**The r10/r11/r12 ablation confirmed the regularization signal.** Pulled
+each run's actual stop and best numbers:
+
+| round | config | peak `improvement_pct` | stopped at (steps) |
+|---|---|---|---|
+| r10 | WD=0.1, dropout=0.1 (replicate r9, new SEED) | 29.9% | 4500 |
+| r11 | WD=0.1 only | **35.5%** | 3500 |
+| r12 | dropout=0.1 only | 31.4% | 4000 |
+
+None beat r9's own 39.5%, but r11 (weight decay alone) came closest and
+clearly outperformed r12 (dropout alone) -- a real, if still single-run,
+signal that **weight decay is doing more of the work than dropout** in
+whatever is suppressing the peak-then-decline pattern. r10's replicate
+(same config as r9, different seed) landed lower than r9's original --
+expected variance, not a contradiction; the regularization *direction*
+still holds up.
+
+**"What failed" investigation -- confirmed NOTHING failed; early
+stopping worked exactly as designed.** All three runs stopped at
+different, non-round step counts (4500/3500/4000 -- not `MAX_STEPS`
+6000, not the `MAX_HOURS` 1.0h wall-clock boundary), the signature of
+per-run patience firing independently. Confirmed directly via the
+pulled-back sweep log: `"stop_reason": "early stop: 4 consecutive evals
+(patience=4) with no new promoted rollout checkpoint"`. The reported
+"~1h12m, that's not what was designed" gap wasn't a bug -- concurrent
+slots wait for the SLOWEST one to individually converge, and patience=4
+evals at `--val-every 500` means 2000 steps (a large wall-clock budget
+under 3-way contention) has to pass with zero improvement before any
+one slot gives up.
+
+**Three real fixes shipped from that investigation:**
+
+1. **`TORCHINDUCTOR_COMPILE_THREADS` was never capped.** v6.9's CPU-
+   thread fix capped `OMP_NUM_THREADS`/`MKL_NUM_THREADS` (the steady-
+   state tensor-math thread pool) but missed a completely separate
+   knob: confirmed directly in `torch/_inductor/config.py`'s
+   `decide_compile_threads()`, the compile-worker subprocess pool
+   (`compile_worker/__main__.py --workers=N`, visible in `ps aux`
+   during "getting the model ready") defaults to `min(32, cpu_count)`
+   **per process**, entirely unaffected by OMP/MKL. With N concurrent
+   slots, up to N x 32 compile-worker subprocesses could compete for
+   the same cores during each process's own compilation burst -- likely
+   the real reason model-ready time felt slower even after the OMP/MKL
+   fix. `provision_and_run.sh`'s `launch_training()` now also exports
+   `TORCHINDUCTOR_COMPILE_THREADS` using the same per-slot division.
+2. **`sweep_logs/manual/{arm}.json` was keyed by arm name only, not
+   round.** r10/r11/r12 (three rounds of the same arm, concurrent) all
+   wrote to the identical file -- only r10 (finished last) survived
+   locally; r11/r12's own `stop_reason` records were silently
+   clobbered. Fixed: now keyed by `run_name` (`r{ROUND}_{ARM}`), matching
+   every other checkpoint/artifact naming convention in this file.
+3. **Early-stopping patience switched from eval-count to step-count.**
+   `Config.EARLY_STOP_PATIENCE` (an int number of EVALS) renamed to
+   `Config.EARLY_STOP_PATIENCE_STEPS` (an int number of STEPS,
+   `--early-stop-patience-steps` on the CLI) -- eval-count patience
+   silently meant something different depending on `--val-every`, which
+   is exactly the kind of unit confusion that made "patience=4" actually
+   mean "2000 steps" without it being obvious from the number itself.
+   Verified the new step-based bookkeeping in isolation (4 scenarios:
+   one-eval-of-slack when patience equals `--val-every`, extra slack
+   when patience is larger, correct resume-time baseline, never-stops
+   when always promoting) before trusting it. Patience is now being set
+   to 500 steps going forward -- at `--val-every 500` this is
+   deliberately aggressive (stops on the very next non-promoting eval
+   after a promotion, one eval of slack), trading a real chance of
+   stopping on a single noisy eval for much faster sessions; worth
+   watching whether this ever cuts off a run that would have recovered.

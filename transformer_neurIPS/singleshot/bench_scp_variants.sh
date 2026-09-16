@@ -68,10 +68,13 @@ set -uo pipefail  # NOT -e -- a single lane failing must not abort the
                    # others or skip the final per-lane report.
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./lib_croc.sh
-source "$HERE/lib_croc.sh"  # only used for run_with_timeout -- generic,
-                             # does not touch any of that file's
-                             # croc-specific globals.
+# shellcheck source=./lib_common.sh
+source "$HERE/lib_common.sh"  # run_with_timeout
+# shellcheck source=./lib_scp.sh
+source "$HERE/lib_scp.sh"   # scp_send_split -- the actual split/send/
+                             # reassemble/verify logic, shared with
+                             # scp_data_files.sh so the two can never
+                             # drift apart.
 
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]] && [[ -z "${PFD_NO_COLOR:-}" ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
@@ -140,64 +143,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-hdr "Preparing test file and pieces"
+hdr "Preparing test file"
 info "generating a random ${FILE_SIZE_MB}MB local test file (random, not zeros)..."
 dd if=/dev/urandom "of=$LOCAL_FILE" bs=1m count="$FILE_SIZE_MB" 2>/dev/null
-EXPECTED_BYTES="$(stat -f%z "$LOCAL_FILE" 2>/dev/null || stat -c%s "$LOCAL_FILE")"
-EXPECTED_SHA="$(shasum -a 256 "$LOCAL_FILE" | awk '{print $1}')"
-ok "test file ready: $LOCAL_FILE ($EXPECTED_BYTES bytes, sha256 $EXPECTED_SHA)"
-
-PIECE_BYTES=$(( (EXPECTED_BYTES + LANES - 1) / LANES ))
-info "splitting into $LANES pieces (~$((PIECE_BYTES / 1048576)) MB each)..."
-split -b "$PIECE_BYTES" -d -a 2 "$LOCAL_FILE" "$LOCAL_DIR/piece_"
+ok "test file ready: $LOCAL_FILE"
 echo ""
 
-hdr "Sending $LANES pieces via $LANES CONCURRENT scp processes"
-declare -a SEND_PIDS=() PIECE_NAMES=()
-T0=$(date +%s)
-for i in $(seq 0 $((LANES - 1))); do
-  piece_name="piece_$(printf '%02d' "$i")"
-  PIECE_NAMES[$i]="$piece_name"
-  (
-    run_with_timeout "$SCP_TRANSFER_TIMEOUT" \
-      scp "${SCP_OPTS[@]}" "$LOCAL_DIR/$piece_name" "$POD_USER@$POD_HOST:$REMOTE_DIR/$piece_name"
-  ) &
-  SEND_PIDS[$i]=$!
-done
-
-FAIL=0
-for i in $(seq 0 $((LANES - 1))); do
-  if ! wait "${SEND_PIDS[$i]}"; then
-    err "lane $i (${PIECE_NAMES[$i]}) failed or timed out"
-    FAIL=1
-  fi
-done
-ELAPSED=$(( $(date +%s) - T0 ))
-[[ "$ELAPSED" -lt 1 ]] && ELAPSED=1
-echo ""
-
-if [[ "$FAIL" != "0" ]]; then
-  err "one or more lanes failed -- see errors above. Not attempting reassembly."
-  exit 1
-fi
-
-MBPS=$(awk -v b="$EXPECTED_BYTES" -v s="$ELAPSED" 'BEGIN{printf "%.1f", (b/1048576)/s}')
-ok "all $LANES lanes finished in ${ELAPSED}s (${MBPS} MB/s aggregate)"
-echo ""
-
-hdr "Reassembling and verifying on $POD_HOST"
-ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" \
-  "cd '$REMOTE_DIR' && cat \$(ls piece_* | sort) > result.bin && rm -f piece_*"
-REMOTE_BYTES="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "stat -c%s '$REMOTE_DIR/result.bin' 2>/dev/null || stat -f%z '$REMOTE_DIR/result.bin'")"
-REMOTE_SHA="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "shasum -a 256 '$REMOTE_DIR/result.bin' 2>/dev/null | awk '{print \$1}'")"
-
-echo ""
-hdr "RESULT"
-if [[ "$REMOTE_BYTES" == "$EXPECTED_BYTES" && "$REMOTE_SHA" == "$EXPECTED_SHA" ]]; then
-  ok "size AND sha256 verified -- $LANES-lane parallel scp: ${MBPS} MB/s aggregate over ${ELAPSED}s"
+hdr "Sending via $LANES concurrent scp processes"
+if scp_send_split "$LOCAL_FILE" "$REMOTE_DIR" "result.bin" "$LANES" "$SCP_TRANSFER_TIMEOUT"; then
+  echo ""
+  hdr "RESULT"
+  ok "PASS -- $LANES-lane parallel scp, size and sha256 both verified"
 else
-  err "VERIFICATION FAILED"
-  err "  size:   got=${REMOTE_BYTES:-<none>} want=$EXPECTED_BYTES"
-  err "  sha256: got=${REMOTE_SHA:-<none>} want=$EXPECTED_SHA"
+  echo ""
+  hdr "RESULT"
+  err "FAIL -- see errors above"
   exit 1
 fi

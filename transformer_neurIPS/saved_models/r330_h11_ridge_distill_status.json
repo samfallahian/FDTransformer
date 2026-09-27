@@ -1,0 +1,42 @@
+{
+  "run_name": "r330_h11_ridge_distill",
+  "arm": "h11_ridge_distill",
+  "step": 1373,
+  "max_steps": 6000,
+  "wall_seconds": 601.7257692813873,
+  "eta_hours": 0.5632809610878408,
+  "train_loss_centroid_l2": 0.019281664863228798,
+  "best": {
+    "rollout_mse": 0.001793038671808865,
+    "improvement_pct": 44.552723679059305,
+    "val_tf_mse": 2.0017004940839134,
+    "train_loss": 0.010902034118771553,
+    "promoted_rollout_mse": 0.001793038671808865
+  },
+  "last_eval": {
+    "val_tf_loss": 0.00921332372476364,
+    "val_tf_mse": 2.0203940782055336,
+    "val_sequences_tf": 25410,
+    "rollout_sequences": 16,
+    "frames_scored": 68,
+    "rollout_mse": 0.0018802736757446408,
+    "persistence_mse": 0.0032337723171033707,
+    "improvement_pct": 41.85510011887806,
+    "improvement_pct_frame1": -3632.319856206213,
+    "improvement_pct_frame_half": 56.07191015763489,
+    "improvement_pct_frame_last": 33.85532645392717,
+    "rollout_seconds": 1.7904105186462402,
+    "raw_rollout_mse": 0.0022582291755551365,
+    "raw_improvement_pct": 30.16734159318912,
+    "raw_val_tf_mse": 2.011531652647977,
+    "raw_val_tf_loss": 0.03004158574183219,
+    "raw_improvement_pct_frame1": -4939.11759986151,
+    "raw_improvement_pct_frame_last": 21.29419820208797,
+    "step": 1250,
+    "train_loss": 0.04116160422563553,
+    "lr": 0.0009205158712705375,
+    "wall_seconds": 548.3236525058746,
+    "train_val_gap": -0.03194828050087189
+  },
+  "wall_time": "2026-09-27T15:20:07"
+}

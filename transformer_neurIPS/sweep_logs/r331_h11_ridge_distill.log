@@ -1,0 +1,212 @@
+[1m[92m[DEVICE DETECTED] CUDA — NVIDIA H200[0m
+  [startup] run lock acquired @ +0.0s
+[1m[92m[CUDA DETECTED — H200 DEFAULTS ACTIVE][0m
+  setting                 [1m[92mCUDA[0m     [2mMPS/CPU[0m     
+  batch size              [1m[92m64[0m       [2m1[0m           
+  eval batch              [1m[92m64[0m       [2m1[0m           
+  AR/aux batch            [1m[92m64[0m       [2m1[0m           
+  AR aux loss             [1m[92menabled[0m  [2mDISABLED[0m    
+  AMP dtype               [1m[92mbfloat16[0m  [2moff[0m         
+  torch.compile           [1m[92moff[0m      [2moff[0m         
+  cudnn.benchmark         [1m[92mon[0m       [2moff[0m         
+  grad accumulation       [1m[92m1[0m        [2m32[0m          
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: kekreth (pvl-data) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.30.0
+wandb: Run data is saved locally in /workspace/cgan/transformer_neurIPS/wandb/run-20260927_151030-uujof9st
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run r331_h11_ridge_distill_t80_ws1
+wandb: ⭐️ View project at https://wandb.ai/pvl-data/Persistence_Linear_v1
+wandb: 🚀 View run at https://wandb.ai/pvl-data/Persistence_Linear_v1/runs/uujof9st
+  [startup] device regime resolved @ +0.1s
+  [startup] starting train_ds load @ +0.1s
+  [data]   reading train_80.h5 rows[0:59280] (9.86 GB) from disk, n_threads=8 ...
+  [data]   train_80.h5 read done in 5.3s (1.88 GB/s across 8 threads)
+  [data]   train_80.h5 float+reshape done in 0.0s
+  [startup] train_ds loaded @ +5.4s
+  [data]   reading val_80.h5 rows[0:25410] (4.23 GB) from disk, n_threads=8 ...
+  [data]   val_80.h5 read done in 2.1s (1.98 GB/s across 8 threads)
+  [data]   val_80.h5 float+reshape done in 0.0s
+  [startup] val_ds loaded @ +7.5s
+  [data] train=59,280/59,280 sequences  val=25,410
+  [data] 'train': (59280, 800, 52) (9.86 GB float32) -> cuda
+  [data]   resident on cuda after 1.7s
+  [data] 'val': (25410, 800, 52) (4.23 GB float32) -> cuda
+  [data]   resident on cuda after 0.6s
+  [startup] data resident on compute device @ +9.8s
+  [model] variant=base tokenization=token E=256 L=6 H=8 params=4.79M attn_impl=sdpa delta=False rope=False
+  [startup] model constructed + moved to device @ +9.9s
+  [model] feature stats installed: mean|max|=39.500 std range [0.009831, 41.74]
+  [startup] feature stats computed @ +12.8s
+  [91m[[93ms[92mt[96ma[94mr[95mt[91m-[93mf[92mr[96mo[94mm[95m:[91mw[93ma[92mr[96mm[94m-[95ms[91mt[93ma[92mr[96mt[94m] [95m/[91mw[93mo[92mr[96mk[94ms[95mp[91ma[93mc[92me[96m/[94mc[95mg[91ma[93mn[92m/[96mt[94mr[95ma[91mn[93ms[92mf[96mo[94mr[95mm[91me[93mr[92m_[96mn[94me[95mu[91mr[93mI[92mP[96mS[94m/[95ms[91ma[93mv[92me[96md[94m_[95mm[91mo[93md[92me[96ml[94ms[95m/[91mr[93m2[92m_[96mh[94m1[95m1[91m_[93mr[92mi[96md[94mg[95me[91m_[93md[92mi[96ms[94mt[95mi[91ml[93ml[92m_[96mr[94mo[95ml[91ml[93mo[92mu[96mt[94m_[95mb[91me[93ms[92mt[96m.[94mp[95mt[0m
+  [warm-start] loading v1.0 winner: saved_models/r2_h11_ridge_distill_rollout_best.pt
+  [warm-start] transferred 4.79 M (100.00% of 4.79 M) across 83 tensors
+  [warm-start] source ckpt meta: step=1000  epoch=1000  val_l2=0.03933395980404663  train_l2=0.024789106100797653  rollout_mse=0.001784114066086819
+  [startup] warm-start/resume decision resolved @ +13.4s
+  [ema] shadow model created, decay=0.98
+  [startup] torch.compile stage done @ +13.4s
+  [causality] before_cut=0.000e+00 after_cut=4.055e+00 tol=3.254e-04 -> causal=True
+  [startup] causality probe done @ +13.9s
+
+
+
+
+
+[1m[93m######################################################################################################################[0m
+[1m[93m#                                                                                                                    #[0m
+[1m[93m#                                 STARTING OVER -- WARM-STARTED WEIGHTS ONLY, STEP 0                                 #[0m
+[1m[93m#   warm-start weights from: /workspace/cgan/transformer_neurIPS/saved_models/r2_h11_ridge_distill_rollout_best.pt   #[0m
+[1m[93m#                                                                                                                    #[0m
+[1m[93m######################################################################################################################[0m
+
+
+
+
+
+
+  [wandb] run started (no URL available -- offline mode?)
+  [ridge-distill] loaded /workspace/cgan/transformer_neurIPS/saved_models/ridge_frame_map.pt (A: (471, 470)) -- weight ramps 0 -> 0.5 over 1200 steps
+  [ar-curriculum] AR_FRAMES ramps 2 -> 8 over 1800 steps (memory estimate below uses the ceiling, 8, not the current/starting value)
+[1m[96m  [memory] expected peak attention-score bytes per path (B*H*L^2*4B * layers):[0m
+  [memory]   train forward         B=64  L=799   -> 7.31 GiB
+  [memory]   eval TF forward       B=64  L=799   -> 7.31 GiB
+  [memory]   eval rollout / persistence report  B=64  L=800   -> 7.32 GiB
+  [memory]   AR aux loss           18.31 GiB (80 retained forwards)
+  [startup] starting null_baselines (incl. first decoder load) @ +26.0s
+[91m[[93ms[92mt[96ma[94mr[95mt[91m-[93mf[92mr[96mo[94mm[95m:[91md[93me[92mc[96mo[94md[95me[91mr[93m] [92m/[96mw[94mo[95mr[91mk[93ms[92mp[96ma[94mc[95me[91m/[93mc[92mg[96ma[94mn[95m/[91me[93mn[92mc[96mo[94md[95me[91mr[93m/[92ma[96mu[94mt[95mo[91me[93mn[92mc[96mo[94md[95me[91mr[93mG[92mE[96mN[94m3[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m_[93mp[92mr[96mo[94md[95mu[91mc[93mt[92mi[96mo[94mn[95m/[91mM[93mo[92md[96me[94ml[95m_[91mG[93mE[92mN[96m3[94m_[95m0[91m5[93m_[92mA[96mt[94mt[95me[91mn[93mt[92mi[96mo[94mn[95mS[91mE[93m_[92ma[96mb[94ms[95mo[91ml[93mu[92mt[96me[94m_[95mb[91me[93ms[92mt[96m_[94ms[95mc[91mr[93mi[92mp[96mt[94me[95md[91m.[93mp[92mt[0m
+  [startup] null_baselines done @ +27.4s
+  [floor] trivial predictors on the training objective (centroid velocity L2): zeros=0.107913  mean=0.110106  previous token=0.0187311  previous frame=0.0074002
+  [floor] must beat 0.107913 (best constant) to have learned anything, and 0.0074002 (previous-frame anchor) to have a chance against persistence
+  [floor] informational latent-space (l2norm): zeros=0.105299  mean=0.104394  previous token=0.0352982  previous frame=0.0186075
+  [train] budget=6000 optimizer steps  micro_batch=64 x accum=1 = effective 64  steps_per_epoch~927  amp=torch.bfloat16  loss=centroid_l2 (latent-space l2norm is informational-only)  device=cuda
+  [startup] entering training loop (step 0) @ +27.4s
+  [train] first virtual batch: observed 1 micro-batches (expected 1)
+  step      1/6000  train(centroid_l2)=0.040788  lr=1.11e-05  gnorm=8.874  0.5m
+    [centroid] mae_vx=0.03056 mae_vy=0.01077 mae_vz=0.02049  rmse_vx=0.03389 rmse_vy=0.0146 rmse_vz=0.023
+  step      2/6000  train(centroid_l2)=0.040061  lr=1.67e-05  gnorm=8.703  0.5m
+    [centroid] mae_vx=0.02984 mae_vy=0.01054 mae_vz=0.02022  rmse_vx=0.03357 rmse_vy=0.0141 rmse_vz=0.02283
+  step      3/6000  train(centroid_l2)=0.035330  lr=2.22e-05  gnorm=7.902  0.5m  eta~17.0h
+    [centroid] mae_vx=0.02392 mae_vy=0.01061 mae_vz=0.01932  rmse_vx=0.02723 rmse_vy=0.01495 rmse_vz=0.0222
+  step     25/6000  train(centroid_l2)=0.019435  lr=1.44e-04  gnorm=2.899  0.6m  eta~2.3h
+    [centroid] mae_vx=0.01071 mae_vy=0.009644 mae_vz=0.008629  rmse_vx=0.01439 rmse_vy=0.01467 rmse_vz=0.0115
+  step     50/6000  train(centroid_l2)=0.016263  lr=2.83e-04  gnorm=2.797  0.7m  eta~1.3h
+    [centroid] mae_vx=0.009063 mae_vy=0.007816 mae_vz=0.007485  rmse_vx=0.01224 rmse_vy=0.01071 rmse_vz=0.01026
+  step     75/6000  train(centroid_l2)=0.016347  lr=4.22e-04  gnorm=5.353  0.7m  eta~1.0h
+    [centroid] mae_vx=0.009921 mae_vy=0.007401 mae_vz=0.00711  rmse_vx=0.0127 rmse_vy=0.01008 rmse_vz=0.009238
+  step    100/6000  train(centroid_l2)=0.023896  lr=5.61e-04  gnorm=7.178  0.8m  eta~0.8h
+    [centroid] mae_vx=0.01414 mae_vy=0.006706 mae_vz=0.01527  rmse_vx=0.0168 rmse_vy=0.01012 rmse_vz=0.01707
+  step    125/6000  train(centroid_l2)=0.018884  lr=7.00e-04  gnorm=8.703  0.9m  eta~0.7h
+    [centroid] mae_vx=0.01427 mae_vy=0.007793 mae_vz=0.005307  rmse_vx=0.01647 rmse_vy=0.01037 rmse_vz=0.007359
+  step    150/6000  train(centroid_l2)=0.019573  lr=8.39e-04  gnorm=8.731  1.0m  eta~0.6h
+    [centroid] mae_vx=0.01579 mae_vy=0.006751 mae_vz=0.00514  rmse_vx=0.01899 rmse_vy=0.009571 rmse_vz=0.007301
+  step    175/6000  train(centroid_l2)=0.030977  lr=9.78e-04  gnorm=13.028  1.1m  eta~0.6h
+    [centroid] mae_vx=0.02855 mae_vy=0.006754 mae_vz=0.005515  rmse_vx=0.03029 rmse_vy=0.009543 rmse_vz=0.007791
+  step    200/6000  train(centroid_l2)=0.025669  lr=1.00e-03  gnorm=11.016  1.2m  eta~0.6h
+    [centroid] mae_vx=0.02081 mae_vy=0.006113 mae_vz=0.01077  rmse_vx=0.02303 rmse_vy=0.008847 rmse_vz=0.01249
+  step    225/6000  train(centroid_l2)=0.023689  lr=1.00e-03  gnorm=10.672  1.3m  eta~0.6h
+    [centroid] mae_vx=0.02033 mae_vy=0.006444 mae_vz=0.006136  rmse_vx=0.02211 rmse_vy=0.009002 rmse_vz=0.007873
+  step    250/6000  train(centroid_l2)=0.025876  lr=1.00e-03  gnorm=10.683  1.4m  eta~0.5h
+    [centroid] mae_vx=0.01724 mae_vy=0.01366 mae_vz=0.008955  rmse_vx=0.01962 rmse_vy=0.01583 rmse_vz=0.01049
+  [eval] step 250: starting rollout eval (16 seqs, sequential decode)...
+  [eval] step 250: starting EMA rollout eval (16 seqs, sequential decode)...
+  [eval] step 250: raw IMPROVEMENT=+36.31%  EMA IMPROVEMENT=+44.75%
+  [eval] step 250: val_tf=0.009385 rollout_mse=0.001787 pers_mse=0.003234 IMPROVEMENT=+44.75%  (frame1 -3702.18%, last +45.98%)  [16 seqs, 2.1s]
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mt[96ma[94mt[95me[91m_[93md[92mi[96mc[94mt[95m] [91m/[93mw[92mo[96mr[94mk[95ms[91mp[93ma[92mc[96me[94m/[95mc[91mg[93ma[92mn[96m/[94mt[95mr[91ma[93mn[92ms[96mf[94mo[95mr[91mm[93me[92mr[96m_[94mn[95me[91mu[93mr[92mI[96mP[94mS[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m/[93mr[92m3[96m3[94m1[95m_[91mh[93m1[92m1[96m_[94mr[95mi[91md[93mg[92me[96m_[94md[95mi[91ms[93mt[92mi[96ml[94ml[95m_[91mr[93mo[92ml[96ml[94mo[95mu[91mt[93m_[92mb[96me[94ms[95mt[91m.[93mp[92mt [96m([94m7[95m6[91m.[93m7[92m5 [96mM[94mB[95m)[0m
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mc[96mr[94mi[95mp[91mt[93me[92md[96m:[94mt[95mr[91ma[93mc[92me[96m] [94m/[95mw[91mo[93mr[92mk[96ms[94mp[95ma[91mc[93me[92m/[96mc[94mg[95ma[91mn[93m/[92mt[96mr[94ma[95mn[91ms[93mf[92mo[96mr[94mm[95me[91mr[93m_[92mn[96me[94mu[95mr[91mI[93mP[92mS[96m/[94ms[95ma[91mv[93me[92md[96m_[94mm[95mo[91md[93me[92ml[96ms[94m/[95mr[91m3[93m3[92m1[96m_[94mh[95m1[91m1[93m_[92mr[96mi[94md[95mg[91me[93m_[92md[96mi[94ms[95mt[91mi[93ml[92ml[96m_[94mr[95mo[91ml[93ml[92mo[96mu[94mt[95m_[91mb[93me[92ms[96mt[94m_[95ms[91mc[93mr[92mi[96mp[94mt[95me[91md[93m.[92mp[96mt [94m([95m1[91m9[93m.[92m3[96m0 [94mM[95mB[91m)[0m
+  [wandb] queued artifact upload: r331_h11_ridge_distill_rollout_best (2 file(s), v-next)
+  --> new best rollout (0.001787, +44.75% vs persistence)
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mt[96ma[94mt[95me[91m_[93md[92mi[96mc[94mt[95m] [91m/[93mw[92mo[96mr[94mk[95ms[91mp[93ma[92mc[96me[94m/[95mc[91mg[93ma[92mn[96m/[94mt[95mr[91ma[93mn[92ms[96mf[94mo[95mr[91mm[93me[92mr[96m_[94mn[95me[91mu[93mr[92mI[96mP[94mS[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m/[93mr[92m3[96m3[94m1[95m_[91mh[93m1[92m1[96m_[94mr[95mi[91md[93mg[92me[96m_[94md[95mi[91ms[93mt[92mi[96ml[94ml[95m_[91mb[93me[92ms[96mt[94m.[95mp[91mt [93m([92m5[96m7[94m.[95m5[91m6 [93mM[92mB[96m)[0m
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mc[96mr[94mi[95mp[91mt[93me[92md[96m:[94mt[95mr[91ma[93mc[92me[96m] [94m/[95mw[91mo[93mr[92mk[96ms[94mp[95ma[91mc[93me[92m/[96mc[94mg[95ma[91mn[93m/[92mt[96mr[94ma[95mn[91ms[93mf[92mo[96mr[94mm[95me[91mr[93m_[92mn[96me[94mu[95mr[91mI[93mP[92mS[96m/[94ms[95ma[91mv[93me[92md[96m_[94mm[95mo[91md[93me[92ml[96ms[94m/[95mr[91m3[93m3[92m1[96m_[94mh[95m1[91m1[93m_[92mr[96mi[94md[95mg[91me[93m_[92md[96mi[94ms[95mt[91mi[93ml[92ml[96m_[94mb[95me[91ms[93mt[92m_[96ms[94mc[95mr[91mi[93mp[92mt[96me[94md[95m.[91mp[93mt [92m([96m1[94m9[95m.[91m3[93m0 [92mM[96mB[94m)[0m
+  [wandb] queued artifact upload: r331_h11_ridge_distill_best (2 file(s), v-next)
+  step    275/6000  train(centroid_l2)=0.029812  lr=9.99e-04  gnorm=11.063  2.0m  eta~0.7h
+    [centroid] mae_vx=0.02713 mae_vy=0.006684 mae_vz=0.005232  rmse_vx=0.02924 rmse_vy=0.008992 rmse_vz=0.007808
+  step    300/6000  train(centroid_l2)=0.021184  lr=9.99e-04  gnorm=13.052  2.1m  eta~0.7h
+    [centroid] mae_vx=0.01698 mae_vy=0.006296 mae_vz=0.00731  rmse_vx=0.01913 rmse_vy=0.008557 rmse_vz=0.008894
+  step    325/6000  train(centroid_l2)=0.021274  lr=9.98e-04  gnorm=11.359  2.2m  eta~0.6h
+    [centroid] mae_vx=0.01888 mae_vy=0.004985 mae_vz=0.005155  rmse_vx=0.02084 rmse_vy=0.007391 rmse_vz=0.006987
+  step    350/6000  train(centroid_l2)=0.027229  lr=9.98e-04  gnorm=13.318  2.3m  eta~0.6h
+    [centroid] mae_vx=0.02501 mae_vy=0.005571 mae_vz=0.004793  rmse_vx=0.0273 rmse_vy=0.008535 rmse_vz=0.007344
+  step    375/6000  train(centroid_l2)=0.026324  lr=9.97e-04  gnorm=11.216  2.4m  eta~0.6h
+    [centroid] mae_vx=0.01864 mae_vy=0.01273 mae_vz=0.009528  rmse_vx=0.02055 rmse_vy=0.01442 rmse_vz=0.01146
+  step    400/6000  train(centroid_l2)=0.023442  lr=9.97e-04  gnorm=11.019  2.6m  eta~0.6h
+    [centroid] mae_vx=0.01907 mae_vy=0.007938 mae_vz=0.00702  rmse_vx=0.02078 rmse_vy=0.0101 rmse_vz=0.00892
+  step    425/6000  train(centroid_l2)=0.022926  lr=9.96e-04  gnorm=10.720  2.7m  eta~0.6h
+    [centroid] mae_vx=0.01994 mae_vy=0.005154 mae_vz=0.005114  rmse_vx=0.02393 rmse_vy=0.007924 rmse_vz=0.007318
+  step    450/6000  train(centroid_l2)=0.020512  lr=9.95e-04  gnorm=13.303  2.8m  eta~0.6h
+    [centroid] mae_vx=0.01767 mae_vy=0.00614 mae_vz=0.004672  rmse_vx=0.01977 rmse_vy=0.008094 rmse_vz=0.006529
+  step    475/6000  train(centroid_l2)=0.025875  lr=9.94e-04  gnorm=12.790  2.9m  eta~0.6h
+    [centroid] mae_vx=0.02161 mae_vy=0.008345 mae_vz=0.008368  rmse_vx=0.02321 rmse_vy=0.01015 rmse_vz=0.009678
+  step    500/6000  train(centroid_l2)=0.022834  lr=9.93e-04  gnorm=15.585  3.0m  eta~0.6h
+    [centroid] mae_vx=0.01791 mae_vy=0.008641 mae_vz=0.007022  rmse_vx=0.02022 rmse_vy=0.01059 rmse_vz=0.008801
+  [eval] step 500: starting rollout eval (16 seqs, sequential decode)...
+  [eval] step 500: starting EMA rollout eval (16 seqs, sequential decode)...
+  [eval] step 500: raw IMPROVEMENT=+48.37%  EMA IMPROVEMENT=+46.58%
+  [eval] step 500: val_tf=0.008651 rollout_mse=0.001727 pers_mse=0.003234 IMPROVEMENT=+46.58%  (frame1 -3763.74%, last +44.56%)  [16 seqs, 2.0s]
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mt[96ma[94mt[95me[91m_[93md[92mi[96mc[94mt[95m] [91m/[93mw[92mo[96mr[94mk[95ms[91mp[93ma[92mc[96me[94m/[95mc[91mg[93ma[92mn[96m/[94mt[95mr[91ma[93mn[92ms[96mf[94mo[95mr[91mm[93me[92mr[96m_[94mn[95me[91mu[93mr[92mI[96mP[94mS[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m/[93mr[92m3[96m3[94m1[95m_[91mh[93m1[92m1[96m_[94mr[95mi[91md[93mg[92me[96m_[94md[95mi[91ms[93mt[92mi[96ml[94ml[95m_[91mr[93mo[92ml[96ml[94mo[95mu[91mt[93m_[92mb[96me[94ms[95mt[91m.[93mp[92mt [96m([94m7[95m6[91m.[93m7[92m5 [96mM[94mB[95m)[0m
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mc[96mr[94mi[95mp[91mt[93me[92md[96m:[94mt[95mr[91ma[93mc[92me[96m] [94m/[95mw[91mo[93mr[92mk[96ms[94mp[95ma[91mc[93me[92m/[96mc[94mg[95ma[91mn[93m/[92mt[96mr[94ma[95mn[91ms[93mf[92mo[96mr[94mm[95me[91mr[93m_[92mn[96me[94mu[95mr[91mI[93mP[92mS[96m/[94ms[95ma[91mv[93me[92md[96m_[94mm[95mo[91md[93me[92ml[96ms[94m/[95mr[91m3[93m3[92m1[96m_[94mh[95m1[91m1[93m_[92mr[96mi[94md[95mg[91me[93m_[92md[96mi[94ms[95mt[91mi[93ml[92ml[96m_[94mr[95mo[91ml[93ml[92mo[96mu[94mt[95m_[91mb[93me[92ms[96mt[94m_[95ms[91mc[93mr[92mi[96mp[94mt[95me[91md[93m.[92mp[96mt [94m([95m1[91m9[93m.[92m3[96m0 [94mM[95mB[91m)[0m
+  [wandb] queued artifact upload: r331_h11_ridge_distill_rollout_best (2 file(s), v-next)
+  --> new best rollout (0.001727, +46.58% vs persistence)
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mt[96ma[94mt[95me[91m_[93md[92mi[96mc[94mt[95m] [91m/[93mw[92mo[96mr[94mk[95ms[91mp[93ma[92mc[96me[94m/[95mc[91mg[93ma[92mn[96m/[94mt[95mr[91ma[93mn[92ms[96mf[94mo[95mr[91mm[93me[92mr[96m_[94mn[95me[91mu[93mr[92mI[96mP[94mS[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m/[93mr[92m3[96m3[94m1[95m_[91mh[93m1[92m1[96m_[94mr[95mi[91md[93mg[92me[96m_[94md[95mi[91ms[93mt[92mi[96ml[94ml[95m_[91mb[93me[92ms[96mt[94m.[95mp[91mt [93m([92m5[96m7[94m.[95m5[91m6 [93mM[92mB[96m)[0m
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mc[96mr[94mi[95mp[91mt[93me[92md[96m:[94mt[95mr[91ma[93mc[92me[96m] [94m/[95mw[91mo[93mr[92mk[96ms[94mp[95ma[91mc[93me[92m/[96mc[94mg[95ma[91mn[93m/[92mt[96mr[94ma[95mn[91ms[93mf[92mo[96mr[94mm[95me[91mr[93m_[92mn[96me[94mu[95mr[91mI[93mP[92mS[96m/[94ms[95ma[91mv[93me[92md[96m_[94mm[95mo[91md[93me[92ml[96ms[94m/[95mr[91m3[93m3[92m1[96m_[94mh[95m1[91m1[93m_[92mr[96mi[94md[95mg[91me[93m_[92md[96mi[94ms[95mt[91mi[93ml[92ml[96m_[94mb[95me[91ms[93mt[92m_[96ms[94mc[95mr[91mi[93mp[92mt[96me[94md[95m.[91mp[93mt [92m([96m1[94m9[95m.[91m3[93m0 [92mM[96mB[94m)[0m
+  [wandb] queued artifact upload: r331_h11_ridge_distill_best (2 file(s), v-next)
+  step    525/6000  train(centroid_l2)=0.019687  lr=9.92e-04  gnorm=5.112  3.6m  eta~0.6h
+    [centroid] mae_vx=0.009814 mae_vy=0.007597 mae_vz=0.0128  rmse_vx=0.01257 rmse_vy=0.009954 rmse_vz=0.01385
+  step    550/6000  train(centroid_l2)=0.023610  lr=9.90e-04  gnorm=7.377  3.7m  eta~0.6h
+    [centroid] mae_vx=0.007367 mae_vy=0.01789 mae_vz=0.01014  rmse_vx=0.009975 rmse_vy=0.0197 rmse_vz=0.01168
+  step    575/6000  train(centroid_l2)=0.044075  lr=9.89e-04  gnorm=15.327  3.9m  eta~0.6h
+    [centroid] mae_vx=0.03429 mae_vy=0.00829 mae_vz=0.02414  rmse_vx=0.03567 rmse_vy=0.01185 rmse_vz=0.02562
+  step    600/6000  train(centroid_l2)=0.020601  lr=9.87e-04  gnorm=9.366  4.0m  eta~0.6h
+    [centroid] mae_vx=0.01749 mae_vy=0.005337 mae_vz=0.006261  rmse_vx=0.01946 rmse_vy=0.007936 rmse_vz=0.008119
+  step    625/6000  train(centroid_l2)=0.034056  lr=9.86e-04  gnorm=15.080  4.1m  eta~0.6h
+    [centroid] mae_vx=0.03065 mae_vy=0.01194 mae_vz=0.00396  rmse_vx=0.0317 rmse_vy=0.01367 rmse_vz=0.006135
+  step    650/6000  train(centroid_l2)=0.019220  lr=9.84e-04  gnorm=14.555  4.2m  eta~0.6h
+    [centroid] mae_vx=0.01511 mae_vy=0.007499 mae_vz=0.00502  rmse_vx=0.01733 rmse_vy=0.01002 rmse_vz=0.00722
+  step    675/6000  train(centroid_l2)=0.022843  lr=9.83e-04  gnorm=18.331  4.4m  eta~0.6h
+    [centroid] mae_vx=0.01895 mae_vy=0.009211 mae_vz=0.004255  rmse_vx=0.02064 rmse_vy=0.01131 rmse_vz=0.00675
+  step    700/6000  train(centroid_l2)=0.027282  lr=9.81e-04  gnorm=12.384  4.5m  eta~0.6h
+    [centroid] mae_vx=0.01097 mae_vy=0.02314 mae_vz=0.005004  rmse_vx=0.01347 rmse_vy=0.02433 rmse_vz=0.006498
+  step    725/6000  train(centroid_l2)=0.030840  lr=9.79e-04  gnorm=16.516  4.6m  eta~0.6h
+    [centroid] mae_vx=0.02483 mae_vy=0.01183 mae_vz=0.00857  rmse_vx=0.02638 rmse_vy=0.01511 rmse_vz=0.01016
+  step    750/6000  train(centroid_l2)=0.082839  lr=9.77e-04  gnorm=23.191  4.7m  eta~0.6h
+    [centroid] mae_vx=0.0817 mae_vy=0.006737 mae_vz=0.008971  rmse_vx=0.08209 rmse_vy=0.008866 rmse_vz=0.01034
+  [eval] step 750: starting rollout eval (16 seqs, sequential decode)...
+  [eval] step 750: starting EMA rollout eval (16 seqs, sequential decode)...
+  [eval] step 750: raw IMPROVEMENT=-6.69%  EMA IMPROVEMENT=+44.05%
+  [eval] step 750: val_tf=0.009509 rollout_mse=0.001809 pers_mse=0.003234 IMPROVEMENT=+44.05%  (frame1 -3399.55%, last +43.10%)  [16 seqs, 2.0s]
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mt[96ma[94mt[95me[91m_[93md[92mi[96mc[94mt[95m] [91m/[93mw[92mo[96mr[94mk[95ms[91mp[93ma[92mc[96me[94m/[95mc[91mg[93ma[92mn[96m/[94mt[95mr[91ma[93mn[92ms[96mf[94mo[95mr[91mm[93me[92mr[96m_[94mn[95me[91mu[93mr[92mI[96mP[94mS[95m/[91ms[93ma[92mv[96me[94md[95m_[91mm[93mo[92md[96me[94ml[95ms[91m/[93mr[92m3[96m3[94m1[95m_[91mh[93m1[92m1[96m_[94mr[95mi[91md[93mg[92me[96m_[94md[95mi[91ms[93mt[92mi[96ml[94ml[95m_[91mb[93me[92ms[96mt[94m.[95mp[91mt [93m([92m5[96m7[94m.[95m5[91m6 [93mM[92mB[96m)[0m
+[91m[[93mw[92mr[96mi[94mt[95me[91m:[93ms[92mc[96mr[94mi[95mp[91mt[93me[92md[96m:[94mt[95mr[91ma[93mc[92me[96m] [94m/[95mw[91mo[93mr[92mk[96ms[94mp[95ma[91mc[93me[92m/[96mc[94mg[95ma[91mn[93m/[92mt[96mr[94ma[95mn[91ms[93mf[92mo[96mr[94mm[95me[91mr[93m_[92mn[96me[94mu[95mr[91mI[93mP[92mS[96m/[94ms[95ma[91mv[93me[92md[96m_[94mm[95mo[91md[93me[92ml[96ms[94m/[95mr[91m3[93m3[92m1[96m_[94mh[95m1[91m1[93m_[92mr[96mi[94md[95mg[91me[93m_[92md[96mi[94ms[95mt[91mi[93ml[92ml[96m_[94mb[95me[91ms[93mt[92m_[96ms[94mc[95mr[91mi[93mp[92mt[96me[94md[95m.[91mp[93mt [92m([96m1[94m9[95m.[91m3[93m0 [92mM[96mB[94m)[0m
+  [wandb] queued artifact upload: r331_h11_ridge_distill_best (2 file(s), v-next)
+  step    775/6000  train(centroid_l2)=0.033069  lr=9.75e-04  gnorm=19.386  5.3m  eta~0.6h
+    [centroid] mae_vx=0.02944 mae_vy=0.006805 mae_vz=0.01077  rmse_vx=0.03081 rmse_vy=0.008515 rmse_vz=0.01255
+  step    800/6000  train(centroid_l2)=0.019716  lr=9.73e-04  gnorm=6.686  5.5m  eta~0.6h
+    [centroid] mae_vx=0.008232 mae_vy=0.005742 mae_vz=0.01504  rmse_vx=0.01074 rmse_vy=0.00788 rmse_vz=0.01601
+  step    825/6000  train(centroid_l2)=0.029692  lr=9.71e-04  gnorm=5.661  5.6m  eta~0.6h
+    [centroid] mae_vx=0.007973 mae_vy=0.01532 mae_vz=0.02241  rmse_vx=0.01073 rmse_vy=0.01666 rmse_vz=0.02325
+  step    850/6000  train(centroid_l2)=0.042009  lr=9.68e-04  gnorm=23.897  5.8m  eta~0.6h
+    [centroid] mae_vx=0.03983 mae_vy=0.007125 mae_vz=0.007616  rmse_vx=0.04104 rmse_vy=0.009185 rmse_vz=0.009449
+  step    875/6000  train(centroid_l2)=0.023058  lr=9.66e-04  gnorm=11.926  5.9m  eta~0.6h
+    [centroid] mae_vx=0.01632 mae_vy=0.01075 mae_vz=0.00871  rmse_vx=0.01918 rmse_vy=0.01253 rmse_vz=0.01048
+  step    900/6000  train(centroid_l2)=0.031782  lr=9.63e-04  gnorm=15.837  6.1m  eta~0.6h
+    [centroid] mae_vx=0.02918 mae_vy=0.008794 mae_vz=0.005034  rmse_vx=0.03089 rmse_vy=0.01075 rmse_vz=0.006784
+  step    925/6000  train(centroid_l2)=0.048684  lr=9.61e-04  gnorm=18.746  6.2m  eta~0.6h
+    [centroid] mae_vx=0.03665 mae_vy=0.02667 mae_vz=0.01436  rmse_vx=0.03772 rmse_vy=0.02788 rmse_vz=0.01582
+epoch   1  MAE   model=2.287e-02  ridge=9.413e-03  pers=1.548e-02   [91mΔmodel= -47.66%[0m  [92mΔridge= +39.21%[0m  [91mcaptured=-121.6% [----------][0m
+epoch   1  RMSE  model=3.495e-02  ridge=1.547e-02  pers=3.138e-02   [91mΔmodel= -11.40%[0m  [92mΔridge= +50.69%[0m  [91mcaptured= -22.5% [----------][0m
+epoch   1  L2    model=4.703e-02  ridge=1.893e-02  pers=3.163e-02   [91mΔmodel= -48.67%[0m  [92mΔridge= +40.17%[0m  [91mcaptured=-121.2% [----------][0m
+  step    950/6000  train(centroid_l2)=0.020948  lr=9.58e-04  gnorm=7.451  6.4m  eta~0.6h
+    [centroid] mae_vx=0.006161 mae_vy=0.01714 mae_vz=0.007064  rmse_vx=0.008404 rmse_vy=0.01921 rmse_vz=0.008916
+  step    975/6000  train(centroid_l2)=0.017313  lr=9.56e-04  gnorm=5.464  6.5m  eta~0.6h
+    [centroid] mae_vx=0.008747 mae_vy=0.01225 mae_vz=0.004199  rmse_vx=0.01144 rmse_vy=0.0141 rmse_vz=0.006001
+  step   1000/6000  train(centroid_l2)=0.022954  lr=9.53e-04  gnorm=20.879  6.7m  eta~0.6h
+    [centroid] mae_vx=0.01863 mae_vy=0.007401 mae_vz=0.006049  rmse_vx=0.02066 rmse_vy=0.01114 rmse_vz=0.008383
+  [eval] step 1000: starting rollout eval (16 seqs, sequential decode)...
+  [eval] step 1000: starting EMA rollout eval (16 seqs, sequential decode)...
+  [eval] step 1000: raw IMPROVEMENT=+40.41%  EMA IMPROVEMENT=+41.47%
+  [eval] step 1000: val_tf=0.009736 rollout_mse=0.001893 pers_mse=0.003234 IMPROVEMENT=+41.47%  (frame1 -3265.69%, last +38.80%)  [16 seqs, 1.7s]
+  step   1025/6000  train(centroid_l2)=0.018839  lr=9.50e-04  gnorm=14.141  7.3m  eta~0.6h
+    [centroid] mae_vx=0.009589 mae_vy=0.01036 mae_vz=0.008602  rmse_vx=0.0126 rmse_vy=0.01276 rmse_vz=0.01049
+  step   1050/6000  train(centroid_l2)=0.013965  lr=9.47e-04  gnorm=15.240  7.4m  eta~0.6h
+    [centroid] mae_vx=0.009677 mae_vy=0.004631 mae_vz=0.006324  rmse_vx=0.01177 rmse_vy=0.006661 rmse_vz=0.00789
+  step   1075/6000  train(centroid_l2)=0.025685  lr=9.44e-04  gnorm=15.177  7.6m  eta~0.6h
+    [centroid] mae_vx=0.02205 mae_vy=0.004861 mae_vz=0.009399  rmse_vx=0.02369 rmse_vy=0.007195 rmse_vz=0.01089
+  step   1100/6000  train(centroid_l2)=0.018677  lr=9.41e-04  gnorm=8.130  7.8m  eta~0.6h

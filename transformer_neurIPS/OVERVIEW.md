@@ -9093,21 +9093,23 @@ session (full detail and exact numbers in the referenced sections):
 | 4 | GPU-utilization / efficiency pass (`PFD_CUDA_MICRO_BATCH`, `AR_SEQS` increase, `torch.compile`) | §78-79 | `torch.compile` actively HURT this workload (frame_ar's growing-context loop defeats dynamo's shape cache -- a real, previously-undocumented incompatibility, now disabled again). Raising `AR_SEQS` 2->16 delivered a real efficiency win (8x more AR-loss sequences per step for ~1.5-2x the wall-clock cost) but did NOT calm the gradient-noise trace as hypothesized (mean/median pre-clip `gnorm` unchanged, §prior-turn finding) and did not change model quality (+43.48% vs +46.60%, within existing run-to-run noise) |
 | 5 | Diagnosed the "worse than the previous-frame anchor" console line as a false alarm, not a real instability signal | §80 | Confirmed via direct log analysis (100% of steps flagged, including at the run's own peak, including on clean noise-free validation loss) -- fixed the display, not a training change |
 
-**What's still genuinely open, not yet tried**:
+**#1 PRIORITY -- see §83**: a real (if early-stopped-by-hand, single
+A/B) run found that REMOVING the `(x,y,z,t,param)` "meta" input columns
+(`USE_META_COLS=False`) did not hurt `improvement_pct` and, on the
+trainer's own promotion-gated best checkpoint, beat the control by 2
+points (+46.58% vs +44.55%, same step). This cuts against a basic
+assumption every arm this session was built on. Not yet confirmed as a
+repeatable effect vs. one lucky A/B pair -- repeating this comparison
+(ideally to completion) is the most urgent next step, ahead of
+everything below.
+
+**What's otherwise still genuinely open, not yet tried**:
 - **The autoencoder's own reconstruction floor, on the centroid triplet
   specifically, has never been measured or reported alongside a real
   run's result** (§81.4b, backlog). Until this exists, it's unknown
   whether some (or much) of the gap between persistence and the
   ~48-51% ceiling is actually the frozen AE's own lossy encoding, not
   anything the transformer could fix.
-- **Whether the model needs the `(x,y,z,t,param)` "meta" input columns
-  at all** -- built and dry-run validated (not yet launched, §82) an
-  A/B ablation (`USE_META_COLS` True vs False) on the modern recipe.
-  `param` (the experiment identifier) IS in the model's input today by
-  default, contrary to an initial assumption raised and corrected this
-  session -- the open question is whether the model is actually USING
-  it in a way that matters for the exposure-bias ceiling, not whether
-  it's present.
 - A real sweep over `AR_SCHED_MIX_P` values (only `0.3` has been tried)
   -- idea #3 above is promising but under-explored.
 - The actual source of the large pre-clip gradient norms (`gnorm`
@@ -9273,3 +9275,121 @@ NETWORK_VOLUME_ID=yl7f9e8rwr \
   --queue=/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_queue_meta_cols_ablation.json \
   --slots=2 --total-budget-hours=1.0 --wandb-group=NC1701
 ```
+
+## 83. v10.11 -- MAJOR FINDING: removing `(x,y,z,t,param)` did NOT hurt, and slightly WON -- flagged as the #1 research priority for the incoming developer
+
+### 83.1 The result (run stopped early by the user for review, not a completed early-stop)
+
+Both `meta_cols_control_on` (round 330, `USE_META_COLS=True`) and
+`meta_cols_ablation_off` (round 331, `USE_META_COLS=False`) ran
+concurrently, same pod, `--wandb-group=NC1702`. The user manually
+inspected the live log, judged the pattern already conclusive, and
+had the pod pulled back and terminated (`runpodctl pod delete
+7gpby8ggldu7d6`) before either run reached its own early-stop --
+`rollout_mse`/`improvement_pct` at every eval checkpoint BOTH runs
+reached is real, pulled-back data, not a projection.
+
+**Every eval checkpoint, both runs, side by side:**
+
+| step | round 330 (`USE_META_COLS=True`, control) | round 331 (`USE_META_COLS=False`, ablation) |
+|---|---|---|
+| 250 | +42.77% | **+44.75%** |
+| 500 | +44.55% | **+46.58%** |
+| 750 | +42.18% | **+44.05%** |
+| 1000 | **+41.62%** | +41.47% |
+| **best (promoted)** | **+44.55%** (step 500) | **+46.58%** (step 500) |
+
+The ablation run (NO `x,y,z,t,param` -- latents only) matched or beat
+the control at every single checkpoint except one near-tie, and its
+own best/promoted checkpoint (the number that actually matters --
+this is what `_rollout_best.pt` gets saved from) beat the control's
+best by a full 2 points, AT THE SAME STEP. This is not single-
+checkpoint luck -- it's the trainer's own promotion gate, on real
+pulled-back data, at 4 independent eval points.
+
+### 83.2 Why this is alarming, stated plainly
+
+§82.3 wrote down, in advance of running this, what each outcome would
+mean:
+
+> If round 331 performs THE SAME OR BETTER -- exactly the user's own
+> framing ("if removal had no impact, we are doing something very
+> wrong here") -- that would mean 5 of the model's 52 input dimensions
+> are dead weight in the CURRENT recipe, which either points at a
+> genuine bug in how that context reaches the loss/rollout, or means
+> the model has never needed to learn to use it.
+
+That is exactly what happened, and it's the WORSE of the two readings
+(not "no difference," but "measurably better without it"). Every
+architectural piece needed to use `param`/position is present and
+active (§82.1: `USE_META_COLS=True` by default, full 52-dim row goes
+through `input_projection`, confirmed live on CPU that perturbing
+those columns changes the output when the flag is on). And yet giving
+the model LESS information produced a BETTER rollout result, twice
+independently confirmed direction (3 of 4 checkpoints, and the
+promotion-gated best). This is inconsistent with "the model is
+correctly using per-experiment context to disambiguate its
+predictions" -- if it were, removing that context should cost
+something, not nothing or a net gain.
+
+### 83.3 Plausible explanations -- none yet confirmed, all worth investigating
+
+- **The columns may be acting as noise/distraction, not signal, given
+  their scale.** §81.2/OVERVIEW.md line 63: `x,y,z,t,param` are raw
+  magnitudes up to ~49x the latent's own scale; `NORMALIZE_FEATURES`
+  is supposed to correct this via per-column standardization
+  (train_production_transformer_deep_dive.py:5299), but whether that
+  normalization is actually well-conditioned for the AR/rollout
+  feedback path specifically (not just the plain teacher-forced path)
+  has never been directly checked.
+- **The per-sequence `param`/`t_idx` may be redundant with information
+  the model can already infer from the latent trajectory itself** --
+  if consecutive latents alone are sufficient to identify which
+  physical regime a sequence is in (plausible, since the encoder's
+  latent presumably already reflects the dynamics of whichever
+  experiment produced it), then the explicit `param` column adds
+  nothing NEW, and the model may be spending capacity/gradient on
+  learning to ignore or partially rely on a redundant, badly-scaled
+  signal -- costing more than it gives back.
+- **A bug in how `x,y,z,t_idx,param` propagate through the
+  autoregressive rollout specifically**, distinct from the plain
+  teacher-forced path -- `rollout_frames()`'s own docstring
+  (train_production_transformer_deep_dive.py:3217) states these
+  columns are "taken from ground truth, exactly as at inference time
+  where they are known" during rollout, which is claimed correct but
+  has not been independently verified with a dedicated test the way
+  the centroid-index mapping was (§74.1) or the `_feed_final` gate was
+  (§77 test suite). Worth confirming this claim is actually true in
+  code, not just in a comment.
+- **This may simply be within run-to-run noise** despite the
+  consistent direction -- one A/B pair, stopped early, is a real
+  signal worth escalating but not yet a statistically established
+  effect. The single most direct next step is repeating this exact
+  A/B (ideally to full early-stop/completion, and ideally more than
+  once) before concluding the meta columns are actively harmful rather
+  than simply not helpful in this one instance.
+
+### 83.4 Handed off as the #1 research priority
+
+This supersedes the earlier framing in §81.5/§82 ("still open, not yet
+tried") -- promoted to the top of the incoming developer's priority
+list, ahead of the `AR_SCHED_MIX_P` sweep and the gradient-noise
+investigation, because it cuts against a basic modeling assumption
+(that per-experiment context should help, or at worst be neutral) that
+every single arm and hyperparameter search this entire session was
+built on top of without questioning. If the meta columns are actively
+harmful, that's a simpler, more fundamental fix than anything tried in
+§74-82, and re-running EVERY prior comparison with `USE_META_COLS=False`
+may be warranted once this is confirmed, not just this one A/B pair.
+
+### 83.5 Artifacts preserved
+
+Pulled back before pod termination: `sweep_logs/r330_h11_ridge_distill.log`,
+`sweep_logs/r331_h11_ridge_distill.log`, and both rounds' checkpoints
+(`saved_models/r330_h11_ridge_distill_*.pt`,
+`saved_models/r331_h11_ridge_distill_*.pt`, plus their
+`_status.json`s -- written directly under `saved_models/`, not
+`saved_models/manual/`, since the run was killed before the normal
+bake-off classify/pull-back path ran). Staged to git (`git add -f`,
+same convention as §82's checkpoint audit) for the user to commit --
+not committed or pushed by this session.

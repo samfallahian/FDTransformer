@@ -5112,3 +5112,4164 @@ one slot gives up.
    after a promotion, one eval of slack), trading a real chance of
    stopping on a single noisy eval for much faster sessions; worth
    watching whether this ever cuts off a run that would have recovered.
+
+## 43. v7.3 -- §40.2's objective-mismatch arms built and locally verified, a real pod-infra investigation (upload-speed gating, then network volumes), and several bugs found the hard way along the way
+
+**Status: branch M (the arms) and the network-volume pipeline are both
+built and locally/API-verified. Neither has been run for real on CUDA
+yet** -- blocked on H200 stock in the one datacenter the network volume
+is pinned to, which `provision_and_run.sh` now retries for automatically
+(see below) rather than failing on the first empty check. Everything
+below is what actually happened this session, not a plan for later.
+
+### 43.1 Branch M -- §40.2's objective-mismatch hypothesis, finally built
+
+§40.2 (v7.0) named this explicitly as a to-do, not yet built: every arm
+through h11 trains mostly teacher-forced, with the AR rollout loss a
+light additive augmentation, then gets scored on a full AR rollout it
+was never directly, heavily optimized against. Scoping this corrected an
+assumption along the way: on CUDA, `accum_steps = virtual_batch //
+micro_batch == 1` (CUDA sets `virtual_batch == micro_batch`), so the
+`micro == 0`-only AR gate in the training loop is a no-op wherever AR
+actually runs -- it only ever mattered on MPS/CPU, where `frame_ar` is
+disabled outright anyway. The real "AR is a light touch" mechanism on
+CUDA is `AR_SEQS` (only 2 of a 64-row batch get the sequential AR
+rollout in every arm through h11) plus AR always being purely additive
+on top of a fixed-weight teacher-forced loss, never a partial
+replacement of it.
+
+Per an explicit decision this session, branch M does **not** touch the
+loss-composition code itself (no TF/AR blend schedule) -- everything
+ships as new arm configs on existing `Config` knobs, one lever at a time
+(mirrors branch V's discipline) before a combined arm:
+
+- **`m1_ar_weight`** -- h9's exact config, `AR_LOSS_WEIGHT` 1.0 -> 3.0.
+- **`m2_ar_curriculum`** -- h9's exact config, a faster/earlier rollout-
+  horizon curriculum than h11's (`AR_FRAMES_START` 2->1,
+  `AR_FRAMES_WARMUP_FRAC` 0.3->0.1).
+- **`m3_ar_combined`** -- m1 + m2, plus `AR_SEQS` originally set to 16
+  (8x h9/h11's 2). **Revised down to 12 later this same session** (see
+  §43.4) after a memory estimate put 16 over an H200's real capacity.
+
+**Local verification, in place of the CUDA run that hasn't happened
+yet:** `tests/test_ar_objective_arms.py` (arm resolution/`apply_arm()`
+pins), a regression case added to `tests/test_ar_frames_curriculum.py`
+for m2/m3's exact curriculum numbers, and -- the one that actually
+matters mechanically -- `tests/test_frame_ar_loss_direct.py`, which
+calls `frame_ar_loss()` directly with a real (small) `BaseTransformer`
+through the real production decoder, at each arm's real `AR_SEQS`/
+`AR_FRAMES` values, and confirms finite loss + finite gradients on every
+parameter. Neither `--smoke-test` nor a real local training run reaches
+this code path on this Mac (MPS disables `frame_ar` entirely), so this
+is the only thing that actually exercises it here. Also ran `m1_ar_weight`
+for real against the real local `train_80.h5`/`val_80.h5` for one
+optimizer step -- confirmed the arm resolves, warm-starts, and correctly
+hits the MPS `frame_ar` disable guard.
+
+### 43.2 A pod-speed gate, built, tested, and then partly superseded
+
+**Motivation:** one real pod (`38.80.152.249:30708`) had scp upload
+speeds so slow it would have taken 30+ minutes for <20GB, vs. the
+~268 MB/s this pipeline normally sees. New script,
+`singleshot/select_fastest_pod.sh`: provisions `NUM_CANDIDATES` (default
+3) cheap A40 pods concurrently, benchmarks each one's real upload
+throughput with the same `lib_scp.sh` split-lane mechanism
+`scp_data_files.sh` uses in production, keeps the fastest, terminates
+the rest immediately.
+
+**Two-tier tests, following this repo's existing pure-function/live-
+skippable split:** `tests/test_pod_speed_gate_ranking.py` (fast, free,
+sources the script with a `BASH_SOURCE == $0` guard so the ranking logic
+runs with zero network dependency) and `tests/test_pod_speed_gate_live.py`
+(opt-in via `RUN_LIVE_POD_TESTS=1`, creates real pods, force-deletes
+everything including the winner in its own teardown).
+
+**Three real bugs found only by actually running it against live pods:**
+
+1. **`declare -ga` is bash 4.2+ only.** macOS's stock bash (3.2.57)
+   rejects `-g` outright ("declare: -g: invalid option"), which meant
+   `ALL_CREATED_PODS` was never actually created and `cleanup()` broke
+   with "unbound variable" under `set -u`. Fixed with a plain assignment
+   (global-by-default inside a function unless shadowed by `local`,
+   portable to 3.2).
+2. **`local tmpdir` inside `main()` didn't survive to the EXIT trap.**
+   `cleanup()` fires AFTER `main()` returns, by which point a `local`
+   variable's storage is gone -- same fix, plain assignment instead.
+3. **`sort` gives no stability guarantee on ties.** A 50.0/50.0 MB/s tie
+   non-deterministically picked the SECOND candidate on this machine,
+   not the first as documented -- fixed with an explicit secondary sort
+   key on original index.
+
+**Live results, twice:** run 1 (2 candidates) -- 1 failed to provision
+with a RunPod-side `"graphql error: Something went wrong"`, the survivor
+benchmarked at 37.5 MB/s. Run 2 (3 candidates) -- 2 of 3 failed with the
+**exact same** transient error, a real, reproducible signal that
+RunPod's API doesn't like fully-simultaneous `pod create` calls from one
+account (not GPU stock, not this script's logic). The lone survivor's
+own reported 10.7 MB/s vs. `lib_scp.sh`'s internal "16.7 MB/s aggregate"
+print for the same transfer is not a bug -- the outer timer honestly
+includes remote reassembly+sha256-verify, which the real
+`scp_data_files.sh` also pays, not just the raw send.
+
+This tool still exists and works, but its purpose for the BIG data
+transfer specifically was superseded by §43.3 below -- upload once to a
+persistent volume beats re-benchmarking+re-uploading every run. Still
+useful for the smaller env-files phase or a one-off benchmark.
+
+### 43.3 Network volumes: a real dead end, then a real fix, then a real bug
+
+**RunPod "Global Volumes" (beta) do NOT have any API/CLI surface at all
+right now** -- confirmed directly against the live OpenAPI spec
+(`rest.runpod.io/v1/openapi.json`): the only volume path is
+`/networkvolumes`; there is no `/globalvolumes`. Creation/attachment is
+console-only. This is exactly what the user's own pre-existing volume
+(`cmu4kk3zv000007l7cn5e9vxh`, common name `chilly_blue_turtle`) was --
+explaining why `runpodctl network-volume get/list` couldn't see it: not
+a permissions bug, a genuinely different, not-yet-exposed resource type.
+Global Volumes are also explicitly documented as not-fully-POSIX (no
+file locking, no atomic rename) -- HDF5 would likely need
+`HDF5_USE_FILE_LOCKING=FALSE` to read reliably from one even if API
+access existed.
+
+**Created a real, automatable classic Network Volume instead:**
+`yl7f9e8rwr` ("cgan-transformer-data"), pinned to `US-GA-2` -- one of
+the few datacenters that supports network volumes AND carries H200
+stock (most volume-capable datacenters don't have H200 at all).
+Uploaded `train_80.h5`/`val_80.h5` for real; sha256-verified both by the
+script and independently by hand.
+
+**Real bug hit and fixed: "Disk quota exceeded" during reassembly.** The
+volume's original 25GB was sized for the two files' final size
+(~14.1GB) but not the TRANSIENT peak during reassembly:
+`scp_reassemble_verify()` used to `cat` every split piece into the final
+file in one shot, needing the full set of pieces AND the full final file
+on disk simultaneously (~2x peak per file), and both files reassemble
+concurrently by design -- real peak hit ~26GB against a 25GB volume.
+Immediate fix: resized the volume to 50GB. Root-cause fix, in
+`lib_scp.sh` itself (benefits every caller, not just this one volume):
+`scp_reassemble_verify()` now appends and deletes ONE piece at a time,
+keeping peak usage close to 1x instead of 2x.
+
+### 43.4 `provision_and_run.sh` re-wired for the network volume, plus two more real bugs and a stock-scarcity retry
+
+**`NETWORK_VOLUME_ID` (+ `DATA_CENTER_IDS` override), new, opt-in:**
+looks up the volume's datacenter automatically, pins pod creation AND
+H200/H300 GPU auto-detection to it (stock elsewhere doesn't help --
+the pod can't be created anywhere else and still attach the volume),
+and replaces the whole "Phase 2/2: data files" step with a fast remote
+`stat` size-check against the local files -- training refuses to launch
+on a mismatch rather than silently training on stale/missing data.
+Unset (default): byte-for-byte the original re-upload-every-run
+behavior, no pinning.
+
+**A real, unrelated bug found and fixed while wiring this up:** the
+concurrent-arm launch heredoc (`launch_training()`, unquoted `<<REMOTE`)
+had two documentation comments containing backtick-quoted code spans --
+`` `compile_worker/__main__.py --workers=N` `` and `` `ps aux` `` --
+which an UNQUOTED heredoc's local shell treats as real command
+substitution, not inert text. This crashed every concurrent-arm launch
+before training even started (`compile_worker/__main__.py: No such file
+or directory`, then macOS's own `_windowserver` process line from the
+locally-executed `ps aux` output getting spliced into the remote script
+and misinterpreted as commands there too). Fixed by escaping both
+backticks.
+
+**Standing instruction from this session, applied:** `cleanup_pod()`'s
+`FORCE_TERMINATE_ON_PULL_FAILURE` default flipped from 0 to 1 -- the pod
+is now terminated on exit regardless of pull-back outcome. A dangling
+billed pod is worse than a lost local artifact wandb's own versioned
+Artifact upload can usually recover anyway. Set it to 0 explicitly for
+one run if the old protective behavior is ever wanted back.
+
+**GPU stock scarcity turned out to be real, not a bug -- added a retry
+loop instead of failing fast.** `US-GA-2` (where the volume lives)
+genuinely had zero H200 stock for a while. New `GPU_WAIT_SECS` (default
+300s/5min) and `GPU_POLL_INTERVAL_SECS` (default 10s) poll instead of
+failing on the very first empty check; validated the mechanism directly
+against the real API (real polling, real elapsed-time tracking, correct
+give-up behavior).
+
+**GPU pool broadened to a real, cheaper option -- then found it doesn't
+help THIS volume specifically.** New `GPU_AUTO_DETECT_PATTERN` (default
+now `H200|H300|RTX PRO 6000 Blackwell (Server|Workstation) Edition$`,
+overridable) adds the RTX PRO 6000 Blackwell 96GB cards ($2.09-2.19/hr,
+cheaper than H100's $3.49/hr) to the auto-detect pool -- AR-rollout
+memory scales with an arm's `AR_SEQS`, not `micro_batch`, so
+h9/h11/m1/m2 (all `AR_SEQS=2`, ~34GB observed on H200) fit comfortably
+in 96GB. The trailing `Edition$` anchor is load-bearing: without it this
+would also match that card's much-smaller MIG-sliced variants (24GB/
+48GB), which would NOT fit. Checked directly against the live API,
+though: this card isn't offered in `US-GA-2` at all, so it doesn't
+unblock the current wait there specifically -- still useful for a
+future volume in a datacenter that has it (e.g. `US-CA-2`/`US-MO-2`,
+which support both network volumes and this card), or for any run not
+pinned to a volume.
+
+### 43.5 `m3_ar_combined`'s `AR_SEQS` revised 16 -> 12 after an honest memory estimate
+
+Using the training script's own `_attn_bytes` memory-estimate formula,
+calibrated against the ONE real data point available (h9/h11's own
+measured ~34GB/141GB on H200 at `AR_SEQS=2`): the rough attention-score-
+only estimate under-reports real usage by a roughly constant ~8.4GB
+(weights, optimizer state, non-attention activations, framework
+overhead) that doesn't scale with `AR_SEQS`, only the AR-rollout term
+itself does. Extrapolating that fixed-overhead model:
+
+| AR_SEQS | estimated real usage | vs. H200's 141GB |
+|---|---|---|
+| 2 (h9/h11, m1/m2) | ~34GB (measured, not estimated) | comfortable |
+| 8 (h5_ar_moreseqs' own ceiling) | ~89GB estimated | comfortable |
+| 12 | ~126GB estimated | ~89% capacity, tight but plausible |
+| 16 (original m3 value) | ~162GB estimated | **over capacity** |
+
+`m3_ar_combined` shipped at **`AR_SEQS=12`** per this session's decision
+-- an ESTIMATE from a single calibration point, NOT yet confirmed on
+real hardware. If it OOMs for real, `AR_SEQS=8` (comfortable estimated
+margin, matches `h5_ar_moreseqs`'s already-proven ceiling) is the
+documented fallback, right in the arm's own `desc`.
+
+### 43.6 What's still actually pending
+
+- Branch M (`m1`/`m2`/`m3`) has never run on real CUDA hardware. Local
+  verification (§43.1) is mechanical correctness, not a research
+  result -- same caveat this file has repeated at every prior MPS-only
+  milestone.
+- `m3_ar_combined`'s `AR_SEQS=12` memory fit is an estimate, not a
+  confirmed one.
+- The network-volume pipeline (§43.3/§43.4) has never actually launched
+  a training run yet -- blocked on `US-GA-2` H200/H100 stock at the
+  time of writing, now waited-on automatically via `GPU_WAIT_SECS`
+  rather than failing immediately.
+
+### 43.7 `WANDB_PROJECT` synced to the new major version
+
+Per the §21.1 convention, `Config.WANDB_PROJECT` renamed
+`NI_Review_v6` -> `NI_Review_v7`, kept in sync by `test_version_sync.py`
+(this file crossed into major version 7 back at §40's v7.0 -- the
+rename itself just hadn't been done until now; `test_version_sync.py`
+had accordingly been failing since v7.0 landed, caught and confirmed via
+`git stash` earlier this same session, and is green again as of this
+rename).
+
+## 44. v7.4 -- §43.5's memory estimate corrected by a real run: `m3_ar_combined`'s `AR_SEQS` reinstated at 16
+
+**§43.5's linear-extrapolation memory estimate was too pessimistic --
+confirmed by an actual cold-start run, not another estimate.** While
+§43 was still being written, a `m3_ar_combined` run (`--fresh
+--no-warm-start`, round 2, `WANDB_GROUP=Storage`) was launched by hand
+on a real `US-GA-2` H200 pod, on the code as it stood BEFORE this
+session's `AR_SEQS` walk-back (i.e. still at the original `AR_SEQS=16`).
+Checked it live, twice, ~2 minutes apart:
+
+- **Steady-state GPU memory: 63,611 MiB / 143,771 MiB (44%)** --
+  identical both checks, i.e. genuinely steady-state, not still
+  climbing mid-curriculum.
+- No OOM, no crash, running smoothly at step 1575/2500 (17.8 min into
+  its 30-min cap) at check time.
+- **First real eval, step 1500: `rollout_mse` beat persistence by
+  +27.71%**, promoted to `_best.pt`. One early eval point -- promising,
+  not conclusive; §39's peak-then-decline pattern has repeated across
+  three prior arms, so this needs to hold up at later evals before it
+  means anything on its own.
+
+63.6GB is not close to §43.5's estimated ~162GB for `AR_SEQS=16`, and
+not even close to the "safe" `AR_SEQS=12` estimate (~126GB) that
+estimate led to shipping instead. The linear model (fixed overhead +
+`AR_SEQS`-proportional attention-score memory) assumed the AR-rollout
+loop's sequential forward passes keep their activations live
+simultaneously; the real allocator evidently reuses/frees them far more
+aggressively across the loop than that assumed. Lesson: a memory
+estimate extrapolated from a SINGLE calibration point is a reason to be
+cautious before a first real run, not a substitute for one -- this is
+exactly why `m3_ar_combined`'s own `desc` said "not yet confirmed on
+real hardware," and it wasn't, until now.
+
+**`AR_SEQS` reinstated to 16** (`train_production_transformer_deep_dive.py`,
+`tests/test_ar_objective_arms.py`, `tests/test_frame_ar_loss_direct.py`
+all updated together, full suite re-verified green). `m3_ar_combined`'s
+`desc` now cites this run's measured number instead of the withdrawn
+estimate.
+
+**Portability note added per this session's own request:** this 63.6GB/
+44% measurement is H200-specific (143.8GB total). `provision_and_run.sh`
+v7.3's broadened `GPU_AUTO_DETECT_PATTERN` (§43.4) means a real run
+could land on an H100 (80GB) or an RTX PRO 6000 Blackwell (96GB) --
+neither confirmed to leave the same headroom at `AR_SEQS=16`. `AR_SEQS`
+is the knob to turn down first if `m3_ar_combined` OOMs on a
+smaller-VRAM card -- 12 or 8 (`h5_ar_moreseqs`'s own already-proven
+ceiling) are the documented fallbacks, now noted directly in the arm's
+`desc` rather than only here.
+
+## 45. v7.5 -- the per-epoch console report gets a ridge/linear-baseline column, a live "ceiling captured" metric, and its color was silently broken in every real run until now
+
+**Root cause found for "why does the console output have no color at
+all": it was never rendering, on any real pod run, full stop.**
+`_COLOR_ON` gates on `sys.stdout.isatty()`, and `provision_and_run.sh`'s
+`launch_training()` pipes the remote training process's stdout through
+`ssh | awk` (for the `[arm/rN]` tag prefix) -- never a tty. Every colored
+`Δ=...%` this report has ever printed on a real pod run rendered as
+plain text; the color logic itself was correct, it just never activated
+outside a local interactive shell. Fixed by exporting
+`PFD_FORCE_COLOR=1` in the remote launch script -- the escape codes
+survive `awk`'s tagging (it only prepends text, doesn't touch the
+line's own content) and render fine both in a real terminal and in
+wandb's own console-capture view (which supports ANSI).
+
+**Third comparison column added: the ridge/linear map, not just
+persistence.** New `_load_ridge_map_for_report()` (lazily loaded and
+cached, mirroring `_load_decoder()`'s pattern) loads `RIDGE_MAP_PATH`
+independently of whether the current arm trains against it
+(`RIDGE_DISTILL_WEIGHT` can be 0.0) -- the SAME map §32.1's own
++69%-vs-persistence ceiling number comes from. `per_epoch_persistence_
+report()` now rolls the ridge map out from the same starting context as
+the persistence baseline (`ridge_rollout_targets()`, already used
+safely elsewhere -- never touches the network, see that function's own
+safety docstring) and reports three things per metric (MAE/RMSE/L2),
+colored:
+
+- `Δmodel` -- model vs. persistence (existing, was already computed,
+  just never actually rendered in color -- see above).
+- `Δridge` -- the ridge map's own margin over persistence, i.e. the
+  achievable ceiling.
+- `captured` -- `Δmodel / Δridge * 100`: what fraction of that ceiling
+  the model has actually closed. >=50% green, 0-50% yellow, negative red
+  (model is worse than persistence even though the ceiling itself is
+  reachable), `n/a` when the ridge map doesn't beat persistence on this
+  metric (nothing to divide by). Also gets a small fixed-width ASCII bar
+  (`ceiling_bar()`) alongside the number.
+
+This is the live version of a question this file has answered only
+post-hoc until now (§32.1, §39, §41's r9/r10/r11/r12 tables) -- "how much
+of the linear map's headroom has the model actually captured" is now a
+number printed every single eval, not something recovered later from a
+pulled-back log.
+
+Gracefully absent (not an error) when `RIDGE_MAP_PATH` doesn't exist yet
+or `TOKENIZATION != 'token'` (`ridge_rollout_targets()`'s own scoping,
+matching `ridge_distill_targets()`) -- existing `persistence/*` W&B keys
+and console behavior are unchanged in that case, fully backward
+compatible.
+
+**W&B: new keys, plus a section meant to bubble to the top.** New
+`persistence/*_ridge*` keys alongside the existing (unchanged)
+`persistence/*_model`/`*_pers`/`*_delta_pct` ones. The three
+`captured_pct` numbers ALSO get logged under a separate `00_ceiling/*`
+namespace -- the leading `00_` is deliberate: W&B's default workspace
+panel/sidebar ordering is alphabetical by section name, so this is the
+section most workspaces will show first without any manual pinning.
+
+**Tests:** `tests/test_ridge_ceiling_report.py` -- pure-function tests
+for `pct_improvement()`/`pct_ceiling_captured()`/`ceiling_bar()`
+(promoted out of `per_epoch_persistence_report()`'s own closures to
+module level specifically so they're independently testable, matching
+this file's own repeated "extract the pure logic, test it in isolation"
+pattern), `_load_ridge_map_for_report()` tests using the same
+hand-checkable `A = 2*I` ridge matrix trick as
+`tests/test_ridge_distill_loss.py`/`tests/test_split_anchor.py`, and an
+end-to-end pair against a real (small) `BaseTransformer` through the
+real production decoder confirming the ridge columns appear when a
+ridge map is available and are cleanly absent when it isn't.
+
+## 46. v7.6 -- `m3_ar_combined`'s first full run completed: §39's decline pattern a 4th time, notably earlier, plus a correction to §44's own AR_SEQS attribution
+
+**Correction to §44/§45 first, since it affects everything below: the
+run measured at 63.6GB/143.8GB (44%) was `AR_SEQS=12`, not 16.** §44
+reported that measurement against `AR_SEQS=16` -- wrong. By the time
+that run's pulled-back result came back, this file's own `AR_SEQS`
+value had already been edited back to 16 locally, and the two got
+conflated when §44 was written. The pulled-back run's own dumped
+`Config` (`saved_models/r2_m3_ar_combined_status.json`'s sibling
+`sweep_logs/manual/r2_m3_ar_combined.json`, which records the ACTUAL
+`Config` values in effect on the pod, not what this file happened to
+say locally afterward) settles it: `"AR_SEQS": 12`. **`AR_SEQS=16`
+(this file's CURRENT shipped value) has never actually been run.**
+Reinstating it was based on that misattribution and remains an
+unconfirmed bet -- a reasonable one (even the more cautious 12-estimate,
+~126GB, overshot the real 63.6GB by ~2x, so 16 likely fits too) but
+extrapolation on top of a correction, not evidence. The arm's own
+`desc` has been corrected in place to say this directly rather than
+only here.
+
+**The run itself (`AR_SEQS=12`, cold start, full 2500/2500 steps,
+27.9 min wall-clock) is `m3_ar_combined`'s first real result, and it's
+genuinely a 4th confirmed instance of §39's overfitting/rollout-drift
+pattern** -- `train_loss` improved monotonically the entire run
+(0.044 -> 0.038 -> 0.023 -> 0.012 -> 0.009) while rollout-vs-persistence
+`improvement_pct` declined monotonically from its very first eval:
+
+| step | improvement_pct | train_loss |
+|---|---|---|
+| 500 | **+34.4%** (peak, promoted) | 0.0436 |
+| 1000 | +30.3% | 0.0385 |
+| 1500 | +27.7% | 0.0229 |
+| 2000 | +20.7% | 0.0117 |
+| 2500 (final) | +19.0% | 0.0092 |
+
+The peak (+34.4%) is the second-best ever recorded across every arm in
+this file (only `a3b_delta_ar`'s 54.4% and `h11_ridge_distill`'s 37.3%
+are higher) -- the underlying idea has real merit. But the peak landed
+at step 500 of a 2500-step budget (**20% into the run**), clearly
+earlier in relative terms than any of §39's three prior cases
+(`s7_h9_scaled` ~2400/6000=40%, `h11_ridge_distill`/`s8_h9_moreseqs_
+scaled` similarly 33-67% through their own budgets) -- `m3`'s heavier
+weight + faster curriculum + larger `AR_SEQS` combination appears to
+overfit/drift faster in relative-budget terms than the milder recipes
+that pattern was first documented on. §39.1's own finding (WD/dropout
+0.05 measurably slows, doesn't reverse, this decline on `h11`/`s8`,
+both still at the standard `WEIGHT_DECAY=0.01`/`DROPOUT=0.01` this `m3`
+run also used) is the natural, already-proven next lever to try here
+too, rather than inventing something new.
+
+**A concrete, fixable process gap: early stopping was OFF for this run,
+and burned real pod-minutes doing nothing.** `Config.EARLY_STOP_
+PATIENCE_STEPS` defaults to `None` (disabled) per `§40.1`'s own
+design -- this run's launch command never passed
+`--early-stop-patience-steps`, and neither does `provision_and_run.sh`
+itself, anywhere. Since no eval ever re-promoted past step 500
+(`best.promoted_rollout_mse` stayed pinned at the step-500 value for
+the rest of the run), a patience of 500 steps (§42's own stated
+"going forward" default, matching `--val-every 500` here) would have
+stopped this run right at step 1000 -- instead it ran a further 1500
+steps (roughly 2/3 of its 27.9-minute wall-clock) producing a strictly
+worse checkpoint than the one already saved, for no benefit whatsoever.
+**Action item, not yet done: `provision_and_run.sh` should default to
+passing `--early-stop-patience-steps 500` (or an equivalent `--extra`
+default) rather than leaving it opt-in-only per launch.**
+
+**The catastrophic-looking `frame1` numbers are the ALREADY-DOCUMENTED
+denominator artifact (§23.1), not a new finding.** This run's own
+final per-frame curve: frame 1 at -556.9%, crossing positive by frame
+~6, peaking ~+43% around frames 10-16, then a slow decline to +13.3% by
+frame 68 -- the same "bad-looking early on a tiny-persistence-error
+denominator, genuinely informative once persistence has degraded" shape
+§23.1 first explained, just crossing positive noticeably earlier here
+(frame ~6) than `e3_ar_long`'s original reference case (frame ~15+) --
+a modestly encouraging shape detail, not a new phenomenon to explain.
+
+**Also worth noting: this run is the first real evidence for §45's new
+ridge-ceiling report feature, even though it predates that feature's
+own console-output changes** -- it was launched under the OLDER
+console format (no `ridge=`/`captured=` columns, no forced color), so
+none of this section's analysis needed the new report; it was all
+reconstructed from the pulled-back JSON's raw numbers instead. The next
+run launched through the current code will show this live instead of
+requiring the same manual reconstruction.
+
+**Next lever shipped, per explicit direction this same session: `m4_ar_
+combined_dropout`.** `m3_ar_combined`'s exact config plus `DROPOUT`
+0.01->0.1 (10x, matching branch G's already-tried `g1_dropout` value) --
+dropout ALONE, deliberately not the combined WD+dropout=0.05 bump §39.1
+tested on `h11`/`s8`, so a result here isolates dropout's own effect
+rather than repeating that exact combination at a different magnitude.
+Not yet run.
+
+## 47. v7.7 -- `m4_ar_combined_dropout` ran: dropout=0.1 measured -137.4% and never promoted, early-stopped correctly in 6.5 min -- but the test itself may have been unfair, so `m5` retries at 0.03 with 3x the patience
+
+**The early-stop-patience default from §46 fired for real, for the
+first time, and worked exactly as designed.** `m4_ar_combined_dropout`
+(`m3_ar_combined`'s exact config + `DROPOUT` 0.01->0.1) stopped at step
+500 of its 2500-step budget: `"stop_reason": "early stop: 500 steps
+(patience=500) since the last new promoted rollout checkpoint (step
+0)"`. Wall-clock: 387.8s (6.5 min) vs. `m3`'s own 1676s (27.9 min) for
+a comparable run -- a real, immediate payoff from §46's fix.
+
+**The result itself is bad, and confirmed NOT a code/config mistake --
+the pulled-back run's own dumped `Config` matches every intended
+setting**: `AR_SEQS: 16`, `DROPOUT: 0.1`, `EARLY_STOP_PATIENCE_STEPS:
+500`, `WANDB_PROJECT: NI_Review_v7`. At its one and only eval (step
+500): `improvement_pct = -137.4%` (worse than persistence),
+`ever_promoted_rollout_checkpoint: false` -- it never cleared the
+promotion gate at all. Direct comparison to `m3` at the identical step:
+
+| | step 500 `improvement_pct` | step 500 `train_loss` |
+|---|---|---|
+| `m3_ar_combined` (no dropout) | +34.4% | 0.044 |
+| `m4_ar_combined_dropout` (0.1) | -137.4% | 0.132 (3x higher) |
+
+**But this may not be a fair test of dropout, and the doubt is
+important enough to act on rather than just note.** Dropout is
+*expected* to slow early convergence -- that's the entire premise of
+§39.1's own finding that WD/dropout 0.05 "measurably slows the decline"
+on `h11`/`s8` (a benefit that shows up over the LATER trajectory, not
+at the first eval). `EARLY_STOP_PATIENCE_STEPS=500` is exactly one
+`--val-every 500` window -- it kills any recipe that doesn't promote on
+its very first try, regardless of whether more time would have let it
+catch up or overtake persistence. `m3` happened to promote immediately,
+so §46's default was never tested against a recipe that DOESN'T; `m4`
+is that test, and the honest reading is "dropout=0.1 didn't beat
+persistence within 500 steps," not "dropout=0.1 is bad," full stop.
+
+**Follow-up shipped per explicit direction: `m5_ar_combined_dropout03`.**
+Gentler `DROPOUT=0.03` (vs. `m4`'s 0.1), AND `EARLY_STOP_PATIENCE_STEPS`
+bumped 500->1500 (3 eval windows instead of 1) baked directly into the
+arm -- giving a regularized variant a real chance to promote before
+judging it, addressing the fairness concern above rather than just
+re-running the same tight patience at a different dropout value.
+
+**A real interaction caught before it could waste another run: baking
+`EARLY_STOP_PATIENCE_STEPS` into an arm's `overrides` does NOT survive
+launching through `provision_and_run.sh` as-is.** The trainer's
+long-standing "CLI beats the arm" rule (`apply_arm()` runs first, then
+CLI flags unconditionally win if passed) means `provision_and_run.sh`'s
+own new default (§46, always passes `--early-stop-patience-steps 500`
+unless `EARLY_STOP_PATIENCE_STEPS=""` is set) would silently clobber
+`m5`'s baked-in 1500 back down to 500 -- reproducing the exact same
+"only one eval window" problem this arm exists to avoid. The arm's own
+override is NOT dead code (a direct/manual trainer invocation without
+an explicit `--early-stop-patience-steps` flag would still respect it),
+but launching `m5` through `provision_and_run.sh` specifically REQUIRES
+also passing `EARLY_STOP_PATIENCE_STEPS=1500` as an env var on that
+launch command, e.g.:
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr EARLY_STOP_PATIENCE_STEPS=1500 \
+  bash singleshot/provision_and_run.sh --arm=m5_ar_combined_dropout03 --round=2 --fresh
+```
+
+## 48. v7.8 -- `m5_ar_combined_dropout03` ran: best peak of the whole branch M family (+38.6%), but the SAME decline pattern a 5th time -- the real signal that regularization tuning alone has run its course
+
+**`m5` (`m3`'s config + `DROPOUT=0.03`, `EARLY_STOP_PATIENCE_STEPS=1500`,
+launched correctly with the env-var override per §47's own warning)
+ran to its wall-clock cap, not an early stop** -- `stop_reason:
+"wall-clock limit (0.5h)"`, `steps_completed: 2000` of a 2500 budget.
+`ever_promoted_rollout_checkpoint: true` this time (unlike `m4`'s
+`false`) -- 0.03 is a real, viable dropout value, unlike 0.1.
+
+**The peak is the best across the entire branch M family so far:**
+
+| step | improvement_pct | train_loss |
+|---|---|---|
+| 500 | **+38.6%** (peak, promoted -- best of `m1`-`m5`, beats `m3`'s own +34.4%) | 0.107 |
+| 1000 | +23.9% | 0.033 |
+| 1500 | +26.8% (a partial bounce) | 0.022 |
+| 2000 (final) | +19.6% | 0.014 |
+
+Gentler dropout didn't just avoid `m4`'s catastrophic failure -- it
+produced a genuinely BETTER early result than `m3` (no dropout at all).
+But the decline pattern replicated a **5th** confirmed time regardless
+(train_loss falling monotonically the whole run while rollout-vs-
+persistence peaks early and erodes), including a partial step-1500
+bounce that still didn't recover the peak.
+
+**The real conclusion: dropout tuning raises the peak a bit, it does
+not fix the underlying decline.** Three dropout values now tried on
+this exact recipe (0.01 implicit in `m3`: peak 34.4%; 0.1 in `m4`:
+never promoted; 0.03 in `m5`: peak 38.6%, best yet) all show the same
+qualitative shape. This is the concrete evidence behind this session's
+pivot away from further regularization/hyperparameter tuning and
+toward "bigger lever" candidates -- see the discussion following this
+section for the menu under consideration.
+
+## 49. v7.9 -- the "bigger lever" menu: a 3-way optimizer bake-off built and queued, 4 more experiments planned behind it
+
+**Diagnosis behind this whole pivot, stated precisely:** `m5`'s
+`train_val_gap` was ~0 for its entire run (teacher-forced train and val
+loss moved together throughout) while the AR-rollout metric peaked
+early and decayed -- this is NOT classical overfitting (which would
+show train/val loss diverging too). It's exposure bias: the model
+degrades specifically under its own autoregressive rollout, a
+distribution it's never fully conditioned on during training. No
+amount of dropout/WD tuning changes that shape, only where the peak
+lands (§48). This session's own research pass additionally found two
+axes never discussed anywhere in this project across 45+ arms:
+**optimizer choice** (AdamW, unconditionally, every single time) and
+**weight averaging/EMA** (never mentioned once).
+
+### 49.1 Phase 1, built now: does the optimizer family itself matter?
+
+New branch **P**, three arms sharing `m5_ar_combined_dropout03`'s exact
+AR/dropout recipe (`AR_MODE=frame_ar`, `AR_LOSS_WEIGHT=3.0`,
+`AR_WEIGHT_WARMUP_FRAC=0.05`, `AR_FRAMES=8`, `AR_FRAMES_START=1`,
+`AR_FRAMES_WARMUP_FRAC=0.1`, `AR_SEQS=16`, `AR_EVERY_N_STEPS=1`,
+`DROPOUT=0.03`) -- the best-known result so far (+38.6% peak, §48) --
+varying ONLY the optimizer:
+
+- **`p1_bestyet_adamw`** -- the control, `m5`'s config again under a new
+  arm name so all three land as wandb/`saved_models/` siblings.
+- **`p2_bestyet_lion`** -- `OPTIMIZER='lion'`
+  ([lucidrains/lion-pytorch](https://github.com/lucidrains/lion-pytorch),
+  confirmed on PyPI and installed locally this session).
+  `LEARNING_RATE` 1e-3->2e-4, `WEIGHT_DECAY` 0.01->0.05 (5x smaller/
+  larger respectively, the middle of Lion's own published 3-10x tuning
+  guidance -- effective decay is `lr * wd`). New `Config.LION_BETAS =
+  (0.9, 0.99)` (Lion's own default, vs. AdamW's `(0.9, 0.95)`).
+- **`p3_bestyet_sophia`** -- `OPTIMIZER='sophia'` (the `sophia-opt`
+  PyPI package, a packaged fork of the official
+  [Liuhong99/Sophia](https://github.com/Liuhong99/Sophia) reference
+  implementation -- confirmed on PyPI and installed locally this
+  session). `LEARNING_RATE` 1e-3->8e-4 (Sophia's own "slightly smaller
+  than AdamW" guidance). New `Config.SOPHIA_BETAS = (0.965, 0.99)`,
+  `SOPHIA_RHO = 0.04`, `SOPHIA_WEIGHT_DECAY = 0.1` (the package's own
+  defaults), `SOPHIA_HESSIAN_UPDATE_EVERY = 10`.
+
+  **A concern raised while planning this turned out to be a non-issue,
+  confirmed by reading the actual installed package source (not
+  assumed from the paper or a summary):** the official Liuhong99
+  reference training SCRIPT refreshes its diagonal-Hessian estimate by
+  sampling a synthetic label from the model's own softmax output --
+  correct for cross-entropy heads, meaningless for our continuous
+  regression head. But `sophia_opt.SophiaG.update_hessian()` ITSELF
+  doesn't do any of that -- reading its source directly: it just EMAs
+  the squared gradient already sitting in `.grad`
+  (`hessian.mul_(beta2).addcmul_(grad, grad, value=1-beta2)`), entirely
+  loss-agnostic. So `p3`'s Hessian refresh (every
+  `SOPHIA_HESSIAN_UPDATE_EVERY=10` steps, reusing the SAME real
+  regression-loss gradient the ordinary update already computed, no
+  extra forward/backward pass) is a standard use of the exposed
+  primitive, not an ad hoc adaptation needing a caveat.
+
+**Code** (`train_production_transformer_deep_dive.py`): new
+`build_optimizer(model, cfg)` (module-level, replacing the single
+hardcoded `torch.optim.AdamW(...)` call every prior arm used) branches
+on the new `Config.OPTIMIZER` (`'adamw'` default -- byte-for-byte
+unchanged behavior for all 48+ pre-existing arms). Lion/Sophia are
+imported lazily inside the branch so a plain Mac dev session never
+needs either package installed. A periodic
+`optimizer.update_hessian()` call is inserted right before
+`optimizer.step()` in the main training loop, gated as a true no-op
+for every non-Sophia arm. `optimizer.step()` conditionally receives
+Sophia's own `bs=` kwarg (the REAL effective batch size,
+`BATCH_SIZE * ACCUMULATION_STEPS` -- NOT the package's own default of
+5120) since AdamW/Lion don't accept that kwarg at all.
+
+**Checkpoint-resume guard added** (extends the existing `cross_version`
+skip-optimizer-state pattern): a checkpoint's `config` blob already
+records `Config.OPTIMIZER` at save time for free (`config_dict()`
+dumps every field generically) -- resume now compares it against the
+CURRENT run's optimizer and skips `load_state_dict` with a clear log
+line on a mismatch, instead of a cryptic key-mismatch crash (Lion keeps
+only an EMA, AdamW keeps two, Sophia keeps an EMA plus a Hessian
+buffer -- none of their per-parameter state shapes are compatible with
+each other). None of the three `p*` arms trigger this (`--fresh
+--no-warm-start`), but it's a real landmine for the next person who
+warm-starts across an optimizer change.
+
+**Dependencies**: `lion-pytorch` and `sophia-opt` added to
+`requirements_sweep.txt`, `singleshot/requirements.txt`, and
+`singleshot/bootstrap_remote.sh`'s install step -- both verified
+installable and importable this session (`from lion_pytorch import
+Lion`, `from sophia_opt import SophiaG` -- the latter's import name
+does NOT match a naive guess from the PyPI project name, confirmed by
+actually installing and inspecting it rather than assuming).
+
+**Tests**: `tests/test_optimizer_selection.py` (`build_optimizer()`
+returns the right class per `Config.OPTIMIZER`, raises `ValueError` on
+an unrecognized value, a real one-step convergence smoke test per
+optimizer against a throwaway `nn.Linear`, and the resume-mismatch
+guard logic) and `tests/test_optimizer_arms.py` (the three `p*` arms'
+`resolve_arm()`/`apply_arm()` pins, mirroring branch M's own pin-test
+convention). Full suite: 132 passed, 13 skipped (up from 116 before
+this section).
+
+**Launch** (all three concurrently, `provision_and_run.sh`'s existing
+3-slot support, no script changes needed):
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr bash singleshot/provision_and_run.sh \
+  --arm=p1_bestyet_adamw  --round=2 --fresh --max-steps=2500 --max-hours=0.5 \
+  --arm2=p2_bestyet_lion  --round2=2 --fresh2 --max-steps2=2500 --max-hours2=0.5 \
+  --arm3=p3_bestyet_sophia --round3=2 --fresh3 --max-steps3=2500 --max-hours3=0.5
+```
+Not yet run. Nothing in this section claims Lion or Sophia helps --
+only that the wiring is real, tested, and ready to find out.
+
+### 49.2 Phase 2, planned but NOT built -- waiting on phase 1's results first
+
+Three more "think bigger" experiments, ranked cheapest-and-most-directly-
+diagnostic-of-the-exposure-bias-shape first, each a one-paragraph menu
+entry (not an implementation spec) pending its own scoping pass once
+real data exists to decide priority:
+
+1. **EMA of weights.** Very low cost, no architecture/loss change --
+   the standard fix for exactly this "peaks early, drifts after" shape.
+   Would apply on top of whichever optimizer phase 1 crowns.
+2. **Non-autoregressive multi-horizon auxiliary head** (§32.2 item 4,
+   never built) -- "the way to bypass error compounding entirely rather
+   than manage it," in this file's own words.
+3. **Make the loss ALWAYS the rollout metric** (§40.2's still-unbuilt
+   second hypothesis half -- branch M only ever ADDED AR loss on top of
+   a fixed-weight teacher-forced loss, never replaced it). Needs the
+   same care `h10_ridge_residual`'s blowup (§26.2) already taught this
+   project about anchors inside the feedback loop.
+
+Two axes considered and explicitly deprioritized for now (real, just
+not queued): retraining/fine-tuning the AE decoder jointly (high risk,
+changes the scoring ground truth itself, too many moving parts to
+isolate what changed) and alternative architecture families (SSM/
+Mamba, diffusion -- zero prior discussion anywhere in this project,
+full-rewrite cost, not worth it while cheaper targeted options above
+are untried).
+
+## 50. v7.10 -- branch P's first launch OOM'd: 3-way concurrency on one GPU was never checked against AR_SEQS=16's real memory footprint, `AR_SEQS` dropped to 8 for the whole bake-off
+
+**The first real launch of branch P (§49) failed.** All three arms
+(`p1_bestyet_adamw`, `p2_bestyet_lion`, `p3_bestyet_sophia`) were
+launched concurrently on one H200 pod, `provision_and_run.sh`'s own
+"multiple experiments concurrently" co-location feature. `p1` crashed
+with `torch.OutOfMemoryError` inside `frame_ar_loss()`'s AR rollout,
+mid-run: `Process ... 45.18 GiB ... Process ... 45.38 GiB ... Process
+... 49.22 GiB` -- three processes totaling ~139.8 GiB against the H200's
+own 143.8 GiB, i.e. essentially the entire GPU divided three ways, with
+nothing left for `p1`'s own AR rollout to grow into. Nothing was pulled
+back for any of the three arms (no `sweep_logs/manual/` entries, no
+`saved_models/*_status.json`) -- this batch produced no usable result at
+all, a genuine wasted pod-rental, not a partial one.
+
+**Root cause: the math was checkable in advance and wasn't checked.**
+`AR_SEQS=16`'s real memory footprint had already been measured SOLO,
+twice over (§44, §46, §48) -- ~45-64GB depending on exactly which run's
+measurement is trusted (see below). Three of those concurrently needs
+~135-190GB against a 141-144GB H200. Every prior successful concurrent
+batch in this project (branch V, branch S) used `AR_SEQS=2` arms
+(~34GB each solo, 3x34=102GB, comfortable) -- co-location was validated
+for the LIGHT recipe, and that validation was never re-checked before
+pointing the same 3-slot mechanism at the HEAVY recipe branch P
+deliberately holds fixed across all three arms. This should have been
+caught before the launch, not after it burned a pod rental.
+
+**A second correction, surfaced while fixing the first: `AR_SEQS=16`
+was never actually confirmed solo either.** §46 measured 63.6GB/143.8GB
+and attributed it to `AR_SEQS=16` -- but §46 itself already corrects
+this: that measurement was actually `AR_SEQS=12` (a code-vs-pulled-back-
+result mislabeling), and `AR_SEQS=16` was reinstated afterward on the
+strength of a measurement that wasn't actually of `AR_SEQS=16` at all.
+So going into this launch, `AR_SEQS=16`'s real solo memory footprint was
+already unconfirmed -- the OOM wasn't just "3x a known number is too
+much," it was "3x an ASSUMED number, which itself turned out to need
+re-deriving, is too much."
+
+**Fix, per explicit direction: `AR_SEQS` dropped to 8 for all three
+branch P arms** (was 16). 8 is `h5_ar_moreseqs`'s own already-attempted
+ceiling (branch H) and is lower than the one real solo measurement that
+actually exists (`AR_SEQS=12` -> 63.6GB). **Stated plainly, not
+overclaimed: this reduces the risk, it does not confirm the fix.** The
+linear extrapolation model relating `AR_SEQS` to real memory usage has
+already been shown wrong once (§46 found the real number ~2.5x lower
+than the model's estimate) -- there isn't a second real calibration
+point to refit that model against `AR_SEQS=8` specifically, so no
+number is being promised here for what 3 concurrent `AR_SEQS=8` copies
+actually use. If this OOMs again, the documented fallback is separate
+pods per arm (no code change -- three separate `provision_and_run.sh`
+invocations instead of one 3-slot concurrent one), not another guess at
+a smaller `AR_SEQS`.
+
+Code (`ROUND2_ARMS['P']`'s three arms), tests
+(`tests/test_optimizer_arms.py`'s `_M5_AR_OVERRIDES`), and `--list-arms`
+all updated and reverified together; full suite still 132 passed, 13
+skipped. Not yet re-run.
+
+## 51. v7.11 -- the run-lock's 30-minute staleness window was ~60-90x looser than the real heartbeat cadence, cut to 5 minutes after §50's OOM orphaned three locks on the persistent volume
+
+**Direct consequence of §50's crash**: all three branch P processes died
+without cleaning up their own `{run_name}.lock` files (`acquire_run_lock()`'s
+`atexit`-registered `release_run_lock()` explicitly does NOT fire on
+SIGKILL -- see that function's own docstring, and a CUDA OOM under real
+memory pressure can trigger the Linux OOM-killer reaping the process
+outright, not just `torch.OutOfMemoryError` unwinding normally). Every
+relaunch attempt then hit `REFUSING TO START: another process appears
+to already be training...` for `p1`/`p2` -- correct, by design, but
+`LOCK_STALE_SECONDS` was `1800` (30 minutes), meaning the only paths
+forward were waiting out half an hour or SSHing in to manually delete
+the lock file by hand. **Now that `saved_models/` lives on the
+persistent network volume (§43.3) rather than an ephemeral pod's local
+disk, an orphaned lock survives pod termination and gets inherited by
+the NEXT pod that mounts the same volume** -- a real, foreseeable
+consequence of that architecture change that hadn't been connected to
+this lock mechanism until it actually bit.
+
+**Root cause of why 1800s was ever chosen: it was a generic "comfortably
+long" guess, never checked against the mechanism's own real behavior.**
+`touch_run_lock()` (the heartbeat) fires every `CHECKPOINT_EVERY_STEPS=25`
+steps -- confirmed against this session's own real run logs, ~20-30s
+apart under normal CUDA throughput. A genuinely alive process re-touches
+the lock roughly 60-90 times within the OLD 1800s window; the staleness
+check only needs to be a healthy MULTIPLE of that real cadence to still
+correctly distinguish "alive" from "dead," not 60-90x it.
+
+**Fix**: `LOCK_STALE_SECONDS` dropped `1800 -> 300` (still a 10-15x
+margin over the real ~20-30s heartbeat -- comfortably covers a slow
+eval or a slow network-volume checkpoint write without false-flagging a
+genuinely alive process), and made overridable via
+`PFD_LOCK_STALE_SECONDS` for a regime that's genuinely slower than this
+(e.g. a real MPS run with a much longer per-checkpoint-cycle wall-clock)
+without needing a code change. The refusal message itself now states
+BOTH real options explicitly -- how many seconds remain until
+auto-reclaim, and the exact `rm` path to delete it immediately -- instead
+of just "refusing" with no stated path forward.
+
+**What was deliberately NOT done**: removing the lock/refusal mechanism
+entirely, or keying it to a per-launch-unique path. Both would eliminate
+the friction by also eliminating the safety property this guards
+(§v6.0's real incident: two overlapping wandb histories for the same
+run) -- a per-launch-unique lock path in particular would make the
+mechanism structurally incapable of ever detecting a genuine concurrent
+double-launch, not just tolerant of a fast recovery from a dead one.
+Tightening the SAME staleness check to match its own real cadence keeps
+the safety property intact (a truly concurrent second launch still gets
+refused immediately, since the first process keeps re-touching every
+~20-30s) while fixing the actual complaint (crash recovery took 30
+minutes when the mechanism's own heartbeat proves ~5 is enough).
+
+**Tests**: `tests/test_run_lock.py`, new -- this mechanism had zero test
+coverage before despite guarding a real, previously-hit incident. Covers
+acquire/refuse/reclaim/touch/release against a real temp-directory
+filesystem (not mocked -- the whole point is real mtime-based
+staleness), the refusal message's remaining-wait text, and the shipped
+300s default specifically (not just that an override mechanism exists
+in the abstract). Full suite: 143 passed, 13 skipped (up from 132).
+
+## 52. v7.12 -- two follow-ups from live production logs on the branch P pod: wandb artifact-upload `inf`-JSON failures fixed at the root, and `scp_env_files.sh` converted to rsync now that the network volume makes most of its files unchanged across relaunches
+
+Both requested directly off real logs from the live branch P pod
+(`205.196.17.66:9924`), not speculative cleanup.
+
+### wandb artifact-metadata `inf` fix
+
+Production logs showed repeated non-fatal failures:
+
+```
+[wandb] artifact upload failed for r2_p1_bestyet_adamw_latest
+(ValueError: Out of range float values are not JSON compliant: inf);
+local file(s) are unaffected.
+```
+
+Root cause: `train()`'s `best` dict initializes `rollout_mse`,
+`improvement_pct`, `val_tf_mse`, and `train_loss` to `float('inf')`/
+`float('-inf')` as the "nothing evaluated/promoted yet" sentinel. Every
+`save_checkpoint()` call before the first validation pass
+(`Config.VAL_EVERY`, e.g. every eval-less step from 0 to 500 in this
+run) passes `extra = {'rollout_mse': best['rollout_mse'], 'improvement':
+best['improvement_pct'], ...}` straight through to `log_artifact()`,
+which flattens it into `meta` and hands it to
+`wandb.Artifact(..., metadata=meta)`. wandb's own JSON validator is
+stricter than Python's `json` module -- it rejects `inf`/`-inf`/`nan`
+outright instead of encoding them as literal `Infinity`/`NaN` tokens --
+so every one of those early-checkpoint artifact uploads silently
+failed. Non-fatal (the local `.pt` write is unconditional and always
+succeeds first) but a real, avoidable gap in wandb's checkpoint-version
+history for every run's first several hundred steps.
+
+**Fix**: `_Telemetry.log_artifact()` (the one shared entry point every
+`save_checkpoint()` call already goes through) now sanitizes `metadata`
+before constructing the `Artifact` -- any float that fails
+`math.isfinite()` becomes `None`, matching how the rest of this file
+already represents "not yet measured" (e.g. `write_status_json`'s own
+output). Fixed at this single shared choke point rather than at each
+individual call site, so any FUTURE caller that happens to pass a
+still-`inf` sentinel through `extra` is covered automatically, not just
+the fields known about today.
+
+**Tests**: new `tests/test_telemetry_artifact_metadata.py`, using a
+fake `wandb.Artifact`/`run` that deliberately mimics wandb's real
+JSON-strictness (raises on a non-finite float) rather than a mock that
+just always succeeds -- confirms the fix actually prevents the
+reproduced failure, not just that the code path runs. Covers: the
+originally-failing `inf` case now succeeds and logs no failure line,
+non-finite values specifically become `None` while finite values and
+non-float types pass through untouched, an all-finite `metadata` dict
+is byte-for-byte unaffected, and the no-`metadata`-passed case still
+works.
+
+### `scp_env_files.sh`: scp -> rsync
+
+With `NETWORK_VOLUME_ID` set, `$REMOTE_ROOT` (`/workspace`) is a
+persistent RunPod network volume that survives pod termination --
+already exploited for `scp_data_files.sh` (skipped entirely once the
+volume already has the data, prior session work) and for
+`saved_models/`/lock-file persistence (§v7.11). `scp_env_files.sh` was
+the one remaining piece still doing a full, unconditional transfer on
+every single launch: the trainer `.py` files, the AE decoder, the ridge
+map, and old-round checkpoints, all sent via plain per-file `scp`
+regardless of whether the pod already has byte-identical copies from
+the previous launch. In practice the AE decoder and ridge map NEVER
+change, and the trainer code often hasn't changed between two
+back-to-back launches either -- only the checkpoint-resume targets and
+whichever `.py` file was actually edited are genuinely new.
+
+**Fix**: replaced the per-file `scp` + manual size-check loop with
+`rsync -az --checksum -i`, one call per file (same `FILES` array,
+unchanged). `--checksum` (not the default mtime+size quick check) is
+deliberate: a `git checkout` or file copy can bump a file's mtime
+without changing its content, which would make the default check
+re-send something that's actually identical -- every file here is
+small enough that paying for a real checksum comparison instead of
+trusting mtime is cheap and removes that false-positive path entirely.
+`-i` (itemize-changes) is what lets the script tell "sent" apart from
+"skipped, already up to date on the pod" per file in its own output,
+replacing the old manual local-vs-remote `stat` size comparison
+(rsync's checksum-based decision is already a stronger correctness
+check than that comparison ever was).
+
+No bootstrap/dependency change needed: `provision_and_run.sh` already
+uses `rsync` for pull-back (`rsync_with_retry()`, pre-existing), which
+confirms rsync is already present on these pod images without any
+extra installation step.
+
+**Not changed**: `scp_data_files.sh` (already network-volume-aware from
+prior session work, bypassed entirely rather than converted to rsync --
+the train/val H5 files are large enough that its own parallel-lane
+split-scp mechanism, `lib_scp.sh`, is worth keeping for the cold-start
+case where the volume genuinely doesn't have the data yet).
+
+**Verification**: `bash -n` on the edited script; full test suite
+green, 147 passed / 13 skipped (up from 143 -- the 4 new telemetry
+tests). The rsync conversion itself has NOT yet been exercised against
+a real pod in this pass -- next relaunch's `scp_env_files.sh` output
+will show the actual "skipped, already up to date" behavior for the
+first time.
+
+## 53. v7.13 -- venv bootstrap now skips reinstalling when a fingerprint-matched venv already survives on the network volume; `p2_bestyet_lion`'s crash investigated (inconclusive on cause, but a real gap in crash-forensics fixed) and traced to likely 3-way GPU-memory contention, not a Lion-specific bug
+
+### bootstrap_remote.sh: skip re-installing an already-good venv
+
+Same root cause as `scp_env_files.sh` (§52): `$VENV_DIR` (default
+`$REPO_ROOT/.venv`) sits under `/workspace` whenever `NETWORK_VOLUME_ID`
+is set, so it survives pod termination -- but `bootstrap_remote.sh`
+unconditionally ran `apt-get update`/`apt-get install`, `python -m venv`,
+and every `pip install` (including a full `torch` download) on EVERY
+relaunch, even against a pod whose venv was already fully built by the
+previous launch. The actual slow part was never venv/package creation
+itself, it was N pip-install round-trips each just re-confirming
+"requirement already satisfied" over the network.
+
+**Fix**: two independent local (no-network) checks now gate the slow
+steps:
+- `dpkg -s mc screen` (a local metadata lookup, no `apt-get update`
+  network round-trip) skips the apt step entirely if both are already
+  installed.
+- A fingerprint file (`$VENV_DIR/.bootstrap_fingerprint`, containing the
+  exact pins -- numpy/h5py/wandb/lion-pytorch/sophia-opt versions, the
+  resolved `CUDA_TAG`, and the interpreter version) plus one cheap
+  `python -c "import torch, h5py, numpy, wandb, lion_pytorch, sophia_opt"`
+  sanity check gates venv creation and every `pip install` call. Only
+  written AFTER every install step actually succeeds (`set -e` would
+  already have aborted the script on a failed step otherwise) --
+  writing it unconditionally would risk caching a partially-broken
+  venv as "done". `CUDA_TAG` detection was moved earlier in the script
+  (was after the installs, now before) so it's known in time to be
+  part of the fingerprint.
+
+Not cached: the actual GPU-visibility verification at the end (now also
+checks `lion_pytorch`/`sophia_opt` import, which the original script
+never verified) -- cheap, and worth re-confirming every launch
+regardless of whether the venv itself was rebuilt.
+
+**Verification**: `bash -n` only in this pass -- not yet exercised
+against a real pod's SECOND relaunch (the case this actually speeds
+up). Next relaunch's bootstrap output will show the real "already
+matches this bootstrap's exact pins" skip message for the first time.
+
+### `p2_bestyet_lion`'s missing process, investigated
+
+Flagged from a live pod (`205.196.17.66:9924`, branch P's 3-way launch,
+§51/§52's context): `p2_bestyet_lion` had a `saved_models/
+r2_p2_bestyet_lion_status.json` frozen at step 250 (14:47:58 UTC) and
+no live process, while `p1_bestyet_adamw` and `p3_bestyet_sophia` were
+still running (or, for p1, had already finished cleanly -- its own
+`sweep_logs/manual/r2_p1_bestyet_adamw.json` shows a legitimate early
+stop at step 500). Findings:
+
+- **p2's run-lock file was ABSENT, not stale.** Per §51's own fix, a
+  SIGKILL'd process (the Linux OOM-killer, the mechanism that caused
+  §50's original 3-way OOM) leaves the lock behind for
+  `LOCK_STALE_SECONDS` to expire. An absent lock means
+  `release_run_lock`'s `atexit` handler actually ran -- i.e. the Python
+  interpreter exited through its NORMAL shutdown path, which also
+  happens after an uncaught exception (traceback printed, non-zero
+  exit, but still a "clean" process exit as far as signals/atexit are
+  concerned). This is consistent with a *caught* `torch.OutOfMemoryError`
+  (PyTorch's own CUDA-OOM exception, which propagates as ordinary
+  Python control flow) rather than the OOM-killer's SIGKILL.
+- **No traceback was recoverable.** Every arm's stdout only ever
+  reached the local terminal that launched `provision_and_run.sh`
+  (piped through `ssh ... | awk` for the "[arm/rN]" tag, nothing
+  written to disk on the pod) -- once that terminal's scrollback is
+  gone or the pod is torn down, the actual error message is
+  unrecoverable. This is a real gap, fixed below.
+- **A live repro attempt was inconclusive but pointed at contention,
+  not a code bug.** Relaunched `p2_bestyet_lion` alone (`--max-steps
+  400 --max-hours 0.15 --no-wandb`) on the same pod while only
+  `p3_bestyet_sophia` was still running (p1 had already finished, so
+  this was 2-way, not 3-way, concurrency). It ran cleanly past step
+  250/275 (where the original crashed) to step 375 with no error
+  before the pod was terminated (`provision_and_run.sh`'s own
+  `wait`+pull-back+terminate flow completing once its slots finished --
+  expected, standing behavior, not a mistake). Getting well past the
+  original failure point under LOWER concurrency, with no crash,
+  argues against a deterministic Lion-specific bug and FOR §50's
+  original, still-open concern: `AR_SEQS=8` reduces 3-way concurrent
+  memory pressure but was never confirmed safe under it, only under
+  2-way. This is circumstantial, not proven -- the exact error message
+  is gone, so this is the best available honest read of the evidence,
+  not a confirmed root cause.
+
+**Fix (forensics, not a guess at the bug itself)**: `provision_and_run.sh`'s
+`launch_training()` now tees each arm's full stdout/stderr to
+`sweep_logs/r{round}_{arm}.log` ON THE POD (in addition to the existing
+live-tagged local view), which the script's own existing pull-back step
+already rsyncs back afterward -- so the NEXT time any arm crashes, the
+actual traceback survives the pod's termination instead of only ever
+existing in a terminal's live scrollback.
+
+**Not done (deliberately, pending real evidence)**: no code change to
+AR_SEQS, concurrency, or Lion's optimizer construction -- the evidence
+here is suggestive, not diagnostic, and changing something based on an
+inconclusive repro would risk overclaiming a fix for a problem that was
+never confirmed in the first place. The existing "run at least two at a
+time" guidance (from this branch's own launch note) already covers the
+cautious path if 3-way concurrency continues to be unreliable; the next
+run's `sweep_logs/r2_p2_bestyet_lion.log` (once the tee fix is live)
+will settle this with a real traceback instead of a second inference.
+
+**Verification**: `bash -n` on both edited scripts; full test suite
+unaffected by these bash-only changes, 147 passed / 13 skipped
+(unchanged from §52).
+
+## 54. v7.14 -- branch P's real results analyzed, a second real bug found and fixed (early-stop patience silently clobbered), AR_SEQS dropped 8->6, next launch prepped
+
+### What actually came back from the 3-way branch P launch
+
+- **`p1_bestyet_adamw` (control): early-stopped at step 500/2500,
+  improvement_pct -21.5% (WORSE than persistence).** Root cause found
+  (see below, not noise) -- it never got a second evaluation window.
+- **`p3_bestyet_sophia`: reached step 2000/2500 (stopped by the 0.5h
+  wall-clock budget, not a crash or early-stop), promoted checkpoint at
+  +34.1% improvement, `train_val_gap` ~0.0003 (still not overfitting in
+  the classical sense).** Comparable to m5's own peak (+38.6% at step
+  500) and, notably, still improving/stable at step 2000 rather than
+  having already peaked and started declining -- the best sustained
+  result of any arm so far, though on a different (lower) AR_SEQS than
+  m5's own run, so not a clean apples-to-apples comparison yet.
+- **`p2_bestyet_lion`: zero real performance data.** Crashed at step
+  ~250-275 before its first scheduled evaluation (`--val-every 500`) --
+  `best` never left its `Infinity` initial sentinel. Lion is completely
+  untested on this recipe so far; nothing about its rollout performance
+  is known yet.
+
+### Second real bug found: branch P's arms silently inherited a
+### too-tight early-stop patience, killing the AdamW control after one eval
+
+`p1_bestyet_adamw`'s -21.5% result traced to a real, previously-fixed-
+elsewhere bug, not to AdamW actually being bad: `last_promotion_step`
+starts at `step` (0 on a cold start), and the early-stop check is
+`(step - last_promotion_step) >= EARLY_STOP_PATIENCE_STEPS`. With
+`--val-every 500` and the trainer's own default
+`EARLY_STOP_PATIENCE_STEPS=500`, the very FIRST evaluation already
+satisfies `500 - 0 >= 500` if it didn't promote -- there is no second
+chance. `m5_ar_combined_dropout03` (branch P's own AR/dropout recipe
+source) already hit this and already fixed it by setting
+`EARLY_STOP_PATIENCE_STEPS: 1500` in its own arm dict (see that arm's
+own `desc`, written before this session touched branch P at all) -- but
+all three branch-P arms were copied from m5's recipe WITHOUT carrying
+that override forward, so they silently fell back to 500 and inherited
+the exact trap m5 had already worked around.
+
+**Fix**: added `EARLY_STOP_PATIENCE_STEPS: 1500` to all three `p1/p2/p3`
+arms' `overrides`, matching m5 exactly (3 eval windows instead of 1).
+**Same unresolved caveat as m5's own fix, called out explicitly in the
+new branch comment**: `apply_arm()` runs BEFORE `main()`'s "CLI beats
+the arm" loop, and `provision_and_run.sh` ALWAYS passes
+`--early-stop-patience-steps` (default 500) as an explicit CLI flag --
+which unconditionally overwrites this 1500 back down to 500 regardless
+of the arm dict. Baking it into the arm dict still helps a direct/manual
+invocation that skips `provision_and_run.sh`, but launching branch P
+through that script REQUIRES also setting `EARLY_STOP_PATIENCE_STEPS=1500`
+as an env var on the launch command -- the next launch command below
+does this.
+
+### AR_SEQS dropped 8 -> 6
+
+Per direct instruction, in response to `p2_bestyet_lion`'s crash
+(§v7.13): a further reduction in the same direction as §50's original
+16->8 cut. Still NOT a confirmed-safe number for 3-way concurrency --
+nobody has measured 3 co-located copies at AR_SEQS=6 either, this is a
+continued risk-reduction, not a proof. All three `ROUND2_ARMS['P']`
+arms and `tests/test_optimizer_arms.py`'s pin test updated together.
+
+### Next launch (prepped, not yet run)
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr EARLY_STOP_PATIENCE_STEPS=1500 \
+  bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/provision_and_run.sh \
+  --wandb=<KEY> --wandb-group=Spock \
+  --arm=p1_bestyet_adamw  --round=2 --fresh --max-steps=2500 --max-hours=0.5 \
+  --arm2=p2_bestyet_lion  --round2=2 --fresh2 --max-steps2=2500 --max-hours2=0.5 \
+  --arm3=p3_bestyet_sophia --round3=2 --fresh3 --max-steps3=2500 --max-hours3=0.5
+```
+
+All three arms re-run `--fresh` (not resumed): `p1`'s prior run is not
+worth resuming from (it stopped for a now-fixed spurious reason, at
+essentially the starting line); `p2`'s prior run never reached a valid
+evaluation; and `p3`'s prior run, while promising, was on the
+about-to-change AR_SEQS (8, now 6) -- resuming it would silently mix
+two different AR_SEQS regimes in one run's history. A clean 3-way
+re-launch keeps the comparison honest.
+
+Also carries forward from this session's other fixes automatically
+(no launch-command change needed): `scp_env_files.sh`'s rsync skip-
+if-unchanged (§52), `bootstrap_remote.sh`'s skip-if-already-built venv
+(§53), the wandb `inf`-metadata fix (§52), and per-arm log persistence
+to `sweep_logs/r{round}_{arm}.log` (§53) for actual crash forensics if
+`p2_bestyet_lion` (or anything else) fails again.
+
+**Verification**: full test suite green, 147 passed / 13 skipped
+(unchanged count from §53 -- these are pin-test content updates, not
+new tests). Not yet launched against a real pod in this pass.
+
+## 55. v7.15 -- the just-shipped scp->rsync conversion (§52) broke the very next real launch: `--no-owner --no-group` added after a `chown ... Operation not permitted` (rsync exit 23) on the pod
+
+First real use of §52's rsync conversion failed immediately:
+
+```
+rsync: [receiver] chown ".../.train_production_transformer_deep_dive.py.XFrq4X" failed: Operation not permitted (1)
+rsync error: some files/attrs were not transferred (see previous errors) (code 23)
+```
+
+Root cause: `-a` (archive) implies `-o`/`-g` (preserve owner/group),
+which requires the RECEIVING rsync process to call `chown` -- and
+RunPod's container images don't grant `CAP_CHOWN` even to the `root`
+user running inside the container (a common container-hardening
+default, unrelated to normal Unix permission bits). `-euo pipefail`
+correctly aborted the whole `scp_env_files.sh` on this, which correctly
+aborted `provision_and_run.sh`, which correctly terminated the pod --
+every layer of this session's own caution worked exactly as designed,
+this was a genuine bug in the fix itself, not a false alarm.
+
+Pull-back's own long-standing `rsync -avP` (`provision_and_run.sh`,
+predates this session) is NOT at risk of the same failure: `-o`/`-g`
+preservation is a silent no-op (not an error) when the RECEIVING side
+isn't root, and pull-back's receiver is always the local, non-root Mac
+user -- confirmed by every pulled-back file this session already
+landing owned by `kkreth`, not `root`. Only the PUSH direction (pod,
+running as root, receiving) actually hits the missing-`CAP_CHOWN`
+error.
+
+**Fix**: `--no-owner --no-group` added to `scp_env_files.sh`'s rsync
+call, dropping just those two components of `-a` (keeps recursive,
+symlink, permission, and timestamp preservation). Ownership doesn't
+matter for this pipeline anyway -- every pod is single-user, everything
+already runs as root.
+
+**Verification**: `bash -n` only in this pass -- not yet re-tried
+against a real pod. Full test suite unaffected (bash-only change),
+147 passed / 13 skipped.
+
+## 56. v7.16 -- diagnosed the reported "GPU stalls even with 3 arms concurrent": traced to the periodic autoregressive validation rollout, not a training-batching bug; a pre-eval log marker added for next-run confirmation
+
+Investigated live on `205.196.19.52:11200` (branch P's relaunch, all
+three arms running with the AR_SEQS=6/patience=1500/rsync fixes from
+§52-55).
+
+### What was actually measured
+
+- `nvidia-smi dmon -s u -d 1 -c 90` (90 one-second samples): SM
+  utilization sits at 97-100% the large majority of the time, with
+  occasional brief (1-2 sample) dips to 20-70%. Not a sustained stall,
+  but real, repeating dips.
+- Cross-referencing `sweep_logs/r2_p1_bestyet_adamw.log`'s own
+  per-25-step timestamps: throughput is a steady ~0.3 wall-clock
+  minutes per 25 steps (~0.72s/step) EXCEPT at step 500 and step 1000
+  (both `--val-every 500` boundaries), where the same 25-step window
+  took 0.6-0.8 minutes -- roughly 2-2.5x longer. The dips observed live
+  in `nvidia-smi` line up with exactly this cadence, not with random
+  noise.
+- CPU/host is not the bottleneck: `load average: ~21` on a 192-core box
+  with 3 concurrent training processes, `iostat`/disk showed nothing
+  notable.
+
+### Root cause: `rollout_frames()`'s validation eval is inherently
+### GPU-underutilizing, and all 3 arms share the same eval cadence
+
+`rollout_frames()` (used by `evaluate()`, called every `--val-every`
+steps -- 500 here) is a genuinely sequential autoregressive decode: it
+re-runs a FULL `model(curr)` forward pass on every one of
+`NUM_TIME - VAL_CONTEXT_STEPS` (80-12=68) iterations, growing `curr` by
+one frame each time via `torch.cat` -- there is no KV-cache reuse, so
+each step both re-does the full attention computation over the
+growing context AND cannot be batched across the time dimension the
+way a normal training step's single forward pass is. Combined with a
+small batch (`VAL_ROLLOUT_SEQS=64`), this workload is latency-bound
+(68 small, sequentially-dependent kernel launches with Python-loop and
+`.cat()`/`.clone()` overhead between them) rather than throughput-bound
+-- exactly the profile that shows up as a GPU utilization dip on
+`nvidia-smi` even though "work" is still happening. Measured
+`rollout_seconds` in this session's own status.json files: 3.2-7.8s
+for 64 sequences, consistent with a latency-dominated loop rather than
+a large batched matmul.
+
+Because all three branch-P arms use the same `--val-every 500` and were
+launched within seconds of each other, their evals tend to land in the
+same wall-clock window -- so a dip that would be a small, single-process
+blip in isolation becomes a visible AGGREGATE utilization dip across
+all three concurrent processes at once, which is what actually gets
+observed watching `nvidia-smi` live even with "three models running
+concurrently."
+
+**This is a real, structural property of the eval, not a training-
+batching misconfiguration** -- the training step itself (per the
+25-step throughput analysis) is steady and fully GPU-utilized; only
+the periodic eval dips. A less naive rollout implementation (KV-cache
+reuse, or batching the "shorter" iterations more cleverly) would close
+this gap, but that's a real architecture change to `rollout_frames()`,
+not attempted here -- flagged as a real, not yet acted on, finding.
+
+### Instrumentation added (per "add it on the next run")
+
+A `[eval] step {N}: starting rollout eval (...)` log line now prints
+BEFORE `evaluate()` is called (previously the only `[eval]` line was
+AFTER, reporting `rollout_seconds` retroactively) -- lets a live
+`nvidia-smi`/`dmon` trace be correlated to the exact wall-clock moment
+an eval starts, confirming this diagnosis directly on the next run
+instead of inferring it from checkpoint-interval timing after the fact.
+
+**Not done**: no change to `rollout_frames()`'s actual mechanism
+(KV-caching, batching) -- this pass is diagnosis + one log line, not
+an eval-performance rewrite; that's a separate, larger piece of work
+if the dips turn out to matter enough to justify it (currently ~a few
+percent of total wall-clock at a 500-step val cadence, not a dominant
+cost).
+
+**Verification**: full test suite unaffected, 147 passed / 13 skipped.
+
+## 57. v7.17 -- branch P's first clean, complete 3-way run: all §52-56 fixes held, real comparable optimizer data for the first time
+
+Relaunched with the rsync/`--no-owner`/AR_SEQS=6/patience fixes from
+§52-56. Result: **no crashes, no premature single-eval early stops,
+full pull-back succeeded on the first try.** First time this branch has
+produced real, comparable data for all three arms.
+
+| Arm | Peak improvement_pct | Outcome |
+|---|---|---|
+| `p1_bestyet_adamw` | **+40.5%** (rollout_mse 0.001691, step ~500) | Early-stopped at step 1500 -- legitimately: `patience=1000` exhausted with no new promotion since step 500 (the real early-stop mechanism working as intended this time, not the §54 single-eval bug) |
+| `p3_bestyet_sophia` | **+38.5%** (rollout_mse 0.001750) | Still promoting -- cut off by the 0.5h wall-clock budget at step 2257, had NOT exhausted patience |
+| `p2_bestyet_lion` | **+30.9%** (rollout_mse 0.001966) | Still running, stable around +30-31%, cut off at step 2294, had NOT exhausted patience |
+
+Note: the actual launch used `--early-stop-patience-steps 1000` (not
+the 1500 documented in §54/§56's arm-dict override) -- still safely
+above `--val-every 500`, so the single-eval trap did not recur, just a
+different concrete patience value than what was written into the code.
+
+**Read of the comparison (early, not final -- none of these ran
+uninterrupted to their full 2500-step budget)**: AdamW's peak is
+highest but it already plateaued in the classic early-peak/exposure-
+bias pattern this whole investigation keeps finding (§40.2 on). Sophia
+is close behind (-2 points) and, notably, was STILL finding new
+promotions past step 1500 where AdamW had already given up --
+suggestive that Sophia may be more resistant to the same plateau, but
+unconfirmed since it never got the chance to actually exhaust its own
+patience before the wall-clock cutoff. Lion trails both by a real,
+non-trivial margin (~8-10 points) but is a legitimate positive result
+(the first time this arm has produced any rollout data at all, per
+§54's crash and §56's fix).
+
+**Also confirmed working in production for the first time**: `scp_env_files.sh`'s
+rsync push (§52/§55), `sweep_logs/r{round}_{arm}.log` per-arm
+persistence (§53), and the `[eval] starting rollout eval` marker (§56,
+present in the pulled-back logs). `bootstrap_remote.sh`'s skip-if-
+already-built venv (§53) was not directly observed this pass (fresh
+pod, first bootstrap).
+
+**Not done**: no conclusion yet on "does the optimizer family matter" --
+Sophia and Lion both need a longer, uninterrupted budget (or a bumped
+`--max-hours`) to actually reach their own patience exhaustion or
+`MAX_STEPS=2500` before AdamW's result can be called final against
+them.
+
+
+## 58. v7.18 -- branch Q built: the Phase 2 "bigger lever" menu (§49.2) wired up as three real arms on top of the surviving best-so-far Sophia config
+
+Branch P's clean 3-way run (§57) named `p3_bestyet_sophia` (+38.5%,
+still promoting when cut off by the 0.5h wall-clock budget) as the
+config to build on. `q1_sophia_ema`, `q2_sophia_auxhead`,
+`q3_sophia_rollout_dominant` implement the three Phase 2 menu items
+against that exact base recipe, varying only the one new axis each
+arm is named for -- same one-variable-at-a-time discipline as every
+other branch here.
+
+**New `Config` fields** (all no-ops at their defaults, so every one of
+the 48+ pre-existing arms is byte-for-byte unaffected): `EMA_DECAY=0.0`
+(disables EMA-of-weights), `TF_LOSS_WEIGHT=1.0` (multiplier on the
+primary teacher-forced loss), `AUX_HEAD_FRAMES=0` / `AUX_HEAD_LOSS_
+WEIGHT=1.0` (>0 constructs `FrameTransformer.aux_head`, a non-
+autoregressive multi-horizon head -- §32.2 item 4, never built before
+this branch).
+
+**Mechanism**:
+- `q1_sophia_ema`: a second, independent deep-copied model instance
+  (not `torch.optim.swa_utils.AveragedModel` -- its wrapper doesn't
+  forward arbitrary attributes, and `rollout_frames()`/`frame_ar_loss()`
+  read `model.frame_native` directly). EMA shadow updated every step;
+  EMA'd weights become the PRIMARY rollout metric each eval (gating
+  promotion/early-stop), raw non-EMA numbers kept as `raw_*` for
+  comparison only.
+- `q2_sophia_auxhead`: new `aux_horizon_loss()` predicts the next
+  `AUX_HEAD_FRAMES` frames in ONE SHOT via `model.forward_aux()` -- no
+  feedback loop at all, so none of `h10_ridge_residual`'s expansive-
+  anchor-in-a-loop risk applies. Only supports frame-native models.
+- `q3_sophia_rollout_dominant`: `TF_LOSS_WEIGHT` multiplies the primary
+  teacher-forced loss, letting `AR_LOSS_WEIGHT`'s rollout term dominate
+  instead -- the still-unbuilt second half of §40.2's original
+  hypothesis (branch M only ever ADDED AR loss on top of a fixed-weight
+  TF loss, never actually flipped the balance).
+
+**Not yet launched as of this section** -- see §59 for the real
+results, including two real bugs found on `q2_sophia_auxhead`'s first
+launches.
+
+## 59. v7.19 -- diagnosed a 3-way `torch.compile` pileup live on the pod, disabled it by default; found and fixed TWO real shape bugs in the frame-native AR/aux-head code paths; final Q-branch numbers land in the high-30s/low-40s%
+
+### Diagnosis: branch Q's first launch looked hung, but was CPU-bound `torch.compile` contention, not a GPU/data problem
+
+Live SSH investigation (`nvidia-smi` + `ps aux`) on the pod mid-launch:
+0% GPU utilization, ~48GB already resident (three models' weights +
+optimizer state loaded fine), but **~195 `torch/_inductor/compile_
+worker` processes alive** on a 192-vCPU box -- each of the three
+concurrent training processes spawns its OWN `torch.compile` worker
+pool sized to the FULL host core count (`--workers=64` each), so a
+3-way concurrent launch oversubscribes the box 3x over before a single
+real training step runs. Branch P's own launches paid the same tax
+(every log shows `torch.compile: on`) but it wasn't as visible then.
+
+**Fix**: `resolve_train_regime()`'s CUDA branch now defaults `compile_
+model` to `False` (`PFD_COMPILE_MODEL=1` re-enables it, e.g. for a
+solo/long run where the 15-30% steady-state speedup amortizes past the
+compile cost). Confirmed via a live re-check: 0 compile-worker
+processes on the next launch, `nvidia-smi` GPU util climbing normally.
+
+**Follow-up bug caught by the user**: `_regime_banner_cuda()`'s printed
+"torch.compile: on/off" line was a HARDCODED string, not derived from
+the actual flag -- so the banner kept claiming "on" even after the
+default flipped to off. Fixed to take `compile_model` as a real
+parameter; `tests/test_train_regime_cuda.py` updated to pin the new
+default (`compile_model is False`) and the `PFD_COMPILE_MODEL=1`/`=0`
+override, plus a dedicated override test.
+
+### Bug 1: `frame_ar_loss()`'s frame-native branch crashed on its first-ever real exercise
+
+`q2_sophia_auxhead` was the FIRST arm in this entire project to combine
+`AR_MODE='frame_ar'` with `TOKENIZATION='frame'` -- every prior
+`frame_ar` arm (branches M/P/Q's other two) ran token-native, so
+`frame_ar_loss()`'s `if getattr(model, 'frame_native', False):` branch
+had never actually executed against the real frozen AE decoder before.
+It called `centroid_velocity_loss()` directly on the raw frame-
+flattened `(B, n_fr, NX*LATENT_DIM=470)` tensor instead of reshaping to
+a trailing `LATENT_DIM=47` axis first (the same `to_per_token_latent()`
+reshape the teacher-forced path already applies) -- crashed on the
+very first training step: `"mat1 and mat2 shapes cannot be multiplied
+(6x470 and 47x100)"` against the decoder's first linear layer. Also
+needed `TOKENIZATION: 'frame'` added to the arm's own overrides in the
+first place -- `AR_MODE='frame_ar'` does NOT imply frame tokenization,
+contrary to the arm's original `desc`.
+
+**Fixed**: both `to_per_token_latent()` calls added in `frame_ar_loss()`'s
+frame-native branch; `q2_sophia_auxhead`'s overrides now include
+`TOKENIZATION: 'frame'`. New regression test
+`test_frame_native_branch_shapes_and_gradients` (confirmed to fail
+against the pre-fix code, reproducing the exact crash, and pass
+against the fix) closes the gap that let this reach a real pod
+uncaught -- `tests/test_frame_ar_loss_direct.py` had only ever
+exercised the token-native branch before this.
+
+### Bug 2: `aux_horizon_loss()` had the IDENTICAL bug, one call site later
+
+`q2_sophia_auxhead`'s SECOND real launch (after bug 1's fix let it get
+further) crashed with the same signature one call site later --
+`aux_horizon_loss()` (the function this arm actually exists to test)
+had the same missing `to_per_token_latent()` reshape on both `aux_pred`
+and `target` before calling `centroid_velocity_loss()`. Missed on the
+first pass because that pass only directly exercised `frame_ar_loss()`,
+not this sibling function.
+
+**Fixed** the same way; new regression test
+`test_aux_horizon_loss_shapes_and_gradients` added directly (confirmed
+fails pre-fix, passes post-fix) so both of `q2`'s call sites are now
+covered locally instead of only being discoverable on a real pod.
+
+### Bug 3 (found the same investigation): `q1_sophia_ema`'s `EMA_DECAY=0.999` never converged within the run's own budget
+
+`q1_sophia_ema`'s first real launch early-stopped at step 1500 with its
+EMA-gated `improvement_pct=-182.7%` (never promoted once, `promoted_
+rollout_mse=Infinity`) -- while the SAME checkpoint's `raw_improvement_
+pct` (non-EMA weights) was `+41.9%`, the best number of the whole
+session at the time. `EMA_DECAY=0.999`'s ~693-step half-life never
+caught up to the raw trajectory within a run whose own AR curriculum is
+still ramping through step 250 -- and because EMA numbers gate
+promotion/early-stop, the run stopped itself on a shadow that was still
+catching up, not a genuine plateau.
+
+**Fixed**: `EMA_DECAY` corrected `0.999 -> 0.98` (~34-step half-life --
+long enough to smooth noise between curriculum steps, short enough to
+converge well before the first `--val-every 500` eval).
+
+### Final results, all three bugs fixed, `p3_bestyet_sophia` also rerun uninterrupted for the full budget
+
+| Arm | Result |
+|---|---|
+| `p3_bestyet_sophia` (rerun, uninterrupted 1h, not the earlier 0.5h-truncated version) | Completed all 2500 steps. **+39.3%** peak -- confirms the earlier truncated run's trajectory (+38.5%) wasn't hiding a materially better number behind the old budget. |
+| `q1_sophia_ema` (fixed `EMA_DECAY=0.98`) | Completed to step 2000, promoted. **+40.8%** -- its best number, and this time the EMA-gated and raw metrics are close (36.2% vs. 34.6%) instead of wildly divergent -- the fix worked. |
+| `q2_sophia_auxhead` (both bugs fixed) | Still zero real data as of this section -- two real bugs, zero completed runs. Untested pending a relaunch. |
+| `q3_sophia_rollout_dominant` (§57/58, no changes needed) | +36.7%, already reported. |
+
+**Assessment**: every arm across branches M/P/Q now clusters in the
+high-30s/low-40s% band -- no single lever (optimizer family, EMA,
+rollout-dominant loss, aux head once it actually runs) has moved the
+needle by more than a couple points over `h9_ar_freq1`'s original
+recipe. This is the signal that incremental tuning on the SAME
+objective/architecture has run its course; see §60 for the pivot to
+more aggressive, previously-deprioritized directions.
+
+## 60. v7.20 -- PLAN ONLY, nothing built yet: three aggressive, previously-untried directions (branches R/S/T), each to be smoke-tested on MPS before ever touching a pod
+
+Written down before any implementation, specifically so this plan
+survives a context loss. §59's assessment: every arm tried since branch
+M clusters in the high-30s/low-40s% band -- incremental tuning on the
+same objective/architecture has plateaued. These three are deliberately
+bigger swings, not more of the same knob-turning.
+
+**Shared constraint across all three**: test as much of the real
+mechanism as possible on this Mac (MPS/CPU) BEFORE spending pod time --
+following this codebase's own existing convention
+(`tests/test_frame_ar_loss_direct.py` already calls `frame_ar_loss()`/
+`aux_horizon_loss()` directly on CPU tensors to exercise code paths
+`regime.disable_ar` would otherwise skip inside `train()`). Each branch
+below is scoped so its CORE new logic (the loss/model code itself, not
+full-scale CUDA throughput) is directly unit-testable on MPS/CPU.
+
+### Branch R -- soft spatial-consistency penalty (§32.2 item 5)
+
+**Explicitly NOT real PINN** -- discussed at length this session and
+worth restating here so a future reader doesn't overestimate what this
+is: real PINN work (e.g. the PSTNet divergence-free-layer paper already
+cited in §32.2) requires continuous, differentiable spatial/temporal
+coordinates as network INPUTS so autograd can compute actual PDE-
+residual derivatives (`∂v/∂x`, `∂v/∂t`) against the real governing
+equations (Navier-Stokes momentum/continuity, divergence-free
+constraints). This model has no such differentiable-coordinate input at
+all -- it's a discrete sequence transformer over `NUM_X=10` x-station
+positions, decoded through a FROZEN, non-differentiable-w.r.t.-space AE
+decoder. No governing equation is ever written down or checked here.
+
+What this actually is: a smoothness/consistency penalty between the
+network's OWN predictions at adjacent x-stations within a frame --
+closer to a generic spatial-regularization/total-variation prior than
+a physics-informed loss, borrowing PINN literature's MOTIVATION
+("physics-based penalties reduce the solution space, accelerating
+convergence") without its machinery. Cheap: no new ground truth, no
+derivative-through-inputs restructuring -- only touches the network's
+own already-decoded per-x-station centroid triplets.
+
+**Planned mechanism**: decode ALL `NUM_X` stations' predicted centroid
+triplets for a frame (today's `centroid_velocity_loss()` only ever
+scores the network's chosen frame content against target -- the aux
+loss here is purely SELF-referential, no ground truth needed), then
+penalize large discrete second-differences (a Laplacian-style
+smoothness term) or first-differences (TV-style) between neighboring
+stations' predicted velocity triplets. New `Config.SPATIAL_SMOOTH_
+WEIGHT` (default 0.0, no-op for every existing arm) and a warmup
+fraction, mirroring `AR_WEIGHT_WARMUP_FRAC`'s existing convention.
+
+**MPS-testability**: fully testable on MPS/CPU -- this is a pure
+function of the network's own decoded output, no CUDA-only AR loop
+dependency at all. Should get a direct unit test (new tensor-shape
+test, similar spirit to `test_frame_ar_loss_direct.py`) proving finite
+loss + real gradients before ever touching a pod.
+
+**Not yet built**: no `Config` fields, no loss function, no arm exist
+yet as of this section -- planning only.
+
+### Branch S -- AROpt-style accept/reject rollout stabilization (§32.2 item 7)
+
+Adapts DeepSeek-V3's accept/reject sampling mechanism to continuous-
+valued autoregressive forecasting, aimed directly at the exposure-bias
+failure mode this entire investigation keeps finding (§39/46/48/57/59)
+rather than tuning around it. Flagged in §32.2 as "highest cost, most
+novel" of the original menu.
+
+**Planned mechanism** (not yet fully specified -- needs a real design
+pass before implementation): at each step of `frame_ar_loss()`'s
+sequential rollout, instead of ALWAYS feeding the model's own last
+prediction back as the next context frame (today's unconditional
+`_feed(nxt)`), compute an acceptance criterion from the deviation
+between the model's own prediction and a cheap reference (e.g. the
+persistence baseline, or ground truth during training) -- REJECT and
+substitute the reference frame when the model's own prediction deviates
+too far, ACCEPT and feed the model's own prediction through otherwise.
+This is a principled, error-adaptive generalization of scheduled
+sampling. **Critical safety constraint, learned the hard way from
+`h10_ridge_residual`'s blowup (§26.2)**: the fallback-on-reject target
+MUST be non-expansive under repeated feedback (persistence or ground
+truth both qualify; a bad model-derived anchor does not) -- this is
+exactly the property `h10` violated.
+
+**MPS-testability**: the sequential AR loop is disabled inside `train()`
+on MPS/CPU (`regime.disable_ar`), but `frame_ar_loss()` itself can
+still be called directly on CPU tensors (exactly as `tests/test_frame_
+ar_loss_direct.py` already does for the existing branches) -- so the
+accept/reject mechanism's correctness (does it actually reject when it
+should, does gradient flow stay sane) is directly unit-testable on this
+Mac before any CUDA run.
+
+**Not yet built**: no acceptance-criterion design, no code, no arm --
+planning only.
+
+### Branch T -- diffusion architecture (previously deprioritized alternative-architecture axis)
+
+Explicitly named in §49.2 as "zero prior discussion anywhere in this
+project, full-rewrite cost" and deprioritized until cheaper options
+were exhausted -- §59's plateau across M/P/Q is the signal that
+threshold has now been crossed.
+
+**Planned mechanism** (scoped down deliberately for a first real test,
+not a full rewrite): a small conditional denoising model operating in
+the 47-dim AE latent space, predicting one frame ahead conditioned on
+context frames (via concatenation or cross-attention, not yet decided),
+trained with a standard diffusion loss (predict noise or velocity
+parameterization) instead of direct regression. A NEW `model_variants.py`
+class (e.g. `DiffusionFrameModel`) and a NEW training-loop branch are
+both required -- diffusion training (denoising loss over sampled
+timesteps) and diffusion inference (iterative sampling, e.g. 8-16 steps
+via DDIM or similar) are both structurally different from every existing
+arm's direct-regression forward pass. Output still decodes through the
+same frozen GEN3 AttentionSE decoder for the centroid-velocity metric,
+keeping this comparable to every other arm's scoring.
+
+**MPS-testability**: the new model class's forward pass (build, single
+denoising step, full sampling loop) is fully testable on MPS/CPU for
+correctness, independent of the AR/CUDA-only code paths -- should get
+its own `--smoke-test`-equivalent (build model, one train step, one
+sample) before ever being pointed at real data or a pod, mirroring how
+every other model variant in this file is smoke-tested.
+
+**Not yet built**: no model class, no training loop branch, no sampling
+code, no arm -- planning only. This is the largest-scoped, highest-
+uncertainty of the three; expect this to take meaningfully longer to
+even reach a first real (even MPS-only, non-competitive) result than R
+or S.
+
+### Sequencing
+
+All three are independent of each other and can be built/tested in any
+order. Given branch T's much larger scope, the natural order is R (cheapest,
+most mechanically similar to existing code) -> S (moderate, needs a real
+design pass on the acceptance criterion) -> T (largest lift). Nothing
+above commits to that order -- just the reasoning for why it's the
+likely path if built sequentially.
+
+## 61. v7.21 -- branch U's first real results: `r1_spatial_smooth` lands in-band with the existing best, `q2_sophia_auxhead` writes off as a real negative result; a threaded HDF5 loader cuts data-load time ~15x; a confound identified and a control arm added
+
+### Threaded HDF5 loading, confirmed on a real pod
+
+The slow, single-core "warm-up" period at the start of every run (user-
+reported, live-diagnosed) was `TransformerDataset`'s single-threaded
+`f['data'][:length]` read of the full 9.86 GiB `train_80.h5` off the
+network volume. `train_80.h5`/`val_80.h5` are chunked ONE ROW PER CHUNK
+(`chunks=(1, NUM_TIME, NUM_X, INPUT_DIM)`), so concurrent threads reading
+disjoint row ranges via their own read-only file handles are safe and
+chunk-aligned -- the same rationale `scp_data_files.sh`'s own `LANES`
+already exploits for the transfer itself.
+
+New `_read_h5_dataset_threaded()` (default 8 threads, `PFD_DATA_LOAD_
+THREADS` env override, falls back to sequential on any failure).
+**Measured on a real A40-then-H100-NVL pod** (US-GA-2, the real network
+volume, `yl7f9e8rwr`) against the actual `train_80.h5`:
+
+| Threads | Wall time |
+|---|---|
+| 1 (old) | 42.2s |
+| 4 | 2.89s |
+| **8 (new default)** | **2.76s -- best** |
+| 16 | 2.93s |
+| 32 | 3.13s |
+
+**~15x speedup**, correctness confirmed bit-identical to sequential on
+both a synthetic local test and the real `val_80.h5` on the pod.
+Interestingly, the SAME code measured on this Mac's local SSD was
+slightly SLOWER threaded than sequential (1.70s vs. 1.17s) -- thread
+overhead dominates when per-request latency is already low; the win is
+specific to network-attached storage, exactly mirroring why parallel
+`scp` only helps over the real network link, not a local copy.
+
+### `r1_spatial_smooth` and `q2_sophia_auxhead`'s real launch: much faster than expected, and why that's not a bug
+
+Both arms finished their step budgets in ~5-6 minutes each (not the
+expected ~30-45 minutes) -- initially looked like a truncated/broken run,
+but is fully explained and NOT a bug: both require `TOKENIZATION='frame'`
+(their new mechanisms only work on frame-native models), which drops the
+transformer's sequence length from `SEQ_LEN=800` (token tokenization,
+`NUM_TIME*NUM_X`) to `NUM_TIME=80` -- a 10x shorter sequence, and since
+attention cost scales roughly with sequence-length-squared, up to ~100x
+less attention compute per step. Confirmed directly in the logs: rollout
+eval dropped from the historical 2-4s (§56) to **0.09s**, and 500-step
+windows completed in well under a minute. Both arms legitimately reached
+their real step budgets (`r1` hit `MAX_STEPS=2500`, `q2` early-stopped),
+nothing crashed or was cut short.
+
+### Results
+
+| Arm | Result |
+|---|---|
+| `r1_spatial_smooth` | Completed all 2500 steps. **+39.4%** peak (rollout_mse 0.00172) -- in-band with `p3_bestyet_sophia` (+39.3%) and `q1_sophia_ema` (+40.8%). First real, non-crashed result for branch U. |
+| `q2_sophia_auxhead` | First-ever completed run (both §59 bugs fixed). Early-stopped at step 1500, **-63.9%**, never promoted once (`promoted_rollout_mse=inf`) -- WORSE than persistence throughout. |
+
+### `q2_sophia_auxhead` is written off (at this configuration)
+
+`AUX_HEAD_LOSS_WEIGHT=1.0` alongside the primary teacher-forced loss and
+`AR_LOSS_WEIGHT=3.0` actively hurts rollout performance -- the model never
+promoted a single checkpoint above the persistence baseline across its
+whole run. Not pursuing further retuning of this specific mechanism (e.g.
+searching for a smaller `AUX_HEAD_LOSS_WEIGHT`) -- the Phase 2 menu named
+three candidate levers, this is the one that failed outright, and the
+budget is better spent on the two untried, more aggressive branches (S,
+T) than on rescuing a mechanism that's already shown a strongly negative
+signal at its first real test.
+
+### A real confound identified: frame tokenization itself, not proven separable from `r1`'s own new term
+
+Both `r1` and `q2` switched `TOKENIZATION='frame'` AT THE SAME TIME as
+introducing their own new mechanism -- there has never been a clean
+"`p3_bestyet_sophia`'s exact recipe + `TOKENIZATION='frame'`, nothing
+else new" control run. `r1`'s +39.4% could be mostly the spatial-
+smoothness term, or frame tokenization could simply be just as good as
+token tokenization at this task on its own (while running ~8-10x cheaper
+per step for free) -- these two explanations are currently
+indistinguishable. New arm `u2_frame_control` (below) isolates this.
+
+### New arm: `u2_frame_control`
+
+`p3_bestyet_sophia`'s exact base recipe + `TOKENIZATION='frame'` ONLY --
+`SPATIAL_SMOOTH_WEIGHT` left at its 0.0 default, no aux head. Directly
+comparable to `r1_spatial_smooth` (identical except the smoothness term)
+and to `p3_bestyet_sophia` itself (identical except tokenization).
+
+**Not yet run as of this section.**
+
+## 62. v7.22 -- branch W built: AROpt-style accept/reject rollout stabilization (§32.2 item 7), plus two more frame-tokenization arms to isolate the real confound from §61
+
+### Branch W (named "W" not "S" -- letter "S" was already taken, see the
+code's own note)
+
+Adapts DeepSeek-V3's accept/reject sampling to continuous-valued AR
+forecasting. New `Config.AROPT_TEMPERATURE` (0.0 default, no-op --
+confirmed via `test_disabled_by_default_matches_existing_behavior`,
+which checks BYTE-FOR-BYTE identical loss output at the default vs. an
+explicit 0.0). New shared `_feed_or_aropt()` helper used by BOTH of
+`frame_ar_loss()`'s branches (frame-native and token-native, unlike
+`aux_horizon_loss()`'s frame-only scoping -- this mechanism doesn't
+inherently need a frame-level head).
+
+**Mechanism**: per-sequence, compute the model's own next-step
+prediction error against ground truth, convert to an acceptance
+probability via `exp(-error/AROPT_TEMPERATURE)` (worse predictions
+rejected more often), sample a per-sequence Bernoulli accept/reject
+decision. ACCEPT feeds the model's own prediction through (today's
+unconditional behavior for every pre-existing arm). REJECT substitutes
+ground truth instead. **Safety** (the `h10_ridge_residual` lesson,
+§26.2): the reject-path fallback is ALWAYS ground truth, never a
+model-derived anchor -- non-expansive under repeated feedback by
+construction.
+
+**MPS-tested** per branch W's own plan requirement: `tests/test_aropt_
+accept_reject.py` (6 tests -- disabled-by-default equivalence, both
+frame-native and token-native branches, a single-sequence micro-batch,
+and both temperature extremes: very high (forces all-accept) and very
+low (forces frequent rejects, exercising the ground-truth-substitution
+path directly)) plus a manual real-MPS-device check (batch=1/2,
+`mps:0`, finite loss ~1.87-1.90, real gradients).
+
+New arm `s1_aropt_frame`: `p3_bestyet_sophia` + `TOKENIZATION='frame'`
+(the same base as `u2_frame_control`) + `AROPT_TEMPERATURE=0.1` (a
+first-attempt value, not tuned).
+
+### Two more arms to properly isolate §61's confound
+
+`u3_frame_rollout_dominant`: `q3_sophia_rollout_dominant`'s own
+`TF_LOSS_WEIGHT=0.3` combined with `TOKENIZATION='frame'` for the first
+time (q3 itself ran token-native only) -- cheap, no new code, just
+combining two already-tested axes.
+
+Together with `u2_frame_control` (§61), the next launch is a genuine
+3-way comparison all sharing the identical `p3_bestyet_sophia` + frame-
+tokenization base, varying exactly one new axis each:
+
+| Arm | New axis vs. `u2_frame_control` |
+|---|---|
+| `u2_frame_control` | none (the control) |
+| `u3_frame_rollout_dominant` | `TF_LOSS_WEIGHT=0.3` |
+| `s1_aropt_frame` | `AROPT_TEMPERATURE=0.1` |
+
+**Not yet run as of this section.** Full test suite: 175 passed, 14
+skipped (up from 165 in §61).
+
+# Major version 8: past the ~40% plateau
+
+## 63. v8.0 -- honest status check, `HALF_TIME_MODE` shipped as a tooling switch, and a strategy menu for getting past the ~40% ceiling this recipe family has hit
+
+**Major version bump** (v7.x -> v8.0) per the WANDB_PROJECT convention
+(§21.1, enforced by `tests/test_version_sync.py`) -- `Config.WANDB_
+PROJECT` renamed `NI_Review_v7` -> `NI_Review_v8`.
+
+### 63.1 Why this version bump: an honest status check, not a new result
+
+Branches M/P/Q/U/W (this entire multi-day arc) have produced a wide but
+shallow sweep of small variations on ONE base recipe
+(`h9_ar_freq1`'s descendants), all landing in a narrow band:
+
+```
+ %improvement
+  70 |  ridge/linear baseline (§25.1) ...................... +69.49%  <- never beaten, by anything
+  50 |
+  46 |  best transformer EVER, 400-step screen (§28.7) ...... +46.49%  <- also never beaten since
+  44 |  h9_ar_freq1's own 400-step number (§26.1) ............ +43.78%  <- the ancestor of every M/P/Q/U/W arm
+  40 |*  * * *  *   *  *                                                <- THIS SESSION lives here
+  35 |* *   *  *  *   *
+  30 |                                                        session low: p2_bestyet_lion +30.9%
+  20 |
+   0 |----------------------------------------------------------------
+ -60 |                                                                   q2_sophia_auxhead -63.9%
+-180 |                                                                   s1_aropt_frame -179.0% (bad temperature)
+```
+
+And the ONE direct longitudinal data point this project has (same
+recipe, shallow screen vs. real production scale) points DOWN, not up:
+`h9_ar_freq1` scored +43.78% at 400 steps, then **fell to +31.35%** at
+145k real production steps (Appendix A.3) -- the opposite of "just
+needs more training." This is a documented, repeated shape (§39/46/48/
+57/59: "a 4th confirmed instance," "a 5th confirmed instance" of the
+same peak-then-decline pattern), not a one-off.
+
+**Conclusion driving this version bump**: continuing to turn small
+knobs on the SAME recipe (optimizer choice, EMA, aux heads, loss
+re-weighting, spatial smoothness, accept/reject at an untuned
+temperature) has been thoroughly tried and has not moved the needle
+past where it already was months ago. This section is a genuine
+strategy reset, not another arm in the same family.
+
+### 63.2 Shipped now (not just planned): `HALF_TIME_MODE`
+
+A real, tested tooling switch -- `Config.HALF_TIME_MODE` (default
+`False`, no-op for every existing arm). When enabled: keeps only EVEN
+time-step indices (`0, 2, 4, ...`) from every sequence, halving
+`NUM_TIME` (80->40), `SEQ_LEN` (800->400), and the resident data volume
+-- for cheaper, faster iteration while testing the strategies below, not
+a claimed quality improvement in itself.
+
+**Mechanism**: `resolve_derived_config_fields()` (new, factored out of
+`main()`'s existing "recompute derived fields after every override"
+step) halves `Config.NUM_TIME` FIRST when `HALF_TIME_MODE=True`, then
+derives `SEQ_LEN`/`VAL_ROLLOUT_STEPS` from the already-halved value --
+ordering matters, called out explicitly in its own docstring.
+`TransformerDataset.__init__` does the actual even-index subsampling
+(`raw[:, ::2, :, :]`) on the raw on-disk `(length, NUM_TIME_ON_DISK,
+NUM_X, INPUT_DIM)` array, BEFORE the final reshape into
+`(length, SEQ_LEN, INPUT_DIM)` -- skipping the subsampling would make
+that reshape fail outright (element-count mismatch) rather than
+silently corrupt data, a real safety property of doing both halvings in
+the same change.
+
+**Not in `PINNED_CONFIG_FIELDS`** (unlike `NUM_TIME`/`SEQ_LEN`
+themselves) -- `HALF_TIME_MODE` is the sanctioned lever for changing
+effective temporal resolution, settable via an arm override or
+`--set HALF_TIME_MODE=true`.
+
+**Tested**: `tests/test_half_time_mode.py` (4 tests -- disabled leaves
+`NUM_TIME` untouched, enabled halves it before deriving `SEQ_LEN`/
+`VAL_ROLLOUT_STEPS`, and the actual `TransformerDataset` subsampling
+against a small synthetic HDF5 file, verified to match `raw[:, ::2]`
+exactly). Also verified end-to-end on the real MPS device: model
+builds at the halved `SEQ_LEN=400` with correctly-sized position
+embeddings (no shape mismatch), forward+backward pass finite. Full
+suite: 179 passed, 14 skipped (up from 175 in §62).
+
+**Honest side effect, not fixed here**: `VAL_CONTEXT_STEPS=12` is left
+unchanged, so under half mode it becomes 12/40=30% of the horizon
+(context) instead of 12/80=15% -- a real, expected consequence of
+halving resolution (less rollout horizon to actually score), not
+rebalanced in this pass.
+
+### 63.3 What LLM training actually looks like at this point in a project, vs. what this one has done
+
+| LLM-training lever | Standard LLM practice | This project's status |
+|---|---|---|
+| LR schedule | Warmup + cosine decay, increasingly Warmup-Stable-Decay (WSD) for flexible-length training and mid-run checkpoint reuse (MiniCPM, DeepSeek-style) | Warmup + cosine only, unchanged since v1.0 (§28.2). Never tried WSD or restarts. |
+| Batch size / gradient noise | Large batch + LR scaled with it (linear/sqrt rules, OpenAI's gradient-noise-scale framework) -- reduces noisy updates | `BATCH_SIZE=64` fixed since the H200 defaults landed; the AR loss specifically runs on as few as `AR_SEQS=2-6` sequences -- a much noisier gradient than the primary loss, never addressed directly. |
+| Data/model scaling (Chinchilla) | Model size and data size scaled together for compute-optimal training | Model has stayed ~5M params this entire investigation; §32.2 item 6 deprioritized capacity increases based on ONE early axis test, before most of this session's newer axes existed. |
+| Pretraining before fine-tuning | The defining LLM practice -- cheap generic self-supervised objective first, task-specific objective second | Never done. Every arm starts from either random init or a warm-start from a PRIOR ARM'S already-task-trained weights -- never a generic representation-learning pass. |
+| Weight averaging | EMA during training (near-universal in diffusion, common in LLM/vision) AND post-hoc "model soups" across independently-trained checkpoints (Wortsman et al.) -- often free accuracy | EMA tried once (`q1_sophia_ema`, §59/61) -- positive but modest (+40.8%, in-band with everything else). Post-hoc soup/averaging across the many DIFFERENT already-trained checkpoints this session produced: never tried. |
+| Regularization | Comparatively LIGHT at scale -- LLMs rarely lean on heavy dropout; optimization + data axes dominate | This project has spent real effort on dropout/weight-decay tuning (branch G, `m4`/`m5`) and reached the same conclusion independently (§48: "regularization tuning alone has run its course") -- the two findings agree. |
+| Different final-stage objective | RLHF/DPO-style: a genuinely different LAST-STAGE loss, not just more pretraining-style loss, can unlock a step change | The closest analogue tried is `q3`/`u3`'s rollout-dominant loss reweighting and `s1`'s AROpt accept/reject -- both real attempts at "change what's being optimized," neither yet successful, but the right SHAPE of idea. |
+
+### 63.4 Strategy menu: 8 candidates, ranked by cost
+
+| # | Strategy | LLM/DL precedent | Mechanism here | Why it might break the plateau | Cost / risk | Weight-compatible with existing checkpoints? |
+|---|---|---|---|---|---|---|
+| 1 | **Model soup / post-hoc weight averaging** | "Model Soups" (Wortsman et al.) -- averaging independently fine-tuned checkpoints improves generalization for free | Average the weights of the best already-completed same-architecture checkpoints (e.g. the token-native cluster: `p1`/`p3`/`q1`/`q3`; separately the frame-native cluster: `r1`/`u2`/`u3`) sitting in `saved_models/` right now | Zero new training compute -- if these checkpoints sit in genuinely different loss-landscape basins, averaging can land in a flatter, better-generalizing region between them | **Lowest of all 8**: no pod time, pure local computation, minutes | **Yes, by construction** -- this IS reusing existing weights, the most direct match to "load the best we have" |
+| 2 | **LR schedule: WSD or cosine-with-restarts** | Warmup-Stable-Decay (MiniCPM, DeepSeek); SGDR warm restarts | Replace the current single warmup+cosine schedule; a restart could specifically target escaping the "peaks early, then declines" rut instead of decaying LR to near-zero right as the decline starts | Directly targets the repeatedly-observed shape: today's schedule anneals LR toward zero exactly when the model is already sliding, freezing it into the decline instead of giving it room to recover | Low -- pure scheduler swap, no architecture change | Yes -- same architecture, can resume from any existing checkpoint |
+| 3 | **Batch-size / AR-gradient-noise reduction** | Gradient noise scale, LR-batch scaling rules | Increase `AR_SEQS` (noisy at 2-6 today) and/or `BATCH_SIZE`, with LR scaled to match, specifically to smooth the AR loss's gradient signal | The AR loss's gradient comes from as few as 2-6 sequences -- a plausible source of the run-to-run "oscillation" the user is pointing at, distinct from a real capability ceiling | Low-moderate -- bounded by GPU memory (already measured close to limits at higher `AR_SEQS`, §44/50) | Yes |
+| 4 | **Progressive resolution curriculum using `HALF_TIME_MODE`** | Progressive resizing (vision), progressive context-length extension (LongRoPE, GPT-NeoX-style) | Start training at `HALF_TIME_MODE=True` (cheap, coarse), then switch to full resolution partway through -- directly exercises the switch just shipped in §63.2 | Coarse-to-fine curricula let the model learn large-scale temporal structure cheaply before spending compute on fine detail -- untried axis, no prior arm has ever varied temporal resolution during a single run | Low -- needs a resolution-switch point in the training loop (not yet built, tooling only) | Yes -- same architecture at both resolutions (position embeddings resize, but that is exactly the ALREADY-EXISTING v1.0<->v2.0 length-mismatch warm-start path, §long-standing) |
+| 5 | **Self-supervised pretraining before the forecasting objective** | The defining modern LLM practice: cheap generic objective first, task objective second | Pretrain the transformer on a masked-frame or next-frame reconstruction objective alone (no centroid decode, no AR loss) to learn general spatiotemporal structure, THEN fine-tune with the current recipe on top | Every arm this whole project has started from either random init or a task-already-trained warm-start -- never a generic representation-learning stage. This is a genuinely untried axis at the "how is the model initialized" level, not the "what's the loss during fine-tuning" level every prior arm varied | Moderate -- a new (simpler) training loop, meaningfully more wall-clock before any task-relevant result exists | Partial -- the pretrained weights become a NEW kind of warm-start source, not compatible with treating pretraining as optional the way `--warm-start` is today |
+| 6 | **Mixture-of-Experts / conditional capacity increase** | Every recent frontier LLM uses MoE for capacity without proportional compute cost | Replace the dense FFN blocks with a small MoE layer, keeping active compute per token similar while raising total capacity | If the plateau is partly a genuine capacity limit (deprioritized early, §32.2 item 6, on thin evidence pre-dating most of this session's own axes) MoE raises capacity without paying the full compute cost a dense scale-up would | Moderate-high -- new architecture component, routing/load-balancing tuning, more to get wrong | **No** -- different layer structure, breaks every existing checkpoint's warm-start |
+| 7 | **Diffusion / non-autoregressive rollout (branch T, already planned §60)** | The direct analogue to diffusion LLMs (LLaDA, Mercury) -- an active 2025-2026 research response to exactly this exposure-bias problem in text | A small conditional latent-space denoiser predicting frames without ever chaining single-step AR predictions -- error compounding structurally can't happen the same way | Every other strategy here still trains against SOME form of the current AR-rollout objective; this is the one candidate that removes the mechanism (sequential feedback) that causes exposure bias in the first place, rather than compensating for it | **Highest of all 8** -- full new model class, new training loop, new sampling procedure, most wall-clock before any result | **No** -- completely different generative mechanism, from-scratch only |
+| 8 | **Joint/partial fine-tuning of the frozen AE decoder** | Analogous to jointly fine-tuning a VAE decoder alongside a latent diffusion model, rather than freezing it as a fixed "tokenizer" | Unfreeze (or lightly adapt) the GEN3 AttentionSE decoder together with the transformer | Every arm's score depends on decoding through a decoder that has NEVER been touched -- if the decoder itself is a bottleneck or mismatched to the transformer's latent geometry, no amount of transformer-side tuning fixes that | Moderate-high, and uniquely risky: it moves the SCORING FUNCTION itself, making every prior result in this entire document not directly comparable to anything trained after it (§49.2 already flagged this) | Partial -- transformer-side weights remain loadable; the decoder side does not, and comparability of the metric itself is the real cost, not just compute |
+
+### 63.5 Recommended sequencing
+
+Cost-ordered, cheapest/most-reversible first -- nothing here is
+committed, this is the reasoning for a likely order if pursued
+sequentially:
+
+```
+ (1) model soup          -- zero pod cost, try TODAY against existing checkpoints
+      |
+ (2) WSD/restart LR      -- cheap, no architecture change
+      |
+ (3) AR gradient-noise   -- cheap, directly tests whether "oscillation"
+     reduction              is noise or a real ceiling
+      |
+ (4) progressive-res     -- uses HALF_TIME_MODE (shipped §63.2), low cost
+     curriculum
+      |
+ (5) SSL pretraining     -- moderate cost, first real "different
+                             initialization" axis ever tried
+      |
+ (6) MoE capacity  ------+-- both break weight compatibility; only
+ (7) diffusion rollout --+   worth the cost if 1-5 are exhausted first
+      |
+ (8) joint decoder FT    -- last, because it invalidates comparability
+                             of every number in this entire document
+```
+
+1-3 are cheap enough that a negative result is cheap to obtain and
+still informative (ruling out "it's just noise" is real progress, per
+the discussion earlier this session). 6-8 are the genuinely
+"architecture changes that break weight loading" the operator explicitly
+said were acceptable to consider -- deliberately sequenced LAST, after
+the cheap, reversible options, not because they're expected to fail,
+but because they're expensive enough that trying them first would waste
+the option value of the cheap tests.
+
+### 63.6 Scope of this section: planning only
+
+**Nothing in §63.4/63.5 is implemented.** `HALF_TIME_MODE` (§63.2) is
+the one exception -- a real, tested, shipped tooling switch, built
+because strategy #4 above needs it to exist before it can be tried at
+all. No arm, no new training-loop code, no new model class for any of
+strategies 1/2/3/5/6/7/8 exists yet as of this section.
+
+## 64. v8.1 -- strategies #1 (model soup) and #2 (WSD/restart LR schedules) built and tested on MPS; strategy #6 (Mixture-of-Experts) planned in detail, not built
+
+Per the operator's direction: strategies #1 and #2 built and tested
+immediately; #6 planned in real technical detail (architecture location,
+cost, risk) but deliberately NOT implemented yet, since it's one of the
+two "breaks weight compatibility" strategies explicitly sequenced last
+in §63.5. All NEW work going forward uses `HALF_TIME_MODE=True`
+(§63.2) for cheap iteration; see §64.2 for why that does NOT apply to
+re-evaluating the ALREADY-TRAINED full-resolution checkpoints strategy
+#1 uses as its ingredients.
+
+### 64.1 Strategy #2 shipped: `Config.LR_SCHEDULE`
+
+New `make_lr_lambda()` dispatch on `Config.LR_SCHEDULE` (default
+`'cosine'`, byte-for-byte the original single warmup+cosine-decay shape
+-- confirmed via `tests/test_lr_schedules.py`'s
+`test_matches_original_hardcoded_shape`, which reimplements the exact
+pre-refactor formula independently and checks it against the refactored
+function at 8 sample steps).
+
+- `'wsd'` (Warmup-Stable-Decay, MiniCPM/DeepSeek-style): holds LR at
+  its peak between the end of warmup and a final decay window
+  (`WSD_DECAY_FRAC * MAX_STEPS`), instead of annealing toward
+  `LR_FINAL_FRAC` for the entire post-warmup budget. Directly targets
+  the repeatedly-observed "peaks early, then declines" shape (§39/46/
+  48/57/59): today's plain cosine schedule is already annealing LR
+  toward its floor exactly as that decline starts, which may be
+  freezing the model into the decline rather than leaving it room to
+  recover.
+- `'cosine_restarts'` (SGDR-style): splits the post-warmup budget into
+  `LR_NUM_RESTARTS + 1` equal-length cosine cycles, resetting back to
+  peak LR at the start of each -- a different mechanism for the same
+  goal, giving the optimizer repeated fresh chances to escape a local
+  rut instead of a single one-way anneal.
+
+**Tested**: `tests/test_lr_schedules.py` (9 tests -- default-cosine
+equivalence, WSD's stable-phase-holds-at-peak and decay-reaches-floor,
+cosine-restarts' reset-at-cycle-start and within-cycle decay, an
+unknown-schedule `ValueError`).
+
+### 64.2 Strategy #1 evaluated on MPS against real checkpoints: `model_soup_eval.py`
+
+New script (`model_soup_eval.py`) evaluates whether uniform/greedy model-
+soup weight averaging (Wortsman et al.) helps on top of the best
+checkpoints branches M/P/Q/U/W already produced -- zero new training
+compute, pure local inference on this Mac's MPS device against real
+weights already on disk.
+
+**Deliberately evaluated at FULL resolution, not `HALF_TIME_MODE`**:
+every ingredient here was trained at `NUM_TIME=80`. `HALF_TIME_MODE`
+re-indexes frames onto a shorter `0..(NUM_TIME/2-1)` position axis --
+for a model that learned the FULL 0..79 axis, that would look up the
+WRONG position-embedding rows entirely, not just a cheaper evaluation.
+`HALF_TIME_MODE` is for NEW training runs (§64.3/64.4 below), not for
+re-scoring checkpoints that predate it.
+
+**Two averageable clusters** identified by inspecting each checkpoint's
+own stored `config` blob (`TOKENIZATION`/`VARIANT`/`EMBED_SIZE`/
+`N_LAYERS`/`N_HEADS`/`AUX_HEAD_FRAMES` must all match):
+- token-native: `p1_bestyet_adamw`, `p2_bestyet_lion`,
+  `p3_bestyet_sophia`, `q1_sophia_ema`, `q3_sophia_rollout_dominant`
+- frame-native (`AUX_HEAD_FRAMES=0`): `r1_spatial_smooth`,
+  `u2_frame_control`, `u3_frame_rollout_dominant`, `s1_aropt_frame`
+
+`q2_sophia_auxhead` (`AUX_HEAD_FRAMES=8`, extra `aux_head.*` params) is
+architecturally incompatible with either cluster and is excluded from
+souping entirely, per `average_state_dicts()`'s own loud
+key-mismatch guard.
+
+**Real bug hit and fixed while building this**: every one of these
+checkpoints was trained with `torch.compile` ON (before it defaulted
+off, §59), so the raw `model_state_dict` payload carries a
+`"_orig_mod."` prefix on every key (torch.compile's `OptimizedModule`
+wrapper) -- `model_soup_eval.py`'s `load_ckpt()` strips it before
+loading, the same unwrap convention this file already applies to the
+live model object elsewhere, just applied to a saved state_dict's keys
+instead. Also hit: a checkpoint's own stored `config` blob records
+absolute filesystem paths (`DECODER_SCRIPTED_PATH` etc.) from wherever
+it was TRAINED (a pod's `/workspace/...` layout) -- always overridden
+with the live local `Config`'s own paths before evaluation.
+
+**Method**: evaluates every individual ingredient fresh (via the SAME
+`evaluate()` every arm's own training run uses, so numbers are directly
+comparable to earlier reported ones), then builds a GREEDY soup
+(Wortsman et al.'s own selection procedure, not blind uniform
+averaging): sort by individual `rollout_mse` ascending, start from the
+best, then add each remaining ingredient only if it does not make the
+running soup's `rollout_mse` worse.
+
+**A real MPS backend stall, found running this**: the full greedy
+search (~9 individual evals + ~7 incremental soup-candidate evals) was
+too slow to complete in one sitting -- even a single evaluation on a
+2032-row subset took ~4 minutes. Batching more sequences per call
+(`chunk`/`tf_batch_size`) didn't fix it: a subsequent attempt sat in
+`ps`'s "uninterruptible sleep" state, consuming almost no CPU across 5+
+minutes for ONE evaluation -- a genuine MPS dispatch/synchronization
+pathology on the sequential AR-rollout loop specifically (68 sequential
+`model.forward()` calls per rollout, each growing the context), not
+something fixable by tuning batch or subset size. **Forcing CPU
+(`MODEL_SOUP_DEVICE=cpu`) fixed the stall outright** -- CPU's single-
+queue, fully synchronous execution proved far more reliable for this
+exact workload than MPS, even though nominally "slower" per-op.
+Scope was also cut from the full greedy search down to the minimum
+informative comparison: each cluster's best-known individual ingredient
+(from this session's own real CUDA numbers) plus ONE uniform soup of
+every member -- 4 evaluations total instead of ~16, on a small (304-row,
+12-sequence) subset for tractable CPU wall-clock.
+
+### Results: model soup FAILS badly on both clusters
+
+| Cluster | Best individual (fresh eval, same subset) | Uniform soup | Delta |
+|---|---|---|---|
+| Token-native (`p1`/`p2`/`p3`/`q1`/`q3`) | `q1_sophia_ema` **+44.45%** | **-225.84%** | -270.3 points |
+| Frame-native (`r1`/`u2`/`u3`/`s1`) | `u3_frame_rollout_dominant` **+50.38%** | **-1678.58%** | -1729.0 points |
+
+Not a marginal loss -- a complete collapse in both clusters, the soup
+scoring far worse than even a naive constant-zero predictor would.
+**Likely explanation**: the original Model Soups result (Wortsman et
+al.) averages checkpoints fine-tuned FROM THE SAME PRETRAINED WEIGHTS
+with only minor hyperparameter differences, keeping every ingredient
+close together in weight space ("linear mode connectivity"). Every
+checkpoint souped here instead started from an independent RANDOM
+INIT and diverged under substantially different optimizers (AdamW/
+Lion/Sophia) and loss terms (EMA, rollout-dominant weighting, spatial
+smoothness, AROpt) -- nowhere near the same basin. Transformers are
+also specifically documented to need a permutation-alignment step
+(matching equivalent-but-differently-ordered attention heads across
+runs, e.g. "Git Re-Basin"-style approaches) before naive averaging is
+meaningful at all; none was attempted here.
+
+**Verdict**: strategy #1, in its simplest (uniform/greedy, no
+permutation alignment) form, is a real, informative NEGATIVE result --
+ruled out for this specific checkpoint population, not worth pursuing
+further without first solving the much harder alignment problem the
+original technique doesn't need when its own precondition (shared
+pretraining lineage) holds. That precondition never held here.
+
+### 64.3 Strategy #6 built + unit-tested (v8.3), NOT yet run on real data
+
+**Status update (post v8.3)**: everything described below as "planned" has
+since been built. `MoEFeedForward`, `_build_ffn()`'s dispatch, and
+`moe_aux_loss()` exist in `model_variants.py`; `MOE_NUM_EXPERTS` (default
+`0`, byte-for-byte dense), `MOE_TOP_K` (default `2`), and
+`MOE_LOAD_BALANCE_WEIGHT` (default `0.01`) exist in `Config` in
+`train_production_transformer_deep_dive.py`, which also adds the aux loss
+into the training loop when `MOE_NUM_EXPERTS > 0`. `tests/test_moe_ffn.py`
+covers it: output-shape, aux-loss finiteness/positivity, gradient reaching
+every expert and the router, `top_k` clamping, the SwiGLU variant, the
+`MOE_NUM_EXPERTS=0` no-op path, and a real tiny-model forward+backward with
+MoE enabled (frame-native tokenization included). All 8 tests pass on
+CPU/MPS.
+
+**What this does and doesn't mean**: this is the same "prove it before
+spending pod time" bar every other mechanism in this project clears before
+a real run -- it confirms the code is correct, not that MoE helps. No arm
+using `MOE_NUM_EXPERTS > 0` has been trained on real data yet; there is no
+production-scale result for this strategy. The original plan below is kept
+for the reasoning/rationale; treat "planned" language in it as historical.
+
+**Original plan (superseded by the above -- kept for rationale)**:
+
+**Where it goes**: `model_variants.py`'s `Block.__init__` currently sets
+`self.mlp = _build_mlp(n_embd, dropout, use_swiglu)` (one dense FFN per
+block, `Block.forward` at line ~295: `x = x + self.mlp(self.ln2(x))`).
+The standard MoE conversion (Switch Transformer, Mixtral) replaces ONLY
+this FFN sublayer with a sparse mixture -- attention stays dense in
+every published MoE transformer variant, and there is no reason to
+deviate here. A new `_build_moe_mlp(n_embd, dropout, n_experts, top_k)`
+would construct `n_experts` independent copies of today's `_build_mlp`
+output (or `SwiGLU`) plus a small linear router (`n_embd -> n_experts`),
+selecting the top-`k` experts per token (`top_k=1` or `2`, matching
+Switch/Mixtral's own choices) and combining their outputs weighted by
+the router's softmax.
+
+**New Config fields (planned)**: `MOE_NUM_EXPERTS` (0 disables --
+byte-for-byte today's dense `_build_mlp`, preserving every existing
+arm), `MOE_TOP_K`, `MOE_LOAD_BALANCE_WEIGHT` (an auxiliary loss term
+penalizing uneven expert utilization -- without it, MoE training is
+well-documented to collapse onto using only 1-2 experts regardless of
+`n_experts`, wasting the added capacity entirely).
+
+**Why it might help**: raises total model capacity without a
+proportional increase in per-token compute (only `top_k` of
+`n_experts` FFNs run per token) -- exactly the mechanism every recent
+frontier LLM uses to scale capacity past what dense scaling can afford.
+If the ~40% plateau is partly a genuine capacity limit (§32.2 item 6
+deprioritized this on thin evidence -- one axis test, predating almost
+every strategy this project has since tried), MoE is a way to test
+that WITHOUT paying dense-scaling's full compute cost.
+
+**Honest cost/risk, stated plainly**: this project's model is currently
+~5M parameters -- small. MoE's benefits are best-documented at a scale
+where a dense equivalent would be prohibitively expensive; at 5M
+params, the router/load-balancing complexity is real overhead that a
+plain capacity increase (`EMBED_SIZE`/`N_LAYERS`) might match or beat
+more simply. The honest framing: this is worth testing BECAUSE it's
+cheaper than dense scaling to try, not because MoE is obviously the
+right tool at this model size -- a genuinely open question, not a
+confident bet.
+
+**Weight compatibility**: NONE. A different `Block.mlp` structure
+breaks every existing checkpoint's warm-start -- any MoE arm starts
+from random init, exactly like every other architecture-changing
+strategy in §63.4's table (#6, #7, #8).
+
+**Sequencing**: per §63.5, deliberately after #1-5 -- not because it's
+expected to fail, but because it's expensive enough (new architecture
+component, routing/load-balancing tuning, from-scratch training only)
+that trying it before the cheap, reversible options would waste their
+option value. **Update**: the code and unit tests are now built (see the
+status note at the top of §64.3) -- what remains outstanding is only the
+real-data run/arm, not the implementation.
+
+### 64.4 What's next, given §64.2's soup results
+
+The soup collapsed on both clusters (§64.2) -- the opposite of "these
+checkpoints happened to sit in the same basin." The divergence across
+optimizers/loss terms was apparently large enough that naive weight-
+space averaging destroys the model entirely, not just fails to help.
+Strategy #1 is DONE for this checkpoint population -- not worth
+retrying without a genuine permutation-alignment step first (a
+meaningfully larger, separate piece of work, not attempted here).
+
+The more informative next test is **strategy #2 (WSD/restart LR
+schedules) on a genuinely fresh run**, isolated from souping entirely --
+already built and unit-tested (§64.1), just needs a real training
+launch (ideally with `HALF_TIME_MODE=True` per the operator's own
+direction) to see whether it does better than plain cosine at avoiding
+the peak-then-decline pattern this whole investigation keeps finding.
+
+## 65. v8.2 -- WSD + `HALF_TIME_MODE` verified end-to-end on a real MPS training run; two more real bugs found (not fixed) along the way
+
+### Real run confirms WSD's math against the actual training loop, not just unit tests
+
+`bash train_production_transformer_deep_dive.py --arm u2_frame_control
+--max-steps 8 ... --set HALF_TIME_MODE=true LR_SCHEDULE=wsd
+WSD_DECAY_FRAC=0.5` on this Mac's MPS device: data resident at
+`(59280, 400, 52)` (confirms `HALF_TIME_MODE` halved `SEQ_LEN` 800->400
+in a real run, not just the unit tests), and the printed per-step LR
+held flat at `8.00e-04` (peak) for steps 1-3 -- exactly WSD's stable
+phase, matching `make_lr_lambda()`'s own math for `MAX_STEPS=8`,
+`WARMUP_FRAC=0.03`, `WSD_DECAY_FRAC=0.5` (decay only starts at step 5).
+Run completed cleanly (8 steps, checkpoint written, `[done]`) --
+the ridiculous `-50332%` improvement number is expected and irrelevant
+(8 steps from random init tells you nothing about quality, only that
+the mechanism runs without crashing).
+
+### Two real bugs found getting there, NEITHER fixed (out of scope for this pass, flagged for later)
+
+**1. `--set KEY1=V1 --set KEY2=V2` (repeated `--set` flags) silently
+drops everything but the LAST occurrence.** `argparse`'s `--set`
+argument uses `nargs="*"` without `action="append"` -- each `--set`
+occurrence REPLACES `args.set` rather than accumulating into it. The
+first smoke-test attempt passed six separate `--set KEY=VALUE` flags
+and only the final one took effect; `HALF_TIME_MODE`/`LR_SCHEDULE`
+silently reverted to their defaults with no warning at all. **Correct
+usage**: pass every override to a SINGLE `--set` flag, space-separated
+(`--set KEY1=V1 KEY2=V2 KEY3=V3`) -- this is how every prior real
+launch command in this document already does it, which is exactly why
+this footgun had never surfaced before.
+
+**2. `_coerce("none")` returns Python `None`, not the string `'none'`
+the training loop's `AR_MODE` checks compare against.** `--set
+AR_MODE=none` therefore can NEVER actually disable AR mode via the CLI
+-- `Config.AR_MODE` becomes `None`, and `if ar_mode != 'none':` (`None
+!= 'none'`) evaluates `True`, so the AR branch stays "on" with
+`ar_mode` equal to neither `'frame_ar'` nor `'none'`, falling into the
+`sched_sampling_loss()` branch instead of skipping AR entirely.
+
+**3. `sched_sampling_loss()` crashes on frame-native models** -- the
+THIRD real instance of the same bug class already fixed twice this
+session (§59: `frame_ar_loss()`, `aux_horizon_loss()`): it calls
+`centroid_velocity_loss(model(inp), tgt, cfg)` directly on a frame-
+native model's raw `NX*LATENT_DIM`-wide output without the
+`to_per_token_latent()` reshape the frozen AE decoder needs. Only
+reachable via bug #2 above (no real arm has ever set `AR_MODE='sched'`
+together with `TOKENIZATION='frame'`), which is why it survived
+undetected -- confirmed via the exact same crash signature as the two
+previous instances: `"linear(): input and weight.T shapes cannot be
+multiplied (39x470 and 47x100)"`.
+
+**Why not fixed now**: all three are real, but none block the actual
+task (verifying WSD/`HALF_TIME_MODE`) once worked around (avoid
+repeated `--set` flags; don't pass `AR_MODE=none` through `--set`,  the
+arm's own `AR_MODE` default plus the existing MPS auto-disable guard
+already produces the same effective behavior safely). Flagged here so
+a future session doesn't rediscover them from scratch -- the sensible
+fix set is: `--set` should use `action="append"` with per-item
+`KEY=VALUE` splitting (or already-working space-separated usage should
+be the ONLY documented form), `_coerce()` should special-case `AR_MODE`
+(and any other field whose valid value is literally the string
+`"none"`) to not intercept it into Python `None`, and
+`sched_sampling_loss()` needs the same `to_per_token_latent()` fix
+already applied twice elsewhere.
+
+Full test suite unaffected: 195 passed, 14 skipped.
+
+---
+
+## 66. v8.3 -- strategy #6 (MoE) built + unit-tested; local-pod startup cost investigated end-to-end: a raw-binary data loader, full startup timing instrumentation, an eval-batch speedup attempt that found and fixed a real OOM-handling bug, then correctly reverted its own default after live testing
+
+### Strategy #6 (Mixture-of-Experts) status update -- see §64.3
+
+§64.3 was written as "planned, NOT built." That's no longer accurate: this
+session actually built it. `MoEFeedForward`, `_build_ffn()`'s dispatch,
+and `moe_aux_loss()` exist in `model_variants.py`; `MOE_NUM_EXPERTS`
+(default 0, byte-for-byte dense), `MOE_TOP_K`, and
+`MOE_LOAD_BALANCE_WEIGHT` exist in `Config`. `tests/test_moe_ffn.py`
+covers shape/gradient/aux-loss/top_k-clamping/SwiGLU/frame-native
+correctness plus a real tiny-model forward+backward with MoE enabled --
+8/8 pass. §64.3 has been amended in place to reflect this (built +
+unit-tested, no real-data training run yet -- `MOE_NUM_EXPERTS=0` stays
+the `Config` default). `singleshot/run_moe_h100.sh` was added as a
+one-command H100 launcher (cold-start `a3b_delta_ar` + MoE, since a
+different `Block.mlp` structure breaks warm-starting from any existing
+checkpoint, same as every other architecture-changing strategy in
+§63.4's table).
+
+A real H100 pod run (`r2_a3b_delta_ar`, this launcher) trained cleanly to
+step 500 with `MOE_NUM_EXPERTS=4`/`MOE_TOP_K=2` and pulled its artifacts
+back successfully -- mechanically sound, but 500 steps from random init
+(no warm-start, as expected) says nothing about whether MoE helps; no
+real result yet, consistent with §64.3's "genuinely open question, not a
+confident bet" framing.
+
+### The real bottleneck wasn't the pod -- it was eval, and it was already there locally
+
+Comparing pod progress to a parallel local (MPS) run of the same arm+MoE
+surfaced something more useful than the MoE question itself: at step 75,
+wall_seconds=34267 for only 75 steps (ETA ~752h). The `IMPROVEMENT=
+-80999%` numbers this produced on `a0_control` (which has `AR_MODE=
+'none'` -- never trained against the rollout objective at all) are
+expected/irrelevant on that arm specifically; but the SPEED problem is
+real and arm-independent, so it was worth attacking directly rather than
+just moving the same slow loop to a faster GPU.
+
+### Fix #1: instrument the startup critical path (`train()`, `TransformerDataset`)
+
+Every stage before the training loop starts now logs a
+`[startup] <stage> @ +Xs` marker: run-lock acquisition, device-regime
+resolution, dataset load (see below), device residency, model
+construction, feature stats, warm-start/resume decision, `torch.compile`,
+causality probe, `null_baselines` (where the `[start-from:decoder]`
+rainbow line actually originates, not before it), and loop entry. The
+previously-silent `_read_h5_dataset_threaded()` disk read now logs
+before/after with GB/s throughput -- there was previously LITERALLY
+ZERO log output during a multi-GB disk read, which is exactly what a
+user watching a live pod session flagged as an unexplained ">1 minute
+pause I can't explain."
+
+### Fix #2: a raw-binary data loader, replacing HDF5 for the full-file read case
+
+Diagnosis: `train_80.h5`/`val_80.h5` are chunked ONE ROW PER CHUNK --
+59,280 separate HDF5 chunk-index lookups+reads for train alone. Fine on
+a warm local page cache (confirmed: 9.86GB in ~2s on this Mac's NVMe),
+but exactly the pattern that turns into one round-trip per row on a
+cold-cache/network-backed pod volume (the ORIGINAL "one CPU core,
+slowly" diagnosis behind `_read_h5_dataset_threaded()` itself, per its
+own v7.20 docstring -- threading helped, but didn't remove the per-row
+chunk structure).
+
+Built: `convert_h5_to_raw()` / `h5_to_raw.py` -- one-off, streamed,
+byte-for-byte-verified conversion of the `.h5` files to a flat
+`.raw`/`.raw.json` (shape/dtype sidecar) pair, same safety convention as
+the existing `decompress_h5.py`. `_read_raw_binary_to_tensor()` loads via
+`torch.from_file()` -- a single sequential memory-mapped read straight
+into a torch tensor, no HDF5, no numpy array at any point.
+`TransformerDataset` auto-detects a `.raw`/`.raw.json` sibling and
+prefers it, falling back untouched to the HDF5 path otherwise
+(`PFD_USE_RAW_BINARY=0` forces the old path). 6 new tests
+(`tests/test_raw_binary_loader.py`) confirm byte-identical output vs.
+HDF5, correct partial-length slicing, real corruption detection in the
+verify step, and end-to-end `TransformerDataset` equivalence -- also
+manually confirmed against the real 4.2GB `val_80.h5` locally
+(byte-identical). Nothing changes for data that hasn't been converted
+yet; run `python h5_to_raw.py` once per box to opt in.
+
+### Fix #3 (measured, not guessed): where the eval time actually goes
+
+Before touching anything, this session insisted on REAL numbers, not
+estimates -- direct local benchmarks against the real `a3b_delta_ar`+MoE
+model and the real `val_80.h5`:
+
+* Rollout cost is genuinely linear per sequence on MPS (`chunk=1`
+  forces one independent iteration per sequence): steady-state ~80s/seq
+  (n=4 and n=8 agreed: 79.8s vs 81.5s; n=1/n=2 were inflated by MPS's
+  own first-call warm-up, not real per-seq cost).
+* The teacher-forced validation pass -- SEPARATE from rollout, and
+  invisible in any prior log line -- also runs at `batch=1` on MPS
+  (`regime.eval_micro_batch`) over ALL 25,410 val rows, EVERY eval:
+  measured ~0.13s/row steady-state, extrapolating to **~55 minutes per
+  eval**, entirely unaffected by `--rollout-seqs`.
+* Reworking the real interval arithmetic from a live run with both costs
+  now separated (rather than lumped into "training time") gives real
+  training-only cost of ~45s/step, not the ~180s/step this session
+  originally (wrongly) inferred before TF cost was isolated.
+* Net: `--val-every 250 --rollout-seqs 16` versus the defaults is a
+  **measured ~7.3x** wall-clock reduction (463s/step amortized -> 63.5
+  s/step; ~772h -> ~106h for 6000 steps) -- driven mostly by eval
+  FREQUENCY (10x fewer evals), since `--rollout-seqs` alone only ever
+  touches the rollout half, and the now-larger TF pass is unaffected by
+  it.
+
+### Fix #4 attempted: raise `eval_micro_batch` above 1 on MPS -- real win, real bug found, real live failure, correctly NOT shipped as the default
+
+The `eval_micro_batch=1` clamp's own comment predates the v3.1 `NUM_X`
+cut and admits to being oversized; `evaluate()` runs under
+`@torch.no_grad()`, so the TRAINING clamp's backward-graph memory
+argument doesn't apply. Raising it (`chunk=`/`tf_batch_size=` in
+`evaluate()`) reduces the NUMBER of MPS dispatch calls without changing
+FLOPs -- CUDA already runs the identical code path safely at
+`eval_micro_batch=32-64`.
+
+**Bug found and fixed**: a first attempt at an OOM-safe backoff wrapper
+(`_run_with_oom_backoff()`, halve-and-retry on a caught
+`RuntimeError`) was USELESS as originally written -- retrying while
+still inside the `except RuntimeError as e:` block keeps `e`'s traceback
+(and every tensor reachable from the failed call's frames) alive, so
+`torch.mps.empty_cache()` has nothing to free yet, and the retry re-OOMs
+with the IDENTICAL byte count no matter how small the chunk gets, even
+down to a chunk independently known to fit. Fixed by moving the
+cache-clear + retry to AFTER the `except` block exits normally (Python
+clears `e`/its traceback at that point, per the language spec). Covered
+by a real regression test
+(`test_exception_state_cleared_before_retry` in
+`tests/test_oom_backoff.py`, 10/10 passing) that checks
+`sys.exc_info()` is actually clear during each retry -- this is exactly
+the state that made `empty_cache()` a no-op before the fix.
+
+**Live testing (after the fix) still crashed at `eval_micro_batch=16`
+AND `32`**, twice, on this exact machine -- NOT reverted based on
+theory, reverted based on watching it fail. Two real, independent causes
+found:
+1. `rollout_frames()`'s context grows by one token every one of its
+   ~680 iterations -- a new shape almost every step defeats the MPS
+   caching allocator's block reuse, the SAME "changing shapes" mechanism
+   `_regime_banner_mps_cpu`'s ORIGINAL training-side rationale already
+   described, just via accumulation instead of backward-graph retention.
+   It was wrong to assume `@torch.no_grad()` made eval exempt from this.
+2. This machine's shared Metal memory pool was ALSO under real, growing
+   pressure from entirely unrelated processes at the time (`other
+   allocations` climbed 66 -> 70 -> 78 GiB across a few minutes --
+   PyCharm, multiple WebKit renderers, WindowServer; confirmed via `top
+   -o mem`, not assumed).
+
+**Net decision**: `PFD_MPS_EVAL_BATCH` default reverted to **1** (`git
+diff` shows the full back-and-forth) -- the backoff mechanism itself is
+real, tested, and kept (self-correcting for whoever DOES have headroom
+to spare, via `PFD_MPS_EVAL_BATCH=N`), but shipping a default that was
+just directly observed to crash on its own reference machine would be
+irresponsible regardless of how good the theory sounded beforehand.
+This is the one lever from this whole investigation that did NOT pay
+off locally -- eval-frequency reduction (`--val-every`/`--rollout-seqs`,
+Fix #3) is the confirmed, safe win; raising `eval_micro_batch` remains
+available as an opt-in for a box with real headroom, not a default.
+
+### Full test suite: 222 passed, 13 skipped (was 195/14 at start of session)
+
+## 67. v8.4 -- PLAN: next real launch moves to an H100 pod; `_latest.pt` cadence made time-based, not just step-based
+
+### 67.1 Checkpoint cadence -- shipped this session
+
+`_latest.pt` was only ever saved every `Config.CHECKPOINT_EVERY_STEPS`
+(25) steps. That is fine as long as step time is roughly what it was
+tuned against (B300/H200), but it is the wrong unit once GPU type
+varies run to run: a slower box under-checkpoints in wall-clock terms,
+a faster one burns I/O checkpointing far more often than the crash-
+recovery use case needs. Added `Config.CHECKPOINT_EVERY_SECONDS = 600`
+(10 min) as a second, independent trigger alongside the existing
+step-based one in the main training loop
+(`train_production_transformer_deep_dive.py`, `train()`) -- whichever
+fires first wins:
+
+```python
+due_for_time_checkpoint = (
+    (time.time() - last_checkpoint_wall) >= Config.CHECKPOINT_EVERY_SECONDS)
+if step % Config.CHECKPOINT_EVERY_STEPS == 0 or due_for_time_checkpoint or hit_budget:
+    save_checkpoint(latest_path, ...)
+    last_checkpoint_wall = time.time()
+    ...
+```
+
+`last_checkpoint_wall` is seeded to `t_start` (not 0) so a resumed
+process doesn't immediately fire a save on its first step. This only
+touches the `_latest.pt` cadence -- `_best.pt` / `_rollout_best.pt`
+promotion logic (§51, §54) and `LATEST_ARCHIVE_KEEP` archiving (§10.9,
+v6.x) are unchanged. On an H100, where per-step time is currently
+unmeasured for this recipe, the 10-minute floor bounds crash-recovery
+loss regardless of what that turns out to be, the same way it now does
+for a very fast or very slow arm on the existing GPU pool.
+
+### 67.2 H100 pod launch -- prep, not yet run
+
+All prior production runs (v1.0 §7, and every sweep round since) used
+B300/H200/RTX PRO 6000 Blackwell hardware; an H100 has not been used for
+this recipe yet. `singleshot/provision_and_run.sh` already supports
+this without a code change -- `GPU_ID` is an explicit override, and
+`GPU_AUTO_DETECT_PATTERN` (default
+`H200|H300|RTX PRO 6000 Blackwell (Server|Workstation) Edition$`,
+see the script's inline comment on relative pricing/VRAM) is an
+environment-variable override, not a hardcoded pool. For the H100 run,
+launch with:
+
+```bash
+GPU_AUTO_DETECT_PATTERN='H100' ./provision_and_run.sh   # or GPU_ID=<exact H100 id/displayName>
+```
+
+Open items before that launch, to fold into this section once run:
+- H100 has 80GB (SXM) or 94GB (NVL) HBM depending on SKU -- confirm
+  which variant `runpodctl gpu list` actually offers before assuming it
+  matches the 96GB Blackwell headroom the current `AR_SEQS` sizing notes
+  (§7.10/singleshot script comments) were measured against.
+- No H100 step-time measurement exists yet for this recipe -- the new
+  `CHECKPOINT_EVERY_SECONDS=600` floor is deliberately hardware-agnostic
+  so this is a measurement to make, not a blocker to the launch.
+- `venv`/dependency bootstrap (`bootstrap_remote.sh`,
+  `requirements.txt`) is GPU-family-agnostic (CUDA wheel selection is
+  driven by the pod image, not this script), so no changes expected
+  there -- confirm on first real H100 boot rather than pre-emptively
+  editing.
+
+## 68. v9.0 -- the H100 launch happened: a queue-driven bake-off runner built, four real bugs found and fixed the hard way, and the root cause of six catastrophically bad screens traced to a mismatched warm-start checkpoint, not the hyperparameters being tested
+
+Major-version bump (v8.4 -> v9.0, not the usual `.N`) because this
+session changed how experiments get launched at all, not just what's
+being tried -- see `singleshot/bakeoff_run.sh` (new) and
+`DATA_PIPELINE_WALKTHROUGH.md` for the parallel data-pipeline writeup
+this same session produced.
+
+### 68.1 `singleshot/bakeoff_run.sh` -- a queue-driven bake-off, not a fixed batch
+
+`provision_and_run.sh`'s `--arm2`/`--arm3` mode launches a FIXED set of
+concurrent arms, waits for all of them, pulls back once. The problem:
+a cheap early-stop (§67's own H100 run -- `h11_ridge_distill` bailed
+after only ~14 real minutes, `EARLY_STOP_PATIENCE_STEPS=500` correctly
+firing) just left the freed GPU slot idle until the whole pod's global
+timeout tore it down.
+
+`bakeoff_run.sh` fixes that: a fixed number of concurrent slots
+(`--slots`, default 2), backed by a JSON queue
+(`singleshot/bakeoff_queue.json`) -- the instant a slot finishes for
+ANY reason (promoted, early-stopped, hit its own budget, crashed), that
+slot's results are pulled back and classified, and the next queued
+permutation launches into the freed slot immediately. Reuses
+`provision_and_run.sh`'s pod lifecycle verbatim (GPU auto-detect, the
+two-layer global-timeout watchdog, `scp_env_files.sh`/
+`scp_data_files.sh`/`bootstrap_remote.sh`, `rsync_with_retry`) --
+nothing in those shared scripts was touched. `--dry-run` validates the
+queue (schema, unique `(arm,round)` pairs so checkpoint prefixes never
+collide, no repeated `--set` per entry) with zero `runpodctl`/`ssh`
+calls -- the only thing safe to iterate on without spending money.
+
+### 68.2 Four real bugs found by actually running it, not by review
+
+Every one of these looked like "it just quit and did nothing" from the
+outside -- `set -e` gives zero error text when the failing command
+itself produced none. Found by reading the pulled-back logs directly,
+not guessed at:
+
+1. **`grep` finding no match silently kills the whole script under
+   `set -e -o pipefail`.** `_explicit="$(grep -oE ... | awk ...)"` --
+   when grep matches nothing (the NORMAL case for 5 of 6 queue entries,
+   which have no `--warm-start` of their own), grep exits 1, `pipefail`
+   propagates that past awk's own 0 exit, and the assignment dies
+   silently. Hit on the very first queue entry, every time, until
+   fixed. Three separate instances of the identical pattern found and
+   fixed: the Phase 1b `--warm-start` extractor, `validate_queue()`'s
+   `--set`-repeat counter (latent -- never fired since every entry
+   currently has a `--set`), and `classify_outcome()`'s log-reason
+   grep (this one would have killed the ENTIRE bake-off mid-run, not
+   just one entry, the first time any slot finished cleanly with no
+   early-stop/wall-clock/traceback line to match). All fixed with a
+   trailing `|| true` (or, for the two cases embedded inside `${VAR:-
+   ...}` defaults, restructured into a separate statement with its own
+   `|| true` -- confirmed directly that `x="${x:-$(false)}"` under
+   `set -e` ALSO dies silently, the default-expansion doesn't protect
+   the inner command substitution).
+2. **`rsync`'s implicit chown on push.** Phase 1b's checkpoint upload
+   used `rsync -avP` (no `--no-owner`/`--no-group`) -- `-a` implies
+   preserving owner/group, which needs `CAP_CHOWN` on RunPod's
+   container even as `root@`. Exit 23 (`chown ... Operation not
+   permitted`), AFTER the file had already transferred 100% correctly
+   -- purely a metadata failure that `set -e` still treated as fatal.
+   This exact failure, and this exact fix, already existed in
+   `scp_env_files.sh` (OVERVIEW.md §55/v7.15) -- missed here because
+   Phase 1b was new code, not a copy of the already-fixed pattern.
+3. **Ctrl-C didn't actually stop anything.** No explicit signal
+   handling existed at all -- relied entirely on ambient process-group
+   delivery reaching the re-exec'd child, the timeout watchdog, AND
+   every live SSH training connection, which isn't something to rely
+   on across environments. Fixed with explicit `trap ... INT TERM` at
+   both the outer wrapper (forwards to the child + watchdog) and the
+   main body (kills every live slot's local SSH connection, then lets
+   the existing `cleanup_pod` EXIT trap delete the pod) -- verified the
+   trap-and-kill mechanism itself fires correctly (confirmed via
+   SIGTERM directly; this session's own sandboxed test tool appears to
+   suppress raw SIGINT delivery to background jobs, an environment
+   quirk, not a flaw in the fix -- the trap code path is identical for
+   both signals).
+4. **The warm-start loader never unwraps `torch.compile`'s
+   `_orig_mod.` prefix.** `h11_wd_dropout_variant`'s explicit
+   `--warm-start saved_models/r2_h11_ridge_distill_rollout_best.pt`
+   crashed with `REFUSING to load: unexpected keys in checkpoint
+   (architecture drift)` -- EVERY key, because that checkpoint was
+   saved while wrapped in `torch.compile`, and its raw
+   `model_state_dict` carries the `_orig_mod.` prefix on every
+   parameter name. `save_scripted_model()`/`moe_aux_loss()` already
+   unwrap this (`getattr(model, "_orig_mod", model)`) -- the warm-start
+   read path (`train_production_transformer_deep_dive.py`, the
+   function `DEFAULT_WARM_START_CKPT` feeds) never did. Fixed: strip a
+   leading `_orig_mod.` from every checkpoint key right after it's
+   read, before the shape/architecture-drift checks run. This is a
+   real fix to the shared trainer, not just the bake-off script --
+   any future explicit `--warm-start` from a compiled checkpoint would
+   have hit the identical crash.
+
+### 68.3 The real finding: six catastrophic screens had ONE shared cause, not six bad hyperparameters
+
+First real bake-off run (post-fixes above) posted wildly negative,
+wildly INCONSISTENT `improvement_pct` across every `a3b_delta_ar`
+screen (-204592%, -219994%, -436965%, -188066%, -81816%) -- diagnosed
+by reading the actual pulled-back logs (`sweep_logs/r21_a3b_delta_ar.log`
+etc.), not the summary numbers alone:
+
+- Every non-`fresh` screen warm-starts from
+  `DEFAULT_WARM_START_CKPT` = `saved_models/old/r1_a3b_delta_ar_rollout_best.pt`.
+  Its own embedded metadata: `step=25 epoch=25`. Its own deep-dive
+  report (`tests/reports/r1_a3b_delta_ar_deep_dive.md`) confirms it was
+  ALREADY losing to persistence by frame 28 in its native 40-frame
+  regime (`last% (frame 28) = -110.84%`).
+- Every screen's rollout eval runs ~68 frames (`VAL_ROLLOUT_STEPS` at
+  `NUM_TIME=80`) -- more than DOUBLE the horizon where this checkpoint
+  was already failing natively. Autoregressive error compounds with
+  rollout length; asking a fraying-by-frame-28 checkpoint to run 68
+  frames free-running is a guaranteed blowup, not a measurement of
+  WSD vs. cosine-restarts vs. `AR_SEQS`. Confirmed directly in the
+  logs: teacher-forced loss was completely normal and decreasing
+  (`val_tf=0.0097`) while rollout MSE was ~2000x worse than
+  persistence -- textbook exposure-bias divergence, not a broken
+  model or a broken metric. The wild swings in the percentages across
+  entries are the noise signature of chaotic divergence dynamics, not
+  a real effect size for anything actually being screened.
+- A second, compounding discovery: `NETWORK_VOLUME_ID` makes
+  `/workspace` (and everything under `saved_models/`, `sweep_logs/`)
+  PERSIST across every pod recreation. Round numbers reused across
+  separate debugging attempts (including ones from before the bugs in
+  §68.2 were fixed) silently accumulated -- e.g.
+  `sweep_logs/r21_a3b_delta_ar.log` contained TWO separate
+  `[DEVICE DETECTED]` startup banners concatenated together, one from
+  an earlier crashed attempt, one from the real run. Not itself the
+  cause of the bad numbers, but a real trap for reading these logs
+  cold -- always find the LAST `[DEVICE DETECTED]` banner before
+  trusting anything above it.
+
+**Fix**: `bakeoff_queue.json`'s three affected screens
+(`a3b_wsd_screen`, `a3b_cosine_restarts_screen`,
+`a3b_arseqs_bump_screen`) now explicitly `--warm-start` from
+`saved_models/r2_h11_ridge_distill_rollout_best.pt` instead --
+confirmed real, positive `improvement_pct=+37.26%` under the CURRENT
+80-frame regime (its own `status.json`, from the real run this same
+session pulled back). Round numbers bumped (21->31, 22->32, 25->35,
+26->36) specifically to avoid resuming the now-poisoned state this
+run just wrote to the persistent volume, per the trap just above. The
+two `fresh: true` MoE screens are untouched by this fix (they don't
+warm-start) and are expected to STILL look bad on a short screen for
+the same long-rollout-horizon reason, just starting from random init
+instead of a bad checkpoint -- for those specifically, "does it train
+without crashing / does loss trend down" remains the real cheap-screen
+signal, not rollout-vs-persistence this early.
+
+**Not yet confirmed on real hardware**: this whole diagnosis is a
+conjecture, however well-evidenced -- the next real bake-off run is
+the actual test (see the command in the session notes / next chat
+turn). If the three re-pointed screens STILL show five-or-six-digit
+negative `improvement_pct` at their very first eval (step 250), this
+diagnosis is wrong and the search continues elsewhere.
+
+### 68.4 The re-pointed run's early results (H200, wandb group `Bones`) -- confirmed live, mid-run
+
+Also fixed this same session, both real: `wandb login`'s interactive
+flow writes to `~/.netrc` (i.e. `/root/.netrc`) -- the CONTAINER's own
+root filesystem, not `/workspace` (the `NETWORK_VOLUME_ID` mount) --
+so credentials never survived a pod recreation despite `/workspace`
+itself persisting. `bakeoff_run.sh` now also checks for a key at
+`/workspace/.wandb_api_key` on the volume itself before deciding
+`--no-wandb`, and each slot's own wandb run URL is now re-printed as a
+standalone, bold, per-slot-colored line the instant wandb prints it,
+instead of being buried mid-scroll.
+
+Checked the live pod directly (`ssh` + reading `saved_models/*_status.json`
+and `nvidia-smi` mid-run, not waiting for pull-back) rather than
+waiting for the run to finish:
+
+- **`h11_wd_dropout_variant` (r36, step 700/6000): `improvement_pct
+  = +46.08%` (`rollout_mse=0.001744`), promoted.** This is the best
+  rollout-vs-persistence result logged ANYWHERE in this project's
+  history to date -- beats `u3_frame_rollout_dominant` (+41.3%),
+  `q1_sophia_ema` (+40.8%), `p1_bestyet_adamw` (+40.5%), and its own
+  warm-start source `r2_h11_ridge_distill` (+37.3%). Only `WEIGHT_DECAY`/
+  `DROPOUT` raised 0.01->0.03 on top of the best known checkpoint. Only
+  12% through its step budget -- could still peak-and-decline like
+  prior arms (the exact pattern `EARLY_STOP_PATIENCE_STEPS` exists
+  for), not yet a final result.
+- **`a3b_wsd_screen`/`a3b_cosine_restarts_screen`/`a3b_arseqs_bump_screen`
+  (r31/r32/r35) are STILL catastrophic** (-246351%/-131296%/-414664%
+  at step 500) -- but checked their logs directly and confirmed the
+  §68.3 warm-start fix DID work this time (`transferred 4.79M
+  (100.00%) across 83 tensors` from the correct, good
+  `r2_h11_ridge_distill_rollout_best.pt`, matching `r36`'s own
+  source). So this is a NEW, separate finding, not the old bug
+  recurring: the common factor across these three (and absent from
+  `r36`) is each either fully RESTARTS the LR schedule (`wsd`/
+  `cosine_restarts` re-run a full warmup ramp back up to peak LR from a
+  fresh optimizer) or raises BOTH `AR_SEQS` and `LEARNING_RATE`
+  together -- a full LR-warmup restart on top of an already-converged
+  checkpoint is a well-known way to catastrophically disrupt it. Real,
+  informative negative result about how to screen these specific axes
+  (a much lower peak LR / no full re-warmup when starting from a good
+  checkpoint), not evidence WSD/cosine-restarts/AR_SEQS bump are
+  themselves bad ideas.
+- **MoE screens (r23/r24) are running 8-14x slower per step than the
+  dense arms** and hadn't reached their first eval yet at check time
+  (step 225/100, `last_eval: {}`) -- ~2.7s/step (`r23`, 4 experts) and
+  ~3.4s/step (`r24`, 8 experts) vs. ~0.24-0.46s/step for every dense
+  `a3b`/`h11` entry in the same batch. Traced to `model_variants.py`'s
+  `MoEFeedForward`, whose own docstring already flags it as "NOT
+  optimized for scale (no token-capacity limit/dropping, a plain
+  per-(slot, expert) Python loop)" -- `top_k x n_experts` boolean-mask/
+  scatter iterations per forward, small-matmul-plus-kernel-launch
+  overhead dominating at this model's size (4.79M params, 32-64 token
+  micro-batches). Not a bug, a known and now EMPIRICALLY CONFIRMED
+  tradeoff. **Backlog, conditional**: don't invest in a real
+  batched/capacity-limited MoE kernel until the current cold-start
+  screens actually finish and show a quality signal worth keeping --
+  optimizing throughput for an approach that turns out not to help
+  would be wasted effort. In the meantime, future MoE queue entries
+  should get a larger `--max-steps`/`--max-hours` budget than dense
+  entries to reach a usable number of evals at all, given the
+  confirmed ~8-14x per-step cost.
+- GPU health checked directly (`nvidia-smi`): 99% utilization,
+  83GB/144GB used on the H200 -- comfortable headroom, no OOM risk
+  from the 3-way concurrent slots at this point in the run.
+
+### 68.5 That run's FINAL numbers (all 6 entries completed) -- confirmed from the pulled-back logs, not just status.json snapshots
+
+- **`r36` (h11_wd_dropout_variant) early-stopped at step 750/6000**
+  (default `patience=500` since the last promoted checkpoint, at step
+  250 -- this run predates §68.6's `--optuna-patience=750` default
+  below). Read the actual per-eval log lines
+  (not just the final `status.json`): `rollout_mse` degraded MONOTONICALLY
+  every single eval -- `0.001744` (step 250, the +46.08% peak) ->
+  `0.001856` (step 500, +42.61%) -> `0.002339` (step 750, +27.67%) --
+  while `val_tf` loss stayed flat/improving the whole time (`0.0323` ->
+  `0.0212` -> `0.0221`). This is as clean a textbook exposure-bias
+  signature as this project has logged: the one-step objective the
+  model is actually trained on is fine and not overfitting; the
+  free-running rollout it's SCORED on degrades anyway, monotonically,
+  every eval. Directly motivates §68.6's search space (regularization +
+  EMA + AR-loss-weight dampening, not more capacity).
+- **MoE screens (`r23`/`r24`) don't just start bad, they get WORSE
+  during training, at least within a cheap-screen budget.** `r23`
+  (4 experts): `rollout_mse` 2.036 (step 250) -> 2.567 (step 500) --
+  degrading, not improving. This matches the ORIGINAL dense cold-start
+  precedent too (`r2_a3b_delta_ar` historically showed -926314% at step
+  500) -- so this isn't uniquely a MoE defect, it's "any cold start
+  looks catastrophic under this eval before real convergence,"
+  compounded by MoE's confirmed ~8-14x slower per-step cost eating into
+  how many of those early, rough steps a cheap screen can even afford.
+  Doesn't change §68.4's conditional-backlog verdict on MoE
+  optimization, but sharpens it: the honest comparison for any future
+  MoE screen is against a dense cold start's OWN early trajectory, not
+  against a warm-started arm's numbers.
+- Persistent-volume log accumulation (§68.3's trap) hit again in these
+  same log files (multiple `[DEVICE DETECTED]` banners per file, one
+  per historical attempt at that round number) -- reconfirming: always
+  read from the LAST banner forward, or better, from the pulled-back
+  `status.json` (one file, always current) rather than the raw
+  accumulated log when just checking "what happened."
+
+### 68.6 `singleshot/optuna_suggest.py` -- a real (if modest) automated search, replacing hand-picked permutations
+
+Direct response to "isn't this what the GPU is for": yes, and the gap
+wasn't hardware, it was that every queue entry through §68.5 was a
+human (this session) hand-picking one hypothesis and writing it into
+JSON -- a real automated search needs a defined space, a sampling/
+suggestion algorithm, and a controller that proposes the next trial
+from prior results without a human doing it each time. Built exactly
+that, layered onto the EXISTING bake-off infrastructure rather than a
+parallel system:
+
+- **`singleshot/optuna_suggest.py`** -- standalone `ask`/`tell`/`summary`
+  CLI, zero SSH/pod awareness, Optuna's own SQLite storage
+  (`sqlite:///PATH`, no server) so independent short-lived process
+  invocations (one per slot-fill event) share state. `ask` calls
+  `study.ask()` and suggests four ROLLOUT-STABILITY axes built directly
+  on `r36`'s result and its §68.5 decline shape (deliberately excludes
+  MoE/capacity -- a different axis, can't warm-start from this
+  checkpoint anyway, and already has its own screens):
+  `WEIGHT_DECAY` (log-uniform 0.01-0.10, `r36` used 0.03),
+  `DROPOUT` (uniform 0.01-0.10, `r36` used 0.03),
+  `EMA_DECAY` (categorical `[0.0, 0.9, 0.95, 0.98, 0.995]` -- `0.98` was
+  `q1_sophia_ema`'s value at +40.8%, never combined with `r36`'s
+  regularization bump before), and
+  `AR_LOSS_WEIGHT` (uniform 0.3-1.0, default 1.0 -- dampening the AR
+  curriculum's push directly targets the exposure-bias mechanism
+  itself, not just regularizing around it). Every trial warm-starts
+  from the same fixed, proven `r2_h11_ridge_distill_rollout_best.pt`
+  under the same fixed `h11_ridge_distill` arm -- only these four
+  values vary. `tell` reads `best.improvement_pct` back out of the
+  pulled-back `status.json` (clamping the `+-Infinity` "never promoted"
+  sentinel to a large finite penalty -- Optuna's storage can't hold
+  actual `inf`/`NaN`) and reports it via `study.tell()`; a crashed/
+  missing-checkpoint trial reports `TrialState.FAIL` instead of a
+  fabricated number, so Optuna's own bookkeeping tells "bad result"
+  and "this config crashed" apart.
+- **Real bug caught during local smoke-testing, before ever touching a
+  pod**: the first version pinned `TPESampler(seed=1337)` for
+  reproducibility -- since `ask` and `tell` are SEPARATE processes
+  (each `ask` call is a fresh Python interpreter), a fixed seed
+  re-initializes the identical RNG state every single call, so TPE's
+  random-sampling fallback (used for its first `n_startup_trials`)
+  returned the EXACT SAME suggestion three times in a row in testing.
+  Fixed by dropping the fixed seed entirely -- confirmed five
+  back-to-back `ask` calls afterward all produced distinct, diverse
+  suggestions.
+- **`bakeoff_run.sh --optuna`** -- minimal surgery on the existing
+  script, not a parallel implementation: `launch_slot()`,
+  `classify_outcome()`, pull-back, the report file, the color-tagged
+  wandb-URL surfacing, and the GLOBAL TIMEOUT WRAPPER are all reused
+  completely unchanged. Only the "where does the next queue entry come
+  from" question changes -- a new `fill_next_slot()` helper either
+  pops from the static `bakeoff_queue.json` arrays (unchanged default
+  behavior) or calls `optuna_suggest.py ask`/`tell` to grow the same
+  `Q_*` arrays live, one trial at a time, as slots free up. New flags:
+  `--optuna`, `--optuna-study=PATH` (default
+  `singleshot/optuna_study.db`, shared across runs to keep building on
+  prior trials), `--optuna-round-offset=40`, `--optuna-max-trials`
+  (default 0 = unbounded, the global timeout is the real cap),
+  `--optuna-max-steps=2000 --optuna-max-hours=0.35 --optuna-patience=750`
+  (3 eval windows at `--val-every 250` -- `r36` got cut at exactly 2
+  windows past its promotion; one extra window of slack separates
+  "truly plateaued" from "about to recover" without burning much
+  budget on losers). `--dry-run --optuna` previews `--slots` trials
+  against a THROWAWAY scratch study file, never the real
+  `--optuna-study` path -- `ask` creates a real `RUNNING` trial the
+  instant it's called, so previewing against the real file without
+  ever `tell`-ing it back would permanently strand trial numbers as
+  abandoned rows in the study meant for the real run. Confirmed via a
+  full local dry-run: five distinct real suggestions generated, passed
+  through the exact same `(arm,round)`-uniqueness/no-repeated-`--set`
+  validation the static queue uses, zero `runpodctl`/`ssh` calls, and
+  the real study file was confirmed NOT created by the preview.
+- Sizing: at ~0.28-0.4s/step (measured this session) and a 0.35h/trial
+  cap across 3 concurrent slots inside a 2h total budget, expect
+  roughly 15-20 trials -- enough for TPE to move past pure random
+  exploration (`n_startup_trials` defaults to 10) partway through the
+  run, but not a large-N study. Honest framing: a real, if modest,
+  first automated search -- not a claim of statistical power a run
+  this size doesn't have.
+- **Not yet run for real** -- smoke-tested end to end locally (`ask`/
+  `tell`/`summary` standalone, plus the full `bakeoff_run.sh --dry-run
+  --optuna` path); the actual 2-hour H200 run is the user's to launch.
+
+### 68.7 The real 2h Optuna run: a genuinely new best (+49.63%), then the 50GB volume filled up and killed the rest of the budget
+
+Ran for real. First 15 trials completed normally -- trial 0
+(`weight_decay=0.0327 dropout=0.0262 ema_decay=0.95 ar_loss_weight=0.546`)
+hit **+49.63%**, a new best beating `r36`'s +46.08%, and several others
+(trials 1, 4, 9) landed in the high 46-49% band too -- real, if early,
+confirmation the search space is sane and the TPE sampler is finding
+good regions. Then **every trial from #16 through #101 (86 in a row)
+failed identically**:
+
+```
+OSError: [Errno 122] Disk quota exceeded
+  File ".../train_production_transformer_deep_dive.py", line 439, in acquire_run_lock
+    with open(tmp, "w") as f:
+```
+
+Root cause, confirmed via `runpodctl network-volume get`: `NETWORK_VOLUME_ID
+=yl7f9e8rwr` is **50GB**, and nothing has ever been deleted from it across
+this entire multi-day session -- every arm from `r2_*` through `r36_*`
+(dozens of arms, each `_latest`/`_best`/`_rollout_best`/`_train_best` plus
+scripted twins plus a 5-deep `_archive/` directory) plus ~15 real Optuna
+trials' own checkpoint sets finally exceeded it. The failure wasn't in
+training at all -- it died trying to write a few-byte run-lock file,
+before even loading data. A compounding, separately real cost: the
+ORIGINAL pull-back code still ran its full 3-attempt/15s-sleep
+`rsync_with_retry()` against a checkpoint that could never exist for
+every one of those 86 failures, burning real wall-clock on retries with
+no chance of success.
+
+**Three fixes, all in `bakeoff_run.sh`, all in the shared poll-loop code
+path (so both static-queue and `--optuna` modes get them for free):**
+
+1. **Purge each trial's checkpoint set from the pod immediately after a
+   successful local pull-back.** We already have the copy; there's no
+   reason for the persistent volume to keep accumulating it run after
+   run. This is the direct fix for the root cause, not just a mitigation.
+2. **Skip the pull-back retry dance when the process crashed and left
+   nothing behind.** A cheap one-shot remote `compgen -G` existence
+   check (via `bash -c`, since `compgen` is a bash builtin, not a
+   generic-shell one) runs first when `local_rc != 0`; only falls
+   through to the full retry-backed `rsync_with_retry()` if something
+   might actually be there.
+3. **Circuit breaker**: `MAX_CONSECUTIVE_FAILURES` (env, default 5) --
+   after that many consecutive trial failures with no checkpoint
+   pulled back, stop launching new trials/queue entries, let
+   already-running slots finish naturally, then proceed straight to
+   final pull-back/teardown instead of relying on the GLOBAL TIMEOUT
+   WRAPPER's SIGTERM ~86 failures later to be the only thing that ever
+   ends it. A run of consecutive failures is a systemic-problem signal
+   (disk full, missing data, a bad shared flag), not "this
+   hyperparameter combo is bad," and should stop the whole run rather
+   than keep spending budget re-confirming the same failure.
+
+**Deliberately NOT done automatically**: bulk-deleting the historical
+backlog (`r2_*` through `r36_*`) that was the actual majority of the
+50GB. Several of those are real reference results this project has
+pointed back to repeatedly (`r2_h11_ridge_distill_rollout_best.pt`
+specifically is the ACTIVE warm-start source for every current and
+future Optuna trial -- deleting it would break the whole search), and
+deleting is irreversible. That cleanup is a one-time, human-reviewed
+action, not something to fold into an automated script.
+
+## 69. v9.1 -- `WANDB_PROJECT` renamed "NI_Review_v8" -> "Persistence_Linear_v1"
+
+A deliberate rebrand, not a version bump -- every prior run stays exactly
+where it is under "NI_Review_*" in wandb; only NEW runs land under the
+new name going forward. This RETIRES the OVERVIEW.md-v4.1 convention
+(`WANDB_PROJECT`'s trailing `_vN` tracks THIS document's latest major
+version) -- "_v1" is the new project name's own independent version 1,
+unrelated to this document being at v9. `tests/test_version_sync.py`'s
+equality check (`WANDB_PROJECT`'s version must match OVERVIEW.md's) was
+removed for exactly this reason -- it would otherwise permanently and
+correctly-uselessly fail forever now that the two are deliberately
+decoupled. The "has SOME trailing `_vN` suffix at all" check stays --
+that part of the convention is still real and enforced.
+
+## 70. v9.2 -- `CHECKPOINT_EVERY_STEPS=25` was firing every ~19s on H100/H200, 30x more often than the 10-minute floor it was supposed to defer to
+
+Caught by direct observation on a live pod, not by review: checked
+`saved_models/r160_h11_ridge_distill_archive/`'s own file timestamps --
+`step_0000875.pt` -> `step_0000975.pt` (100 steps, 4 checkpoints) spanned
+14:43:43 -> 14:44:58, ~19s per 25-step checkpoint interval. §67.1's
+`CHECKPOINT_EVERY_SECONDS=600` addition was meant to be a 10-minute
+floor "regardless of hardware," but the pre-existing
+`CHECKPOINT_EVERY_STEPS=25` (tuned for B300/H200-era throughput, per its
+own original comment: "~20-30s apart") was ALWAYS going to fire first on
+any reasonably fast GPU -- the 600s trigger never got a real chance to
+govern anything.
+
+Raising `CHECKPOINT_EVERY_STEPS` alone would have broken something else,
+though: `touch_run_lock()`'s stale-lock detector has a 300s staleness
+threshold, deliberately calibrated (§v6.1/v7.11 lineage) against a
+heartbeat every ~20-30s -- a 10-15x safety margin. `touch_run_lock()` was
+called from the SAME conditional block as the checkpoint write, so
+simply making checkpoint writes rarer would have ALSO slowed the lock
+heartbeat to match -- up to 600s between touches, LONGER than the 300s
+staleness window, which would falsely mark a perfectly healthy run as
+dead and let another process steal its lock mid-run.
+
+**Fix**: decoupled the two. `CHECKPOINT_EVERY_STEPS` raised to `5000`
+(at the fastest measured rate this session, ~0.19s/step dense H100/H200,
+that's ~950s -- still comfortably above 600s, so `CHECKPOINT_EVERY_
+SECONDS` is now the real, sole governor there; at MoE's measured
+~3.4s/step, 5000 steps is ~4.7 hours, so the 600s time-based trigger
+governs there too -- `CHECKPOINT_EVERY_STEPS` is now a backstop, not the
+dominant trigger, on every hardware speed actually measured this
+session). A new `RUN_LOCK_TOUCH_EVERY_STEPS = 25` keeps the lock
+heartbeat on its original fast, fixed cadence via a cheap `elif` branch
+(touch the lock with no checkpoint write) alongside the main save block
+-- the 300s staleness math is unchanged and still correct.
+
+**Not yet running anywhere**: like the wandb rename in §69, this only
+affects the NEXT time `scp_env_files.sh` uploads a fresh copy of the
+trainer to a pod -- any trial already running with the old code in
+memory keeps its old (~19s) cadence until it finishes.
+
+## 71. v9.3 -- wandb's local artifact cache filled the CONTAINER's root disk to 100%, mid-run, on a COMPLETELY DIFFERENT filesystem than the one this session had been watching
+
+Checked the live pod directly after being asked to fix an "over
+utilized" disk warning -- `/workspace` (the persistent
+`NETWORK_VOLUME_ID`, 50GB quota, everything §68/§70 had been
+monitoring) was fine at ~23GB. The real problem was `df -h /`: the
+CONTAINER's own ephemeral root disk (`overlay`, `CONTAINER_DISK_GB=60`)
+at **100% used, 20KB free**, with three trials still fully alive and
+consuming GPU the entire time -- a disk that was never even part of the
+mental model this whole cleanup effort had been built around.
+
+Root cause: `/root/.cache/wandb/artifacts/obj` alone was 60GB.
+`save_checkpoint()`'s `log_artifact()` call queues a wandb artifact
+upload on EVERY checkpoint save -- not just `_best`/`_rollout_best`
+promotions, the routine `_latest.pt` write too -- and wandb caches a
+local copy of every uploaded artifact indefinitely by default, on the
+container's root disk, not `/workspace`. At the OLD (pre-§70)
+`CHECKPOINT_EVERY_STEPS=25` cadence (~19s/write on H100/H200), that's
+enough local-cache growth to fill a 60GB disk within a few hours of a
+3-slot run.
+
+**Immediate fix**: cleared the cache live (`wandb artifact cache
+cleanup 0GB` -- which itself failed, unable to even create a tmpdir on
+a disk with zero bytes free; fell back to `rm -rf
+/root/.cache/wandb/artifacts/obj/*`). Freed the disk from 20KB to 60GB
+free in one command, zero disruption to the three running trials
+(confirmed: same GPU utilization, same round numbers, still training
+immediately after).
+
+**Standing fix**: `bakeoff_run.sh`'s poll loop now runs this same
+cleanup (`wandb artifact cache cleanup 0GB`, `rm -rf` fallback) every
+`WANDB_CACHE_CLEANUP_INTERVAL_SECS` (default 900s = 15 min), on its own
+clock independent of slot/trial completion events -- the cache grows
+continuously while ANY trial is actively checkpointing, not just when
+one finishes.
+
+**How much §70 alone would have already helped**: `CHECKPOINT_EVERY_
+STEPS` raised 25->5000 cuts the DOMINANT contributor (the `_latest.pt`
+path) by ~30x once a fresh pod picks up that code -- the same growth
+that filled 60GB in a few hours would now take on the order of days.
+Not zero, though: promotion-triggered uploads still accumulate
+independently of that fix over a long enough run, so the periodic
+cleanup above is real insurance, not redundant with §70.
+
+**Neither fix reached the run that hit this**: the live run that
+triggered this whole investigation was already 1h38m into its 2h
+budget, running old code in memory, when this was diagnosed -- it
+finished (or will finish) on the manually-cleared headroom alone,
+never picking up either the §70 checkpoint-cadence fix or this
+section's periodic-cleanup addition. Both apply starting with the next
+fresh pod.
+
+## 72. v10.0 -- "Scotty": a real study result (trial 112, +51.43%) confirmed the run completed cleanly, one real interrupt-handling bug found, and a two-track plan to both deepen and keep searching at once
+
+The full 2-hour `--optuna` run (§71's run) completed and every one of its
+22 finished trials pulled back correctly -- confirmed by direct file
+listing, not just trusting the console. The overall study record is now
+**trial 112: +51.43%** (`weight_decay=0.0966, dropout=0.0735,
+ema_decay=0.98, ar_loss_weight=0.683`), beating trial 0's earlier
++49.63%.
+
+### 72.1 Real bug found: the GLOBAL TIMEOUT WRAPPER's own SIGTERM path lost in-flight work
+
+Checked the Optuna study state directly after the run ended: trials 128,
+129, 130 (the 3 slots' in-flight work at the exact moment
+`--total-budget-hours` elapsed) were stuck in `RUNNING` forever --
+`handle_interrupt()` killed their local ssh clients (correctly stopping
+the remote training) but never attempted a pull-back first, and never
+told Optuna a result either. Real, permanent loss of partial progress,
+and permanently-orphaned study rows.
+
+**Fixed**: `handle_interrupt()` now does, for every live slot, BEFORE
+killing it: one best-effort (no-retry -- this is an emergency path, not
+the normal one) `rsync` pull-back of whatever checkpoint state exists
+at that exact instant, then (in `--optuna` mode) reports it back to the
+study via `tell` (a real result if the pull-back landed, `--failed`
+otherwise) so the trial is never left dangling. Caught and fixed a
+second bug WHILE writing this fix, before it ever ran for real: the
+first draft indexed `Q_TRIAL` by the SLOT number instead of the QUEUE
+index that slot happened to be running (`Q_TRIAL[SLOT_QIDX[slot]]`, not
+`Q_TRIAL[slot]`) -- those only coincide by accident for the first few
+trials in a run. The 3 orphaned trials from this run were manually
+marked `--failed` to close out the bookkeeping.
+
+### 72.2 The plan: two tracks, one pod, wandb group "Scotty"
+
+Rather than just re-running the same screen, or just deepening the one
+best result, do both at once on the same pod:
+
+- **Track A -- deepen**: `h11_ridge_distill` warm-started from
+  `r2_h11_ridge_distill_rollout_best.pt`, PINNED to trial 112's exact
+  hyperparameters (`singleshot/bakeoff_queue_trial112.json`, round 200),
+  `--max-hours=2.0` and `--early-stop-patience-steps=1000000` (i.e.
+  effectively disabled) so it uses the FULL 2-hour budget rather than
+  getting cut off early by the same patience mechanism that stopped the
+  original 2000-step screen -- the open question is whether +51.43%
+  keeps climbing with a real budget instead of a cheap-screen one.
+- **Track B -- keep searching**: `--optuna` mode, reusing the SAME
+  `optuna_study.db` (131 trials of history already, well past TPE's
+  `n_startup_trials=10` default -- suggestions should be genuinely
+  informed now, not mostly-random exploration), but only **2** slots
+  this time, not 3 -- Track A's pinned run occupies the 3rd concurrent
+  slot on the same GPU.
+- Both tracks tagged `WANDB_GROUP=Scotty` (`--wandb-group=Scotty` on
+  both invocations) so every run this session lands in one filterable
+  wandb group.
+- Both bake-off processes run against the SAME pod (`POD_ID` passed to
+  the second once the first creates it) with `KEEP_POD=1` on both, so
+  neither process's own completion tears the pod down out from under
+  the other -- final teardown is a manual step once both finish.
+
+## 73. v10.1 -- the Scotty run's real outcome, a severe data-loading contention bug found and fixed, and Optuna requeue tooling
+
+### 73.1 Final verdict: trial 112's recipe has a real ceiling, not a screen-budget artifact
+
+Track A (round 200, pinned to trial 112's exact hyperparameters,
+`--max-hours=2.0`, early-stop effectively disabled) ran to its full
+2-hour wall-clock limit at step 12,464/100,000. Peak stayed at
+**+48.31%** (set early) and DECLINED from there -- 48% (early) -> 38%
+(step 1,750) -> 24% (step 6,250) -- never recovering. Giving this exact
+recipe 6x more steps than its original 2,000-step screen did NOT reveal
+a stronger regime; it kept sliding. Real, if disappointing, signal that
+this recipe's ~48-51% band is a genuine ceiling, not a screen-length
+artifact -- directly motivating §74 below (question the LOSS/METRIC
+itself, not just the hyperparameters around it).
+
+Track B (Optuna) ran 153 trials this session (58 completed) before the
+same 2h timeout, reaching round 192. **Overall study record stayed at
+trial 112, +51.43%** -- nothing in this run's fresh exploration beat
+it, though trials 136 (+50.12%) and 146 (+49.99%) came close. Notable:
+4 of the top 5 trials cluster around `ema_decay=0.95-0.98` and
+`weight_decay=0.03-0.10` -- a real TPE-discovered region, not scatter.
+
+### 73.2 Severe data-loading contention found: 0.01 GB/s reading the SAME file from 3 concurrent processes, fixed with an in-RAM promotion
+
+Two Optuna trials (131/132, rounds 171/172) died at **step 1/2000**
+after burning their entire 21-minute budget -- confirmed via their
+actual logs, not guessed: `train_80.h5 read done in 724.0s (0.01 GB/s
+across 8 threads)`, vs. 0.15-2+ GB/s measured solo elsewhere this
+session. All three concurrently-launched processes (including Track
+A's own pinned run) measured the identical 0.01 GB/s reading the SAME
+file from `/workspace` (`mfs#us-ga-2.runpod.net`) at the same time --
+a 15-200x collapse, far worse than simple 3-way bandwidth-splitting
+would predict. Root cause is most likely that MooseFS (a shared,
+multi-tenant network filesystem at 82% cluster-wide utilization, not a
+dedicated local disk) serializes concurrent opens of the same file far
+worse than raw bandwidth division alone would explain.
+
+**Fix**: `bakeoff_run.sh` now promotes `train_80.h5`/`val_80.h5` into
+`/dev/shm` (tmpfs -- real RAM) once per pod, via a new
+`promote_data_to_shm()` step. `Config.TRAIN_H5`/`VAL_H5` are PINNED
+absolute paths (no `--set` override possible), so the only way to
+redirect reads is a symlink at the exact pinned path.
+`mount --bind` (which would have needed zero other changes -- a
+bind-mounted path transparently reports the real file's size to `stat`)
+was tried FIRST and confirmed NOT permitted in this container
+(`mount: permission denied`, no `CAP_SYS_ADMIN`). Symlinks need no
+special privileges but require one real precaution: `/dev/shm` is
+per-pod ephemeral while `/workspace` (where the symlink itself lives)
+is the PERSISTENT volume, so a symlink from one pod would dangle on the
+very next one. Solved with a `.on_volume` backup of the real file kept
+ON the persistent volume -- first time ever on a given volume, back up
+the real file and symlink; every time after (including a dangling
+symlink from a previous pod), just refill `/dev/shm` from that backup.
+Also required fixing the existing `NETWORK_VOLUME_ID` data-presence
+check to `stat -L` (dereference) instead of a plain `stat`, since a
+plain `stat` on a symlink reports the link's own tiny size, not its
+target's -- would have permanently broken that check on every run after
+the first one. **Verified live under real 2-3-way concurrent load
+post-fix**: two freshly-launched trials measured 3.3s and 8.3s loading
+the same file that previously took 724-774s under contention, no
+repeat of the step-1 failure for the rest of the run.
+
+### 73.3 Optuna `requeue` -- a completed trial's bad result doesn't get retried on its own
+
+The two contention-killed trials (131/132) exited cleanly (exit code 0,
+hit their own wall-clock cap) with a REAL status.json showing
+`improvement_pct=-inf` (clamped to -1,000,000) -- so `bakeoff_run.sh`
+correctly reported them as genuine (if catastrophic) results, not
+crashes. Optuna has no "this completed trial's result doesn't count"
+mechanism: once `COMPLETE`, a trial is permanent history that only ever
+informs FUTURE suggestions, never gets automatically re-attempted --
+confirmed directly in the study (`value: -1000000.0` for both,
+permanently). Added `optuna_suggest.py requeue --trial N`, using
+Optuna's real `study.enqueue_trial()` API to force that trial's exact
+params to be served again on the very next `ask()`, ahead of the
+sampler. Smoke-tested on a throwaway study first, then applied for
+real to trials 131/132 and verified (against a disposable copy of the
+real study, so the verification itself didn't consume the queued slot)
+that the next `ask()` genuinely returns those exact params.
+
+### 73.4 Standing instruction going forward
+
+The user does not want this agent launching real (billed) pod runs
+unless explicitly authorized for that specific run. From this point on:
+code, tests, and queue files are written and verified locally (syntax
+checks, dry-runs, unit tests, smoke tests against disposable data) --
+the user runs and monitors the actual pod themselves.
+
+## 74. v10.2 -- is scoring the loss on ONE point of a 125-point cube too narrow? `CENTROID_LOSS_POINTS` built
+
+Directly motivated by §73.1: trial 112's recipe (and everything derived
+from it) has hit a real ceiling around +48-51% that more regularization
+tuning and more training time both failed to move. The user's
+hypothesis: the training loss (`centroid_velocity_loss()`) has only
+ever scored the model on ONE of the AE decoder's 125 reconstructed
+spatial points -- the exact center (`CENTROID_TRIPLET_IDX=62`) -- and
+that may be too narrow a supervision signal, independent of anything
+else already tried.
+
+### 74.1 Confirmed the cube's index layout directly, not by assumption
+
+`decode_centroid()`'s docstring already asserted index 62 is "the
+middle of 125," but `125 // 2 == 62` is true of ANY flat ordering, so
+that alone doesn't prove which physical offset each of the other 124
+indices corresponds to. Found and read the actual generator,
+`og_data_prep/Ordered_005_AllPossibleCombos.py`: `offsets = [-2, -1, 0,
+1, 2]`, nested `for dx in offsets: for dy in offsets: for dz in
+offsets:` -- i.e. index `(dx+2)*25 + (dy+2)*5 + (dz+2)`. Confirms
+`(0,0,0) -> 62` independently of the docstring's own claim, and gives
+the exact indices of the 6 face-adjacent neighbors: `{37, 57, 61, 63,
+67, 87}` (NOT the 26-neighbor Moore neighborhood -- axis-aligned
+face-adjacency only, matching what "6 positions around the centroid"
+means).
+
+### 74.2 Two new training-loss modes, `decode_centroid()` (eval) left completely untouched
+
+New `Config.CENTROID_LOSS_POINTS` (default `'center'`, bit-identical to
+every existing result -- verified by a direct test comparing against
+the pre-existing single-centroid computation):
+- `'center_plus_6'` -- mean over the centroid + its 6 face-adjacent
+  neighbors (7 points, uniformly weighted).
+- `'all125'` -- mean over the full cube, centroid up-weighted by
+  `Config.CENTROID_LOSS_CENTER_WEIGHT` (default 10.0) relative to the
+  other 124 (each at weight 1.0).
+
+Implementation: factored `decode_centroid()`'s single frozen-decoder
+call into `_decode_raw()` (returns the full unsliced 375-dim vector),
+so the new modes pull additional triplets from the SAME decode call
+rather than re-invoking the decoder per point; `decode_centroid()`
+itself is unchanged (still just `_decode_raw()[..., CENTROID_SLICE]`).
+This is the load-bearing design choice: EVERY eval/rollout/
+persistence-baseline call site in this file goes through
+`decode_centroid()`, never `centroid_velocity_loss()` -- so
+`improvement_pct`/`rollout_mse` mean the EXACT same thing regardless of
+which loss mode a given arm trains with, keeping every historical
+result (r36, trial 112, everything in §73.1's table) directly
+comparable to whatever these new modes produce. Changing what the model
+is TRAINED on must never change what the numbers we've been comparing
+all session MEAN.
+
+New `tests/test_centroid_loss_points.py` (12 tests, all passing):
+index-mapping correctness against an independently-reimplemented
+reference formula (not just re-importing the same possibly-wrong
+constant), diagonal neighbors confirmed excluded, all three modes
+produce finite scalars with real gradient flow, `center_plus_6`/`all125`
+are exactly zero for identical inputs, `all125` at `CENTER_WEIGHT=1.0`
+matches a plain 125-point mean, `all125` at `CENTER_WEIGHT=1e6`
+converges to the center-only loss value (verified: 2.03048 vs 2.03047),
+an unknown mode string raises `ValueError`, and `decode_centroid()`'s
+own output is verified bit-identical across all three modes. Full
+existing suite re-run clean: 232 passed, 14 skipped, zero regressions.
+
+### 74.3 Queue prepared, not launched (per §73.4)
+
+`singleshot/bakeoff_queue_centroid_points.json` -- two entries, both
+warm-started from `r2_h11_ridge_distill_rollout_best.pt` with trial
+112's EXACT other hyperparameters (`WEIGHT_DECAY=0.0966
+DROPOUT=0.0735 EMA_DECAY=0.98 AR_LOSS_WEIGHT=0.683`), changing ONLY
+`CENTROID_LOSS_POINTS` -- an isolated, apples-to-apples test of this one
+variable, sized as a cheap screen (2000 steps / 0.35h / 750-step
+patience, matching this session's established screen convention).
+Validated via `--dry-run` only -- not run.
+
+```bash
+bash singleshot/bakeoff_run.sh --dry-run \
+  --queue=singleshot/bakeoff_queue_centroid_points.json --slots=2
+```
+
+### 74.4 Numbering note
+
+Labeled `v10.2` (continuing the same v10 chapter as §72's original
+Scotty plan and §73's outcomes/fixes) rather than a fresh `v11.0` --
+this reads as a direct continuation of the same investigation (Scotty's
+ceiling finding -> question the loss itself), not an unrelated new
+chapter. Flagged for the user to correct if a harder version boundary
+was intended.
+
+## 75. v10.3 -- a 3rd `CENTROID_LOSS_POINTS` mode (`distance_weighted`), the queue resized to 1h/H200, wandb group "McCoy", and a dedicated "focus" dashboard
+
+### 75.1 Third mode: `distance_weighted` -- a smooth falloff, not a hard cutoff
+
+`center_plus_6` is a hard 7-point cutoff (centroid + face-neighbors,
+uniform weight); `all125` is a binary split (centroid at
+`CENTROID_LOSS_CENTER_WEIGHT`, all other 124 points flat at `1.0`
+regardless of how close or far they are from the centroid). Neither
+lets a point's distance from the centroid matter continuously. Added a
+3rd mode: weight per point = `CENTROID_LOSS_CENTER_WEIGHT / (1 + dist)`,
+where `dist` is that point's Euclidean grid distance from the centroid
+(new module-level `CENTROID_DISTANCES` tuple, 125 entries, built
+directly from the same `_cube_idx` offset math already verified in
+§74.1 -- `CENTROID_DISTANCES[62] == 0.0`, asserted at import time).
+
+Confirmed by direct test (`tests/test_centroid_loss_points.py`, now 15
+tests): zero for identical inputs, gradients flow, weight strictly
+decreases with distance (unlike `all125`'s flat non-center weight), and
+`decode_centroid()` remains bit-identical regardless of this mode (same
+isolation guarantee as the other two). One thing this mode does NOT do,
+confirmed by a failed assumption caught before committing: raising
+`CENTROID_LOSS_CENTER_WEIGHT` does NOT make `distance_weighted`
+converge to center-only behavior the way `all125` does at a huge
+weight -- since every non-center point's weight is
+`CENTER_WEIGHT / (1 + dist)`, the RATIO of a neighbor's weight to the
+centroid's weight is `1 / (1 + dist)`, a constant independent of
+`CENTER_WEIGHT`. A 1e6 center weight still leaves face-neighbors
+(`dist=1`) at fully half the centroid's weight. This is an inherent,
+correctly-understood property of the scheme (a smooth falloff, not a
+tunable-to-center-only knob), not a bug -- the original "converges to
+center-only at huge weight" test from `all125` was deliberately NOT
+reused here for that reason.
+
+### 75.2 Queue resized: 2 entries -> 3 entries, cheap-screen sizing -> ~1h/H200
+
+`singleshot/bakeoff_queue_centroid_points.json` rebuilt with 3 entries
+(rounds 310/311/312: `center_plus_6`, `all125` w=10, `distance_weighted`
+w=10), each `max_steps=6000 max_hours=1.0
+early-stop-patience-steps=1500` -- roughly 6x the step budget of the
+original 0.35h cheap screens (§74.3), keeping the same
+steps:patience:val-every ratio. Same trial-112 hyperparameters,
+warm-start checkpoint, and isolation-of-one-variable design as before.
+Re-validated via `--dry-run --slots=3`: all 3 `(arm,round)` pairs
+unique, zero network/ssh calls made.
+
+### 75.3 wandb group "McCoy" and a dedicated "focus" dashboard
+
+Per explicit request, this batch uses `--wandb-group=McCoy` (previous
+batches: "Bones" §68.4, "Scotty" §72.2) -- a top-level
+`bakeoff_run.sh` CLI flag, not something baked into the queue JSON, so
+no queue-file change was needed for this part.
+
+New `singleshot/setup_wandb_focus_view.py` -- a standalone,
+no-SSH/no-pod script using the `wandb_workspaces` package (installed
+this session, v0.4.11) to create a saved wandb Workspace view
+containing exactly one Section named "focus" with exactly one panel: a
+`LinePlot` of `improvement_pct` (confirmed a genuine per-step
+time-series metric, not summary-only, by reading the trainer's own
+`tel.log(wandb_payload, step=step)` call site), filtered to
+`Group == 'McCoy'` via `RunsetSettings(filters=...)`, with
+`auto_generate_panels=False` so nothing else gets auto-added next to
+it. Directly answers "If it is somewhere else in wandb, I don't want to
+find it" -- one section, one panel, nothing auto-generated alongside
+it. Built and verified locally (`Workspace` object constructs correctly
+against the real entity `pvl-data`, panel/filter fields inspected) but
+`.save()` (the network call that actually creates it in wandb) was NOT
+invoked -- per §73.4, left for the user to run.
+
+### 75.4 Commands for the user to run (nothing above was launched)
+
+```bash
+# Dry-run already confirmed clean; drop --dry-run to actually launch.
+# NETWORK_VOLUME_ID=yl7f9e8rwr (this project's persistent volume,
+# §68.7/§72) is REQUIRED -- without it the pod has no /workspace mount,
+# so no warm-start checkpoint and no persisted wandb key (see the v10.5
+# errata note at the end of this section for why this was missing here
+# originally).
+NETWORK_VOLUME_ID=yl7f9e8rwr bash singleshot/bakeoff_run.sh \
+  --queue=singleshot/bakeoff_queue_centroid_points.json --slots=3 \
+  --total-budget-hours=1.0 --wandb-group=McCoy
+
+# One-time (or whenever the view needs recreating) -- builds the wandb
+# Workspace itself, no pod/training involved:
+python singleshot/setup_wandb_focus_view.py \
+  --entity pvl-data --project Persistence_Linear_v1 --group McCoy
+```
+
+## 76. v10.4 -- the McCoy run's result: widening the loss target HURT, not helped -- all 3 `CENTROID_LOSS_POINTS` modes underperformed the single-centroid ceiling
+
+### 76.1 Numbers (H200, wandb group `McCoy`, pod `5oprn256i8lxla`, all 3 slots exit 0 / pull-back OK)
+
+Pulled-back `manual/r310-312_h11_ridge_distill.json`, full eval curves
+(not just the final `best` snapshot):
+
+| Mode | round | Peak improvement_pct | Peak step | Ended at | beat_constant_predictor |
+|---|---|---|---|---|---|
+| `center_plus_6` | 310 | **+43.84%** | 750 | +38.05% @ step 2250 | true |
+| `distance_weighted` w=10 | 312 | +43.48% | 500 | +28.57% @ step 2000 | true |
+| `all125` w=10 | 311 | +41.55% | 1000 | +33.69% @ step 2500 (noisy, dipped to +18-22% mid-run) | **false** |
+
+All 3 early-stopped at their configured 1500-step patience, well
+short of `max_steps=6000` and `max_hours=1.0` (wall time 1330-1614s
+each, ~22-27 min -- the 1h budget was never the binding constraint,
+patience was).
+
+### 76.2 Verdict: broadening the training-loss target made things WORSE, not better
+
+The §74 hypothesis was that scoring training loss on only 1 of 125
+reconstructed points might be too narrow a signal, and that including
+more of the cube (uniformly, or distance-weighted) might produce a
+better-trained model. The result is the opposite: **every widened mode
+peaked BELOW trial 112's established single-centroid ceiling**
+(+48.31% Track A / +51.43% Track B best, §73.1) -- by 5-10 points, not
+a rounding difference. All 3 also reproduce the identical exposure-bias
+decline shape already characterized in §73.1 (early promotion, then
+monotonic-ish decline as free-running rollout drifts from the
+teacher-forced training distribution) -- so this isn't "broader loss
+delays the peak given more steps," it's strictly worse at every step
+budget tried.
+
+Within the 3, there's an internally consistent gradient: `center_plus_6`
+(narrowest widening, uniform 7-point window immediately around the
+centroid) did the LEAST damage; `all125` (widest, most diluted --124
+points at flat weight 1.0 vs. one point that's actually evaluated) did
+the MOST damage, and was the only mode to fail `beat_constant_predictor`
+at all during training, plus the noisiest curve of the three (dips to
++18-22% mid-run). `distance_weighted` fell in between but closer to
+`center_plus_6`, despite having the same "spread across all 125"
+structure as `all125` -- consistent with its per-point weight decaying
+fast enough (`1/(1+dist)`, so a face-neighbor at dist=1 already gets
+half weight, and the cube's outer shell at dist~2.8 gets ~1/4) that its
+*effective* footprint is much closer to `center_plus_6`'s 7-point window
+than to `all125`'s flat 125-point one.
+
+**Practical conclusion: the single-centroid loss (existing default,
+`CENTROID_LOSS_POINTS='center'`) is not the bottleneck.** Widening the
+spatial scoring window, in any of the 3 forms tried, trades away
+accuracy on the one point that's actually evaluated for accuracy on 6
+or 124 points nobody is scoring -- a real, measured cost, not a
+theoretical one. This closes out the §74/§75 investigation: keep the
+default `'center'` mode for any future run; `center_plus_6`,
+`all125`, and `distance_weighted` remain available as `Config` options
+(and are unit-tested, §74.2/§75.1) but are not recommended based on
+this result.
+
+### 76.3 Next hypotheses (not yet built or run -- for discussion)
+
+The loss-target-width axis is now closed (§76.2). Candidate next
+directions, roughly in order of how directly they attack the
+exposure-bias decline shape that has now shown up identically in EVERY
+run this session regardless of loss target (§73.1 Track A, §76.1's all
+3 modes, and the original r36 finding that motivated the whole Optuna
+search):
+
+1. **Scheduled sampling / attack the exposure bias directly, not just
+   regularize around it.** Every run so far either trains fully
+   teacher-forced (bar `AR_LOSS_WEIGHT`'s existing curriculum) or has
+   tried to delay the decline with weight decay/dropout/EMA (Track B's
+   whole search space, §68.6-68.7). None have changed WHAT the model
+   sees during training to look more like free-running rollout. A
+   scheduled-sampling or DAgger-style scheme (occasionally feed the
+   model its own prior prediction instead of ground truth during
+   training, ramping up over steps) targets the actual mismatch
+   between train-time and rollout-time input distributions, rather
+   than hoping regularization slows the drift once it starts.
+2. **Checkpoint at/near the peak and stop -- treat the decline as
+   expected, not a failure to prevent.** Every run's `best.*` already
+   reflects this (the promoted checkpoint is pulled from the peak, not
+   the final step), but the current early-stop patience (750-1500
+   steps) still burns real wall-clock and steps chasing a recovery that
+   has now never once happened across ~10+ runs this session. Consider
+   cutting patience substantially (e.g. 250-500 steps) as a pure
+   efficiency change -- would not change the achievable ceiling, but
+   would let more distinct hyperparameter configs be screened per
+   dollar/hour.
+3. **Revisit `AR_LOSS_WEIGHT` specifically against the confirmed
+   ceiling.** Trial 112 used `AR_LOSS_WEIGHT=0.683` (dampened from
+   h11's default of 1.0); Track B's 153-trial search covered this axis
+   already but never in combination with any of the 3 widened loss
+   targets from this section. Given §76.2's finding that widening the
+   *target* hurts, an open question is whether widening the *AR
+   curriculum* portion specifically (as opposed to the plain
+   teacher-forced portion) behaves differently -- untested combination.
+4. **Rollout-length curriculum.** `--rollout-seqs` has stayed fixed at
+   16 across every run referenced above. If the decline is driven by
+   compounding rollout error, training against progressively longer
+   rollout windows (rather than a fixed short one) is a more direct
+   lever than loss-target width and hasn't been tried at all this
+   session.
+
+Recommend (1) as the most likely to move the actual ceiling rather
+than just find another point on the same ~48-51% plateau, since it's
+the only untried idea that changes what the model is trained to be
+robust to, rather than how hard it's regularized or what target it's
+scored against. (2) is a free efficiency win regardless of which
+hypothesis is tested next and could be adopted immediately.
+
+## 77. v10.5 -- hypotheses #1 (scheduled sampling) + #4 (rollout-horizon curriculum) combined into ONE mechanism, `AR_SCHED_MIX_P`
+
+### 77.1 Correction: hypothesis #4 was already running in every trial-112-derived run so far
+
+Before building anything, checking `h11_ridge_distill`'s own arm
+definition (the arm every run since Scotty has used) found it ALREADY
+sets `AR_MODE='frame_ar', AR_FRAMES=8, AR_FRAMES_START=2` -- i.e. the
+rollout-horizon curriculum from hypothesis #4 has been active in trial
+112 itself and every one of the §76 centroid-loss-points runs. #4 was
+never a new axis to test; it was already baked into the baseline. This
+reframes the real gap as just hypothesis #1 (scheduled sampling) --
+attacking exposure bias by mixing ground truth into the ALREADY-CURRICULUM'D
+rollout, not adding a separate curriculum on top of one that doesn't
+exist yet.
+
+### 77.2 Why `AR_MODE='sched'` (the existing scheduled-sampling code path) can't just be turned on here
+
+The codebase already has an `AR_MODE='sched'` path
+(`sched_sampling_loss()`, `Config.SCHED_SAMPLING_P`) -- but it's a
+single-step, two-forward mix with NO horizon/curriculum concept at all,
+and `AR_MODE` is a single mutually-exclusive setting (`'none' | 'frame_ar'
+| 'sched'`, picked by one `if/else` in the training loop). Switching to
+`'sched'` would mean giving up `frame_ar`'s already-curriculum'd
+multi-frame chain entirely -- the opposite of "combine #1 and #4."
+
+### 77.3 New mechanism: `Config.AR_SCHED_MIX_P`, a scheduled-sampling gate INSIDE `frame_ar_loss()`'s existing chain
+
+Added a new knob that composes with the curriculum instead of replacing
+it. `frame_ar_loss()`'s per-step feedback already had one decision point
+(`_feed_or_aropt()`: feed the model's own prediction, optionally via
+AROpt accept/reject, §32.2 item 7). Added `_feed_final()` in front of it:
+with probability `AR_SCHED_MIX_P` (evaluated fresh per sequence, per
+chain step), force GROUND TRUTH regardless of what `_feed_or_aropt()`
+would have picked; otherwise defer to it unchanged. This is classic
+scheduled sampling (Bengio et al. 2015) applied AT EVERY STEP OF THE
+ALREADY-CURRICULUM'D CHAIN -- as `AR_FRAMES_START` ramps the rollout
+longer over training, the model is simultaneously exposed to a fixed
+fraction of its own errors at each of those (growing number of) steps,
+rather than the curriculum alone changing only the LENGTH of a
+100%-self-fed chain. `AR_SCHED_MIX_P=0.0` (default) is an exact
+passthrough to `_feed_or_aropt()` -- every existing `frame_ar` arm
+(h9/h11/branch-M/P/Q/S, etc.) is unaffected byte-for-byte.
+
+Verified via `tests/test_sched_mix.py` (6 new tests, mirroring
+`test_aropt_accept_reject.py`'s own convention): default reproduces the
+exact pre-v10.5 loss for the same seed; finite/differentiable in both
+frame-native and token-native branches and at `AR_SEQS=1`;
+`AR_SCHED_MIX_P=1.0` demonstrably overrides `AROPT_TEMPERATURE=1e6`
+(proving the gate actually short-circuits AROpt rather than silently
+no-opping); and `AR_SCHED_MIX_P` composes with `AR_FRAMES_START` without
+interfering with `ar_frames_for_step()`'s own curriculum math. Full
+suite re-run clean: 241 passed, 14 skipped, zero regressions (up from
+235 before this section -- the 6 new tests).
+
+### 77.4 The run: trial 112's exact recipe + `AR_SCHED_MIX_P=0.3`, nothing else changed
+
+`singleshot/bakeoff_queue_sched_mix.json` -- ONE entry, round 320,
+`h11_ridge_distill` arm (so `AR_MODE='frame_ar', AR_FRAMES=8,
+AR_FRAMES_START=2` -- hypothesis #4 -- come from the arm default,
+unchanged), same warm-start checkpoint and trial-112 hyperparameters as
+every prior isolation run this session (`WEIGHT_DECAY=0.0966
+DROPOUT=0.0735 EMA_DECAY=0.98 AR_LOSS_WEIGHT=0.683`), `CENTROID_LOSS_POINTS`
+left at its default `'center'` (per §76.2's conclusion -- not
+re-litigating the closed loss-target-width question), plus the one new
+variable: `AR_SCHED_MIX_P=0.3` (30% chance per chain-step of forcing
+ground truth instead of the model's own fed-back prediction, on top of
+the already-active 2-to-8-frame horizon curriculum). Sized
+`max_steps=6000 max_hours=1.0 early-stop-patience-steps=1500`, matching
+§75.2's convention -- `AR_SCHED_MIX_P`'s extra cost is one `rand`+`where`
+per existing chain step, not an additional forward pass, so no
+step-cost premium over any other `h11_ridge_distill` run this session.
+Validated via `--dry-run --slots=1 --wandb-group=NC1701`: entry valid,
+zero network/ssh calls made.
+
+### 77.5 Fully qualified command for the user to run (nothing above was launched, per §73.4)
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_run.sh \
+  --queue=/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_queue_sched_mix.json \
+  --slots=1 --total-budget-hours=1.0 --wandb-group=NC1701
+```
+
+### 77.6 Errata: two real mistakes in how this command was first handed off
+
+1. The first version of this command omitted `NETWORK_VOLUME_ID=yl7f9e8rwr`
+   entirely -- without it, the pod comes up with no `/workspace` mount at
+   all, meaning no warm-start checkpoint AND no persisted wandb key for
+   `--wandb-group` alone to discover (the auto-discovery in
+   `bakeoff_run.sh`, §75/988-994, only checks a file that lives ON that
+   mount). Confirmed as a real, load-bearing omission, not a style
+   preference -- every prior real launch this session
+   (§68.7/§72.2/§75.4) used this exact env var.
+2. The user's very next real launch after that correction used the OLD
+   `bakeoff_queue_centroid_points.json` (rounds 310-312, §76 -- already
+   analyzed) again, not `bakeoff_queue_sched_mix.json` (round 320, this
+   section) -- so as of this writing, no `AR_SCHED_MIX_P` result exists
+   yet. §77.5's command above is the corrected, complete one for that
+   still-pending run.
+
+## 78. v10.6 -- round 320's real result, a live GPU-utilization audit, and why the "worse than the previous-frame anchor" console line is NOT the instability signal
+
+### 78.1 Round 320 result: `AR_SCHED_MIX_P=0.3` peaked closer to trial 112's ceiling than any §76 variant, but the same decline shape persisted
+
+Pulled from `sweep_logs/manual/r320_h11_ridge_distill.json`: peak
+**+46.60%** at step 250, declining to +35.24% by early-stop at step
+1750 (`early-stop: 1500 steps since the last new promoted rollout
+checkpoint (step 250)`). This beats every §76 centroid-loss-points
+variant (all under +44%) and is within ~2-5 points of trial 112's own
+ceiling (+48.31%/+51.43%, §73.1) -- a real, if modest, improvement. But
+the identical exposure-bias decline shape is still there: peak early,
+monotonic-ish decline afterward. One run at one fixed `AR_SCHED_MIX_P`
+value isn't enough to call this "solved," but it's the closest any
+single-variable change has gotten to the ceiling so far.
+
+### 78.2 Live GPU-utilization audit during round 320, requested mid-run
+
+`nvidia-smi dmon` (5 samples, 1Hz) and a point-in-time snapshot while
+round 320 was training:
+
+| Resource | Observed | Cap | Utilization |
+|---|---|---|---|
+| GPU compute (SM) | 0-67%, bursty | 100% | ~40% avg, frequent 0% dips |
+| GPU memory | 24.5 GB | 143.8 GB | 17% |
+| Power draw | 130-190 W | 700 W | 18-27% |
+| SM clock | 1980 MHz | 1980 MHz (max) | pinned at ceiling, `pstate=P0` |
+
+SM clock already at its max with power/memory this low rules out
+thermal/power throttling -- the GPU is starved for work, not held back.
+Root cause identified by reading `resolve_train_regime()`
+(train_production_transformer_deep_dive.py:579): **the CUDA
+micro-batch is a HARDCODED constant** (`64 if "H200" in name else 32`),
+completely independent of `Config.BATCH_SIZE`/`ACCUMULATION_STEPS`
+(those fields are dead on the CUDA path -- confirmed by the comment at
+line 5264, "Config.ACCUMULATION_STEPS are no longer read inside the
+loop"). No `--set` override could have changed this; it required an
+actual code change. Separately, `torch.compile` is OFF by default on
+CUDA for a real, already-documented reason (v7.19): concurrent multi-
+slot launches each spawn their own full-core `torch._inductor`
+compile-worker pool, oversubscribing the host N-way before a single
+step runs -- but that reasoning doesn't apply to a solo (`--slots=1`)
+run like this one, where the steady-state 15-30% speedup has a full
+hour to amortize. An opt-in override (`PFD_COMPILE_MODEL=1`) already
+existed for exactly this case.
+
+### 78.3 Fixes: `PFD_CUDA_MICRO_BATCH` env override (new) + `PFD_COMPILE_MODEL=1` (already existed)
+
+Added `PFD_CUDA_MICRO_BATCH` to `resolve_train_regime()`'s CUDA branch
+-- unset preserves the exact hardcoded 64/32 default byte-for-byte;
+set, it overrides `micro_batch` (and `virtual_batch`/`eval_micro_batch`/
+`aux_micro_batch`, which all track it, since CUDA runs with gradient
+accumulation off). Deliberately an opt-in env var, not a default
+change or a `Config` field read inside the CUDA branch -- a larger
+batch changes gradient-noise characteristics (§78.4) and hasn't been
+validated safe for every existing arm/regime, so this is one knob to
+test in isolation on the next run, matching this session's own
+one-variable-at-a-time convention. `bakeoff_run.sh` gained pass-through
+for both `PFD_CUDA_MICRO_BATCH` and `PFD_COMPILE_MODEL` (read from the
+calling shell's environment, exported into the remote heredoc only
+when set -- same convention as `NETWORK_VOLUME_ID`). New test
+`test_cuda_micro_batch_env_override` (`tests/test_train_regime_cuda.py`)
+confirms the override works and that both CUDA defaults (H200=64,
+generic=32) are unchanged when unset. Full suite re-run clean: 242
+passed, 14 skipped, zero regressions.
+
+### 78.4 The real instability signal was never the "worse than the previous-frame anchor" line -- it's the pre-clip gradient norm
+
+Read `centroid_velocity_loss`'s console flag logic directly
+(train_production_transformer_deep_dive.py:5968-5978): that red
+"worse than the previous-frame anchor" line fires whenever the RAW,
+single-step, noise-perturbed (`NOISE_STD`) teacher-forced training loss
+exceeds a FIXED floor computed once from clean validation data. This
+comparison is inherently noisy and near-meaningless on a step-by-step
+basis -- round 320's own eval curve shows genuine **+42-46% improvement
+over persistence** at the very same steps where nearly every per-step
+console line was flagged red. If this flag were the real signal, a
+healthy, clearly-improving model couldn't produce it on almost every
+line, which is exactly what's observed. This is a diagnostic red
+herring, not a sign of anything wrong.
+
+The REAL instability signal is `gnorm` -- and it's actually informative
+once you know what it measures: `torch.nn.utils.clip_grad_norm_()`
+(train_production_transformer_deep_dive.py:5843) returns the norm
+**BEFORE clipping**, then rescales the gradient down to `Config.GRAD_CLIP`
+(default 1.0) in place. Round 320's log shows `gnorm` values of
+9-25+ on a large fraction of steps -- meaning the RAW gradient is
+routinely 10-25x larger than the clip threshold before being clamped
+down. `GRAD_CLIP` is already doing its job (preventing those spikes
+from blowing up the optimizer step), but frequent large pre-clip norms
+this large are a genuine sign of a noisy per-step training signal, not
+a false alarm like the anchor-comparison line.
+
+### 78.5 Why the SAME fix (larger batch) addresses both the GPU-efficiency question and the gradient-noise question
+
+This isn't a coincidence: gradient noise from mini-batch sampling
+shrinks as batch size grows (the per-step gradient estimate averages
+over more examples), which is exactly the standard mechanism behind
+why larger batches produce calmer, less spiky `gnorm` traces. The same
+`PFD_CUDA_MICRO_BATCH` override that fixes the GPU-utilization finding
+(§78.2 -- 126 GB of unused headroom) is also the most direct, cheapest
+lever on the gradient-noise finding (§78.4) -- one change, two
+symptoms, rather than a separate mechanism for each. `torch.compile`
+(§78.3) contributes on the OTHER axis found in §78.2 (kernel-launch-
+overhead-bound bursts in the sequential `frame_ar` AR loop, which batch
+size can't fix since that loop's cost is chain-length-bound, not
+batch-width-bound) -- fusing those small sequential ops directly
+targets the 0%-utilization dips in the `dmon` trace, not the gradient
+noise.
+
+Not changed this round: `GRAD_CLIP` itself (still 1.0, unchanged) --
+the plan is to see whether a larger batch alone meaningfully calms the
+`gnorm` trace before reaching for a second, more invasive lever (e.g.
+lowering `GRAD_CLIP` further, or adaptive/percentile-based clipping)
+on top of it. One variable at a time, same convention as every other
+change this session.
+
+### 78.6 The run: same isolation-run hyperparameters as round 320, plus the two efficiency fixes, plus a larger early-stop patience
+
+`singleshot/bakeoff_queue_sched_mix_v2.json` -- ONE entry, round 321,
+IDENTICAL hyperparameters to round 320 (`h11_ridge_distill` arm,
+trial-112 recipe, `AR_SCHED_MIX_P=0.3`) so this is a clean before/after
+comparison of the efficiency fixes alone, not a new hypothesis.
+`early-stop-patience-steps` raised `1500 -> 2000` (33% more) -- since a
+calmer gradient trace (if `PFD_CUDA_MICRO_BATCH` delivers on §78.5's
+prediction) plausibly extends how long the model can be trained before
+the exposure-bias decline sets in, and since the throughput gain from
+better GPU utilization gives real wall-clock room to spend more
+patience within the same `max_hours=1.0` cap without a proportional
+runtime cost. `max_steps=6000`/`max_hours=1.0` unchanged. Validated via
+`--dry-run --slots=1 --wandb-group=NC1701` with
+`PFD_CUDA_MICRO_BATCH=128 PFD_COMPILE_MODEL=1` set: entry valid, zero
+network/ssh calls made.
+
+### 78.7 Fully qualified command for the user to run (nothing above was launched, per §73.4)
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr PFD_CUDA_MICRO_BATCH=128 PFD_COMPILE_MODEL=1 \
+  bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_run.sh \
+  --queue=/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_queue_sched_mix_v2.json \
+  --slots=1 --total-budget-hours=1.0 --wandb-group=NC1701
+```
+
+Watch `nvidia-smi dmon -s pucm` during this run to confirm SM
+utilization/memory/power actually rise versus §78.2's baseline numbers
+before drawing any conclusion about whether the batch/compile change
+helped the gradient-noise/decline-shape question too -- those are two
+separate things to verify, not one.
+
+## 79. v10.7 -- round 321 confirmed `torch.compile` actively hurts this workload, and the batch-size lever was aimed at the wrong knob; `AR_SEQS` is the real one
+
+### 79.1 What round 321 actually showed (user manually killed the pod after spotting it live)
+
+Live inspection of `r321_h11_ridge_distill.log` found:
+
+`torch._dynamo hit config.cache_size_limit (8)` at step ~175 --
+`frame_ar_loss()`'s sequential AR loop grows its context by one token
+per iteration (up to `AR_FRAMES*NUM_X` ≈ 80 distinct shapes per call,
+§77's already-active curriculum), and `torch.compile(model,
+dynamic=True)` did not absorb that growth cleanly -- the guard failure
+was a STRIDE mismatch, not just a size change. Dynamo recompiled
+repeatedly, hit its cache limit after 8 distinct shapes, and silently
+fell back to eager for that function from then on. Net effect: real
+compile overhead was paid (a 192-worker `torch._inductor` pool spawned
+just for this one solo slot) for none of the steady-state benefit on
+the part of the step that dominates cost. This is a DIFFERENT,
+previously-undocumented failure mode from the one that made compile
+default OFF in the first place (v7.19's concurrent-multi-slot CPU
+oversubscription) -- it's not about slot count at all, it's that
+`frame_ar`'s growing-context loop is structurally hostile to
+shape-caching JIT, regardless of how many slots are running.
+
+Separately: round 321's memory only rose 24.5 GB -> 27.1 GB despite
+doubling `micro_batch` 64 -> 128 -- far less than doubling would
+predict. Root cause: `h11_ridge_distill` runs the sequential
+`frame_ar` AR loop on EVERY step (`AR_EVERY_N_STEPS=1`), and that
+loop's own parallelism is gated by `Config.AR_SEQS` (arm default: 2),
+which is COMPLETELY INDEPENDENT of `micro_batch`/`PFD_CUDA_MICRO_BATCH`
+-- §78.3's fix only widened the (apparently minor-cost) primary
+teacher-forced pass, never touching the loop that actually dominates
+per-step wall time. Measured throughput bore this out: ~0.38s/step in
+round 321 (batch=128, compile on) vs. ~0.3s/step in round 320
+(batch=64, compile off) -- flat to slightly WORSE, not better.
+
+### 79.2 Corrected fix: compile OFF, raise `AR_SEQS` instead (no new code needed)
+
+`AR_SEQS` is already a plain `--set`-able `Config` field (no code
+change required, unlike §78.3's `micro_batch`, which needed a new env
+override because it was hardcoded). Raising it directly increases how
+many sequences run in parallel through each of the sequential AR
+loop's ~80 growing-length forwards -- the actual GPU-idle-between-
+kernels mechanism identified in §78.2, correctly targeted this time.
+`regime.aux_micro_batch` (which clamps `AR_SEQS` on CUDA, see
+`resolve_train_regime`) now equals `micro_batch=128` under
+`PFD_CUDA_MICRO_BATCH=128`, so `AR_SEQS` can go up to 128 without being
+silently clamped back down -- picked 16 (8x the arm default) as a
+first, moderate step to test in isolation, not the ceiling.
+
+`singleshot/bakeoff_queue_sched_mix_v3.json` -- ONE entry, round 322
+(321 is now dead, pod killed manually), identical to round 320/321's
+recipe (`AR_SCHED_MIX_P=0.3`, `early-stop-patience-steps=2000`) plus
+`AR_SEQS=16`, and `PFD_COMPILE_MODEL` dropped entirely (defaults back
+to OFF). `PFD_CUDA_MICRO_BATCH=128` kept (harmless, real if modest win
+on the primary TF pass, §78.3). Validated via `--dry-run --slots=1
+--wandb-group=NC1701` with `PFD_CUDA_MICRO_BATCH=128` set: entry valid,
+zero network/ssh calls made.
+
+### 79.3 Fully qualified command for the user to run (nothing above was launched, per §73.4)
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr PFD_CUDA_MICRO_BATCH=128 \
+  bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_run.sh \
+  --queue=/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_queue_sched_mix_v3.json \
+  --slots=1 --total-budget-hours=1.0 --wandb-group=NC1701
+```
+
+Watch `nvidia-smi dmon -s pucm` early (first few hundred steps) to
+confirm memory/utilization actually rise THIS time, and grep the log
+for `cache_size_limit`/`torch._dynamo` to confirm it stays clean (it
+should -- compile is off, so dynamo never engages at all).
+
+## 80. v10.8 -- quantified proof the "worse than the previous-frame anchor" console line was never a real signal, and it's now removed
+
+### 80.1 The quantified check (not just a mechanism argument)
+
+Direct analysis of round 320's full local log (`sweep_logs/r320_h11_ridge_distill.log`):
+**100% of all 73 logged steps, step 1 through step 1750 (the entire
+run to early-stop), were flagged "worse than the previous-frame
+anchor."** Zero exceptions -- including at the run's own peak.
+
+The decisive check used the CLEAN validation teacher-forced loss (no
+`NOISE_STD` injection, full val set, not a noisy single training
+mini-batch), so "it's just training noise" can be ruled out directly:
+
+| step | val_tf_loss (clean) | anchor | verdict | real rollout improvement_pct |
+|---|---|---|---|---|
+| 250 (run's peak) | 0.009874 | 0.00740 | worse | **+46.60%** |
+| 500 | 0.008946 | 0.00740 | worse | +43.60% |
+| 1750 (early-stopped) | 0.008606 | 0.00740 | worse | +35.24% |
+
+Even with every noise source removed, the model never once beat the
+anchor -- not even at the checkpoint that was simultaneously beating
+persistence by 46.6% on the metric that actually matters. Confirmed
+mechanism: `anchor` is a ONE-STEP, never-compounding "copy the previous
+frame" predictor -- unusually strong on smooth physical data precisely
+BECAUSE it never compounds -- while `improvement_pct` is a MULTI-STEP
+autoregressive rollout comparison, where persistence's error compounds
+and a genuinely-learned model can win by a wide margin while still
+losing the one-step comparison every single time. These measure
+different regimes; losing one while winning the other is expected, not
+a red flag.
+
+### 80.2 Fix: the per-step alarm is gone, only the (rare, real) positive case still shows
+
+Removed the `elif train_loss > anchor:` red-flag branch entirely from
+the per-step console line (train_production_transformer_deep_dive.py,
+`~5985`) -- it was structurally incapable of ever showing anything but
+red on this arm's own recipe (§80.1), so it carried zero information.
+`crossed_anchor` (green, "beats previous-frame anchor... saving
+_train_best.pt") is unchanged and is now the ONLY anchor-related signal
+ever printed -- kept specifically because it's the rare, genuinely
+informative direction, not because it's common. The OTHER red flag,
+`WORSE THAN PREDICTING ZERO` (failing to beat the trivial CONSTANT
+predictor), is a different and real problem signal and was left
+untouched -- unlike the anchor, that one's rare on a healthy run and
+means something when it fires. No change to `crossed_anchor`/
+`train_improved`'s underlying computation or the `_train_best.pt`
+checkpoint-save gating -- display-only change. Full suite re-run clean:
+242 passed, 14 skipped, zero regressions.
+
+## 81. HANDOFF NOTES (v10.9) -- for the next developer picking this up
+
+This section is written to be readable **on its own**, without first
+reading §1-80. It orients a new developer: what this project is, how
+the data was built, what's been tried, where the project currently
+appears to be stuck, and one concrete backlog item (§81.4) requested
+explicitly for improving unit-test coverage. Every other section in
+this document (§1-80) is the detailed, chronological lab notebook this
+summary is distilled from -- cross-references below point back into it
+for full detail, code line numbers, and exact numbers.
+
+### 81.1 What this project is, in one paragraph
+
+The goal is to train a transformer (`train_production_transformer_deep_dive.py`)
+to predict the future evolution of a turbulent wake flow (vortex
+shedding behind a bluff body, varied by inlet velocity) in a compressed
+latent space, well enough that its **autoregressive rollout** (feed the
+model's own predictions back in as input, repeatedly, to simulate many
+timesteps forward) beats a trivial **persistence baseline** (literally:
+freeze the last known frame and never update it) by as wide a margin as
+possible. The trained model is meant to eventually stand in for running
+the real (expensive) simulation. Progress is measured almost entirely
+by one number: `improvement_pct` = how much lower the model's
+rollout MSE is than persistence's rollout MSE, on a fixed held-out
+validation rollout window.
+
+### 81.2 How the data was put together
+
+Full detail: `DATA_PIPELINE_WALKTHROUGH.md` (280 lines, read this next
+-- it dissects one real training example end to end with real numbers).
+Condensed version:
+
+```
+raw sim output (pickled per-frame        GEN3 AttentionSE          build_wake_atlas.py      prepare_data.py       train_production_
+dataframes: x,y,z,vx,vy,vz per grid      autoencoder (frozen,      (finds vortex-core       (assembles 52-dim     transformer_deep_dive.py
+point, per PARAM FOLDER, per step)       trained separately,       centroids, emits         rows into 80x10x52    (trains on the 47-dim
+      |                                  NOT part of this repo's   (y,z) sensor taps        sequences)            latent slice; the
+      |                                  training loop at all)     to sample around them)         |                47-dim latent is
+      +---------- encode -------------------->  |                        |                        |                decoded back through
+                                     47-dim latent per grid              wake_atlas.csv.gz    train_80.h5 /         the SAME frozen
+                                     point, per step -- this is    (y,z taps + spatial       val_80.h5             decoder to score the
+                                     what gets baked into every    centroid cx,cy,cz)        (N, 80, 10, 52)       training loss)
+                                     row of train_80.h5/val_80.h5
+```
+
+**Raw source**: `/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent/<PARAM>/<step:04d>.pkl.gz`
+-- one directory per simulated case, named things like `3p6`, `4p6`,
+`5p2`, `6p4`, `6p6`, `7p2`, `7p8`, `8p4`, `10p4`, `11p4`. These
+directory names ARE the experiment identifier at the raw-data level.
+
+**The `PARAM` naming is already a real, live inconsistency worth
+knowing about up front** (this is the exact gap §81.4's backlog item
+exists to close): `prepare_data.py::parse_param()` hardcodes a
+lookup table mapping each folder-name code to a physical scalar (an
+inlet/free-stream velocity, in m/s):
+
+```python
+{"3p6": 5.6, "4p4": 6.9, "4p6": 7.2, "5p2": 8.1, "6p4": 10.0,
+ "6p6": 10.3, "7p2": 11.3, "7p8": 12.2, "8p4": 13.1,
+ "10p4": 16.3, "11p4": 17.8}
+```
+
+Note that `"3p6"` does NOT map to `3.6` -- the folder-name code is an
+opaque legacy label, not a directly-readable encoding of the physical
+value it represents. So the SAME experiment can legitimately be
+referred to as `"3p6"` (the folder/code name, which is what's stored
+in `train_80.h5`'s `param` column after going through `parse_param()`
+-- see below) OR as `"U=5.6"` / similar (the actual physical quantity),
+depending on which script, plot, or conversation you're reading. There
+is currently no single column anywhere in the training data that
+records BOTH forms side by side, and no documented reason for why the
+codes are shaped the way they are (why `6p6`, not `6p3` for 10.3?)
+beyond "that's what the raw folders are named."
+
+**Assembly**: `build_wake_atlas.py` finds the vorticity-magnitude
+weighted centroid of the vortex core for each `(param, step)` (§3A of
+the walkthrough doc), and emits a sliding window of `(y,z)` sensor taps
+around it, PLUS some random/background taps for contrast -- all
+recorded in `wake_atlas.csv.gz`. `prepare_data.py` then assembles
+`train_80.h5`/`val_80.h5`: shape `(N_sequences, 80, 10, 52)`, where the
+52 feature columns are `[latent(0:47), x(47), y(48), z(49), t_idx(50),
+param(51)]` -- `param` here is already the PARSED SCALAR (e.g. `10.0`
+for `"6p4"`), not the original folder-name string. `t_idx` is a
+position WITHIN the 80-frame sequence (0-79), not an absolute simulation
+timestep -- that mapping back to a real `.pkl.gz` step number is not
+stored per-row either.
+
+**Val/train param split** (as of the current version, `prepare_data.py`
+v3.5): `val_params = ["3p6", "6p4", "11p4"]`, everything else in train.
+This has moved multiple times as issues were found (`4p4`'s raw folder
+turned out partially corrupt/unusable, `3p6` was later found to
+overlap with data the upstream autoencoder had already SEEN during its
+own training -- meaning validation on `3p6` measures the transformer's
+generalization over already-familiar latents, not a fully clean
+holdout; see `prepare_data.py` lines ~1021-1090 for the full history of
+this decision and its caveats).
+
+**Frozen, external dependency**: the GEN3 AttentionSE autoencoder
+(trained completely separately, lives under
+`encoder/autoencoderGEN3/`) is used TWICE, in two different roles that
+are easy to conflate (§3 of the walkthrough doc covers this in detail):
+once (long before any of this repo's training runs) to PRODUCE the
+47-dim latent baked into every H5 row, and again, LIVE during every
+training/eval step of `train_production_transformer_deep_dive.py`, to
+DECODE a 47-dim latent back into a 375-dim physical velocity
+reconstruction (125 spatial points x 3 velocity components) so the
+training loss and the `improvement_pct` eval metric can be computed in
+real, physical units rather than raw (physically meaningless, arbitrary-
+scale) latent space. This decoder is frozen -- never trained by this
+repo, never fine-tuned, loaded once as a scripted `.pt` file.
+
+### 81.3 The traceability gap in the CURRENT datasets (why this matters for testing)
+
+Today, `train_80.h5`/`val_80.h5` (and their `_quartered`/Parquet
+derivatives) let you recover, per row: the 47-dim latent, the spatial
+`(x,y,z)` coordinate (though only the 10 fixed `x` stations and the raw
+`(y,z)` sensor-grid values -- NOT the actual (cx,cy,cz) vortex-core
+centroid this point was sampled around, or whether it was a real
+wake-core tap vs. a random background sample), the within-sequence
+`t_idx` (NOT an absolute simulation step number), and the parsed
+`param` SCALAR (not the original folder-name code, and not any other
+naming convention someone might use for the same experiment). Getting
+any of the missing pieces back requires re-joining against
+`wake_atlas.csv.gz` (for the wake-core/random distinction and the
+`cx,cy,cz` centroid) or reading `prepare_data.py`'s source directly
+(for the `parse_param()` table and `X_COORDS`) -- see the walkthrough
+doc's §5 table for the full "have it / don't have it" breakdown.
+
+None of this matters for TRAINING or for the `improvement_pct` metric
+-- the model only ever needs the 47-dim latent and its own
+positional/temporal bookkeeping. It matters for **writing competent
+unit tests**: a test that wants to assert "row N really does correspond
+to the vortex core of experiment `3p6` at simulation step 143, at grid
+position `(y,z)=(-4,18)`, roughly `(4.2, -1.1, 3.6)` units from the
+core centroid" currently cannot do that from the training data alone --
+it has to reconstruct the join by hand, against files that live outside
+`data/`, using lookup tables that live in yet another file. That's a
+real testing gap, not a training gap, which is exactly why the fix
+(§81.4) is scoped as two NEW dataset variants rather than a change to
+the datasets actually used for training.
+
+### 81.4 BACKLOG: build "trace" versions of `train_80.h5`/`val_80.h5`
+
+**Status: not started. Explicitly a backlog item, not in progress.**
+
+**Ask (verbatim intent, from the user)**: create two new dataset files
+-- `train_80_trace.h5` and `val_80_trace.h5` (naming to be finalized by
+whoever picks this up; the `_trace` suffix is a placeholder) -- that
+contain **the exact same training data** as `train_80.h5`/`val_80.h5`
+(same rows, same 52-dim feature vectors, same row ordering/shapes), but
+with **additional appended metadata columns** that make it possible to
+trace every row's spatial, temporal, and "experiment" identity all the
+way back to its original source, without needing to separately load
+`wake_atlas.csv.gz` or reverse-engineer `parse_param()`. This
+provenance data is **not needed for training or for the
+`improvement_pct` validation metric** -- the model must never see these
+columns as input features. It exists purely so that **unit tests** can
+make strong, source-verifiable assertions instead of the current
+"trust the pipeline, spot-check by hand" state described in §81.3.
+
+**What "trace back to source" should mean concretely** -- three axes,
+matching the user's own framing:
+
+1. **Spatial**: which raw simulation grid point(s) this row's
+   `(x,y,z)` corresponds to, AND (where applicable) the vortex-core
+   centroid `(cx,cy,cz)` it was sampled relative to, AND whether this
+   row is a real wake-core tap or a random/background sample (today:
+   only recoverable by joining `wake_atlas.csv.gz`, see §3A of the
+   walkthrough doc).
+2. **Temporal**: the ABSOLUTE simulation step number (the `NNNN` in
+   `<step:04d>.pkl.gz`) this row's `t_idx` corresponds to within its
+   source param's raw file sequence -- not just the 0-79
+   within-training-sequence offset currently stored.
+3. **"Experiment"**: the original raw folder-name code (e.g. `"3p6"`)
+   AND the parsed physical scalar (e.g. `5.6`, i.e. what `parse_param()`
+   already computes) stored SIDE BY SIDE, explicitly closing the
+   "sometimes keyed off `3p6`, sometimes off `U=...`" ambiguity
+   described in §81.2 -- plus, ideally, the original source file path
+   itself (`get_file_path(param_set, step)`'s output, or an
+   equivalent), so a test can, in principle, go all the way back to the
+   exact `.pkl.gz` a value came from.
+
+**Explicit non-goals**:
+- These files are NOT meant to replace `train_80.h5`/`val_80.h5` for
+  training -- the trainer's `Config.TRAIN_H5`/`VAL_H5` pinned paths
+  (§77.2/§78.3 discuss how rigidly other paths in this codebase are
+  pinned) should keep pointing at the existing, untouched files.
+  Whether the trace files are consumed by loading a SUBSET of their
+  columns for training (dropping the extra metadata) or are purely a
+  test-only artifact never touched by `train_production_transformer_deep_dive.py`
+  at all is an open implementation decision for whoever picks this up
+  -- but either way, the ordinary training/eval path must remain
+  provably unaffected.
+- Not meant to change any existing test, metric, or training run's
+  numbers -- this is purely additive, new test infrastructure.
+
+**Suggested (not mandated) approach**: extend `prepare_data.py`'s
+assembly step (or write a thin companion script that consumes its
+intermediate outputs) to also emit these extra columns per row, sourced
+from information `prepare_data.py`/`build_wake_atlas.py` already have
+in hand at assembly time (the raw param-folder string, the absolute
+step number, the wake-atlas join result) but currently discard once the
+row is written. Follow the existing `_quartered`/Parquet precedent
+(DATA_PIPELINE_WALKTHROUGH.md §5) for how this codebase already carries
+"extra, non-training metadata" alongside a dataset (HDF5 attrs +
+per-row columns, or a Parquet sidecar) rather than inventing a new
+convention.
+
+**Why this is valuable enough to backlog explicitly**: the "Known gaps"
+list at the end of DATA_PIPELINE_WALKTHROUGH.md already flags that
+nothing tests the Parquet conversion's provenance round-trip, and
+`test_data_quality.py`'s one content-level test targets the WRONG
+(legacy, `train_40.h5`) file. A trace-enabled dataset is what would let
+a future test suite assert real, end-to-end, source-verifiable
+correctness (e.g. "every row flagged as a wake-core tap really does
+have a matching `wake_atlas.csv.gz` entry with a centroid within
+physical tolerance of where the atlas said it should be") instead of
+today's structural-only checks (shapes, dtypes, non-degeneracy).
+
+### 81.4b BACKLOG: report the autoencoder's own reconstruction "floor" side-by-side with every experiment's result
+
+**Status: not started. Explicitly a backlog item, not in progress.**
+
+**Ask (verbatim intent, from the user)**: every experiment this session
+reports `rollout_mse`/`improvement_pct` as if the frozen GEN3 decoder's
+output were ground truth -- but the decoder is itself LOSSY (it's an
+autoencoder: real velocity -> 47-dim latent -> reconstructed velocity,
+and that round trip has its own inherent error, separate from anything
+the transformer does). We currently have no measurement, reported
+alongside a run's real result, of how much of the remaining gap is the
+TRANSFORMER being imperfect vs. the ENCODING ITSELF being imperfect --
+i.e. no visible "floor" below which no amount of transformer
+improvement could ever push `rollout_mse`, because even a perfect
+transformer predicting the perfect TARGET LATENT would still decode to
+something measurably different from the real, originally-measured
+velocity.
+
+**What exists today, and why it doesn't already cover this**:
+`encoder/autoencoderGEN3/test_ae_lightning.py::test_ae_reconstruction()`
+already does an encode->decode round trip on 100 real rows and prints
+an RMSE -- but it (a) scores the FULL 375-dim reconstruction, not
+specifically the single centroid triplet (`[186:189]`) that
+`centroid_velocity_loss()`/`improvement_pct` are actually scored on,
+(b) samples a different random file/100 rows every run (no fixed,
+reusable reference number), (c) mostly prints rather than asserts
+(DATA_PIPELINE_WALKTHROUGH.md §6 flags this same caveat), and (d) is
+never invoked by, or reported alongside, any real training run's
+`status.json`/wandb output. So there is currently no apples-to-apples
+"encoding floor" number sitting next to any `improvement_pct` a reader
+could compare against.
+
+**What the fix should look like**: compute, on a FIXED reference
+sample (e.g. the same validation rollout window `improvement_pct`
+already uses), the encode -> decode round-trip error on the CENTROID
+TRIPLET specifically -- i.e. take real measured `(vx,vy,vz)` at the
+centroid, run it forward through the frozen GEN3 encoder to get a
+latent, then immediately decode that latent back, and compare the
+result to the ORIGINAL real measured value (not to anything the
+transformer predicted). This is a NEW quantity, distinct from
+everything currently computed:
+
+| Quantity | Compares | Already exists? |
+|---|---|---|
+| `rollout_mse` | model's decoded rollout prediction vs. decoded ground-truth latent | Yes |
+| `persistence_mse` | decoded "copy last frame" vs. decoded ground-truth latent | Yes |
+| **encoding floor (new)** | decoded(encode(real measured value)) vs. the REAL measured value itself | **No** |
+
+Report this floor value once per dataset/split (it doesn't depend on
+any model or training run -- it's a property of the frozen AE alone),
+then surface it side by side with `rollout_mse`/`improvement_pct` in
+`status.json` and the console eval printout, so every future
+experiment's numbers can be read against "how close to the AE's own
+ceiling did this get" as well as "how much better than persistence was
+this," per the user's own framing: "helps give confidence."
+
+**Why this matters for interpreting everything in §81.5 below**: if
+the encoding floor turns out to be a non-trivial fraction of the
+distance between persistence and the ~48-51% ceiling this session kept
+hitting, that's a real, previously invisible upper bound on how much
+`improvement_pct` could EVER improve, no matter what's tried on the
+transformer/loss/curriculum side -- a materially different situation
+from "we haven't found the right training recipe yet." Currently
+unknown either way; this backlog item is what would answer it.
+
+### 81.5 Where this currently appears to be stuck
+
+The model has, across many architectures/losses/hyperparameters tried
+this session and previously, converged on a **~48-51% ceiling** on
+`improvement_pct` (ridge/linear baseline: `+69%` improvement over
+persistence, for context -- so the transformer has never caught up to
+even a simple fitted linear map, let alone dramatically exceeded it).
+The dominant, repeatedly-confirmed failure pattern is **exposure bias**:
+every run peaks early (often within the first few hundred steps) and
+then declines -- sometimes slowly, sometimes sharply -- as training
+continues, and this has now been observed under every loss variant,
+every hyperparameter combination, and every efficiency change tried.
+Chronological summary of what's been tried against this ceiling this
+session (full detail and exact numbers in the referenced sections):
+
+| # | Idea | Section | Outcome |
+|---|---|---|---|
+| 1 | Optuna hyperparameter search (weight decay, dropout, EMA decay, AR loss weight) over 153 trials | §68.6-68.7, §72-73 | Found trial 112 (+51.43%), the best result of the whole session; Track A (2h, no early stop) confirmed this is a genuine ceiling, not a screen-length artifact -- given 6x more steps, it declined from +48.31% to +24% and never recovered |
+| 2 | Widen the training loss's spatial scoring target beyond the single centroid point (`center_plus_6`, `all125` flat-weighted, `distance_weighted`) | §74-76 | All 3 variants UNDERPERFORMED the single-centroid loss, the narrower the widening the less damage (center_plus_6 best of the 3, all125 worst) -- concluded the single-centroid loss is not the bottleneck, closed this axis |
+| 3 | Scheduled sampling (`AR_SCHED_MIX_P`, new mechanism built this session) layered on the already-existing `AR_FRAMES_START` rollout-horizon curriculum | §77-78 | Peaked at +46.60% -- closer to trial 112's ceiling than any loss-widening variant, but the SAME decline shape persisted. One data point, not yet swept over `AR_SCHED_MIX_P` values |
+| 4 | GPU-utilization / efficiency pass (`PFD_CUDA_MICRO_BATCH`, `AR_SEQS` increase, `torch.compile`) | §78-79 | `torch.compile` actively HURT this workload (frame_ar's growing-context loop defeats dynamo's shape cache -- a real, previously-undocumented incompatibility, now disabled again). Raising `AR_SEQS` 2->16 delivered a real efficiency win (8x more AR-loss sequences per step for ~1.5-2x the wall-clock cost) but did NOT calm the gradient-noise trace as hypothesized (mean/median pre-clip `gnorm` unchanged, §prior-turn finding) and did not change model quality (+43.48% vs +46.60%, within existing run-to-run noise) |
+| 5 | Diagnosed the "worse than the previous-frame anchor" console line as a false alarm, not a real instability signal | §80 | Confirmed via direct log analysis (100% of steps flagged, including at the run's own peak, including on clean noise-free validation loss) -- fixed the display, not a training change |
+
+**What's still genuinely open, not yet tried**:
+- **The autoencoder's own reconstruction floor, on the centroid triplet
+  specifically, has never been measured or reported alongside a real
+  run's result** (§81.4b, backlog). Until this exists, it's unknown
+  whether some (or much) of the gap between persistence and the
+  ~48-51% ceiling is actually the frozen AE's own lossy encoding, not
+  anything the transformer could fix.
+- **Whether the model needs the `(x,y,z,t,param)` "meta" input columns
+  at all** -- built and dry-run validated (not yet launched, §82) an
+  A/B ablation (`USE_META_COLS` True vs False) on the modern recipe.
+  `param` (the experiment identifier) IS in the model's input today by
+  default, contrary to an initial assumption raised and corrected this
+  session -- the open question is whether the model is actually USING
+  it in a way that matters for the exposure-bias ceiling, not whether
+  it's present.
+- A real sweep over `AR_SCHED_MIX_P` values (only `0.3` has been tried)
+  -- idea #3 above is promising but under-explored.
+- The actual source of the large pre-clip gradient norms (`gnorm`
+  routinely 10-25x the `GRAD_CLIP=1.0` threshold) is still unexplained
+  -- batch size was ruled out as the cause; whether it's tied to
+  specific phases of the `AR_FRAMES_START` curriculum, to
+  `AR_SCHED_MIX_P`/`AROPT_TEMPERATURE`'s own randomness, or is intrinsic
+  to `frame_ar`'s chained-rollout structure generally, is unknown.
+- No one has yet tried directly attacking the exposure-bias DECLINE
+  itself with an intervention that changes DURING a single run (e.g.
+  annealing `AR_SCHED_MIX_P` over training, the way classic scheduled
+  sampling anneals its own mixing probability, rather than the current
+  fixed-value-per-run design) -- everything tried so far picks one
+  fixed value/config and trains it start to finish.
+- The MoE variants (referenced but not detailed in this handoff --
+  see §23 and surrounding sections) were found to get WORSE with more
+  training, not just slower to converge -- a different, so-far-
+  unexplained failure mode from the exposure-bias decline seen
+  everywhere else, worth a fresh look with the tooling now available
+  (Optuna, the `AR_SCHED_MIX_P` mechanism) that didn't exist when MoE
+  was last tried.
+
+### 81.6 Operational notes for picking this back up
+
+- **Standing rule (explicit user instruction, §73.4)**: whoever is
+  operating this codebase writes/verifies code, tests, and configs
+  locally (syntax checks, dry-runs, unit tests) but does NOT launch
+  real GPU pod/training runs autonomously -- that decision belongs to
+  whoever owns the budget. Every `bakeoff_run.sh` invocation in this
+  document was `--dry-run` validated, never actually launched, unless
+  explicitly stated otherwise.
+- **Launching a real run**: `singleshot/bakeoff_run.sh`, always with
+  `NETWORK_VOLUME_ID=yl7f9e8rwr` (this project's persistent RunPod
+  volume -- omitting it means no `/workspace` mount, no warm-start
+  checkpoint, no persisted wandb key; a real mistake made and corrected
+  this session, §77.6). See §75.4/§77.5/§78.7/§79.3 for fully-qualified
+  example commands.
+- **wandb project**: `Persistence_Linear_v1` (renamed from
+  `NI_Review_v8`, §69), entity `pvl-data`. Each batch of runs this
+  session used its own `--wandb-group` (`Bones`, `Scotty`, `McCoy`,
+  `NC1701`) to keep them visually separable in the dashboard.
+  `singleshot/setup_wandb_focus_view.py` (§75.3) builds a focused,
+  single-metric (`improvement_pct`) dashboard view scoped to one group.
+- **The reference hyperparameter recipe**, used as the base for every
+  isolated-variable experiment this session: `h11_ridge_distill` arm,
+  warm-started from `saved_models/r2_h11_ridge_distill_rollout_best.pt`,
+  `WEIGHT_DECAY=0.0966331656012948 DROPOUT=0.07345842794271963
+  EMA_DECAY=0.98 AR_LOSS_WEIGHT=0.6828481795652924` (trial 112's exact
+  params, §68.7/§73.1).
+- **Test suite**: `pytest tests/` from `transformer_neurIPS/`, 242
+  passing / 14 skipped as of this writing (skips are hardware-gated --
+  e.g. tests requiring the scripted decoder file or CUDA). Full suite
+  runs in under 20 seconds; keep it that way (existing tests are
+  deliberately small/synthetic where possible, e.g. tests exercising
+  `frame_ar_loss`/`centroid_velocity_loss` directly at tiny model sizes
+  rather than requiring a real training run to validate mechanisms).
+- **This document (`OVERVIEW.md`) is the primary lab notebook** --
+  read chronologically for full context, or jump to a specific `§N`
+  cross-referenced above. `DATA_PIPELINE_WALKTHROUGH.md` is the
+  authoritative, example-driven reference for the data format
+  specifically. Neither is likely to be fully up to date the moment
+  something new is tried -- always verify a referenced code line number
+  or file still says what this document claims before relying on it
+  for anything consequential (the same "verify, don't trust blindly"
+  discipline applied throughout this session's own work).
+
+## 82. v10.10 -- does the model actually need the "experiment" (`param`) column, or is it silently averaging across experiments? `n2_meta_off` was NEVER run -- built the real test
+
+### 82.1 Correcting the record: `param` IS in the model's input today, but the ablation that would prove it MATTERS has never been executed
+
+User's hypothesis: the transformer might be "averaging outputs across
+experiments" because it lacks the context to distinguish which
+experiment (inlet velocity, keyed inconsistently as `"3p6"` vs. its
+physical value, §81.2) a given token belongs to. First checked whether
+that context is even present -- it is: `Config.USE_META_COLS = True`
+by default (train_production_transformer_deep_dive.py:818), which
+means `model_variants.py`'s `input_projection` consumes the FULL
+52-dim row (latent + `x,y,z,t_idx,param`) on every arm run this
+session, including every `h11_ridge_distill` run referenced throughout
+§68-81 -- none of them override `USE_META_COLS`.
+
+There is a real, pre-existing control arm for exactly this question --
+`n2_meta_off` (branch N, train_production_transformer_deep_dive.py:2094,
+"Zero the (x, y, z, t, param) input columns entirely") -- but **direct
+search of `OVERVIEW.md`, `sweep_logs/`, and `saved_models/` found zero
+evidence it was ever actually run**. The one time branch N came up in
+this project's history (§20.2), the operator was explicitly told NOT
+to run its arms -- but for an unrelated reason (a bogus threshold-based
+auto-classifier misfire at a too-short step budget, not because the
+meta-columns question itself was ever answered). So the correct
+status is: **untested, not previously falsified** -- my earlier
+phrasing implying it might have run was wrong and is corrected here.
+
+### 82.2 Mechanically confirmed the zeroing actually works before proposing a real run
+
+`model_variants.py:664/819`: `h = h * self.feat_keep`, where
+`feat_keep` zeroes indices `[LATENT_DIM:INPUT_DIM]` (i.e. `x,y,z,t_idx,
+param`) when `USE_META_COLS=False` (`model_variants.py:459-462`).
+Verified directly on CPU, no pod needed: built a real model, ran it
+twice on the same input, then wildly perturbed the meta columns
+(`x[:,:,LATENT_DIM:] = torch.randn(...) * 100`) and re-ran --
+
+```
+USE_META_COLS=True:  perturbing meta cols changes output=True
+USE_META_COLS=False: perturbing meta cols changes output=False
+```
+
+Confirms the mechanism does exactly what it claims: with the flag off,
+the model's output is provably invariant to whatever garbage sits in
+those columns. Also confirmed warm-start-safe: zeroing happens on the
+INPUT side (`h * feat_keep`), not by deleting weights, so
+`input_projection`'s existing weight columns for the meta features
+simply go unused rather than causing a shape mismatch against
+`r2_h11_ridge_distill_rollout_best.pt`.
+
+### 82.3 The real test: same modern recipe, A/B on `USE_META_COLS` only
+
+`n2_meta_off`'s own definition is stale (branch N predates
+`PREDICT_DELTA`'s eventual retirement path, uses `LOSS=mse` instead of
+the current fixed centroid-velocity objective, and isn't warm-started)
+-- rather than resurrect that exact arm, built a fresh, isolated A/B
+directly on trial 112's modern recipe (same one used for every §74-80
+experiment), changing ONLY `USE_META_COLS`:
+
+`singleshot/bakeoff_queue_meta_cols_ablation.json` -- two entries:
+- round 330 `meta_cols_control_on` -- `USE_META_COLS=True` (explicit,
+  though this is already the default -- stated for clarity as the
+  control side of the A/B)
+- round 331 `meta_cols_ablation_off` -- `USE_META_COLS=False`, otherwise
+  byte-identical: same `h11_ridge_distill` arm, same warm-start
+  checkpoint, same trial-112 hyperparameters (`WEIGHT_DECAY=0.0966
+  DROPOUT=0.0735 EMA_DECAY=0.98 AR_LOSS_WEIGHT=0.683`), same
+  `max_steps=6000 max_hours=1.0 early-stop-patience-steps=1500`.
+  `AR_SCHED_MIX_P` deliberately NOT included on either side -- keeping
+  this test independent of the still-experimental §77-79 mechanism, so
+  a difference (or lack of one) can't be attributed to the wrong knob.
+
+Validated via `--dry-run --slots=2 --wandb-group=NC1701`: both entries
+valid, unique `(arm,round)` pairs, zero network/ssh calls made.
+
+**What the two possible outcomes would mean**, since this is worth
+stating explicitly before the result comes back:
+- If round 331 (no meta cols) performs MEANINGFULLY WORSE than round
+  330 -- the model is using `param`/position context in a way that
+  matters, and the exposure-bias ceiling has a different explanation
+  (the information is present but something else -- the loss, the
+  curriculum, the rollout mechanism -- isn't using it well).
+- If round 331 performs THE SAME OR BETTER -- exactly the user's own
+  framing ("if removal had no impact, we are doing something very
+  wrong here") -- that would mean 5 of the model's 52 input dimensions
+  are dead weight in the CURRENT recipe, which either points at a
+  genuine bug in how that context reaches the loss/rollout, or means
+  the model has never needed to learn to use it (e.g. if per-sequence
+  `param` is redundant with something else already fully determining
+  behavior, or the loss doesn't reward using it). Either reading would
+  be a real, actionable finding, not a null result to shrug off.
+
+### 82.4 Fully qualified command for the user to run (nothing above was launched, per §73.4)
+
+```bash
+NETWORK_VOLUME_ID=yl7f9e8rwr \
+  bash /Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_run.sh \
+  --queue=/Users/kkreth/PycharmProjects/cgan/transformer_neurIPS/singleshot/bakeoff_queue_meta_cols_ablation.json \
+  --slots=2 --total-budget-hours=1.0 --wandb-group=NC1701
+```

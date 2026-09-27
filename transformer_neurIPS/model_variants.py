@@ -278,6 +278,94 @@ def _build_mlp(n_embd, dropout, use_swiglu):
     )
 
 
+class MoEFeedForward(nn.Module):
+    """Sparse Mixture-of-Experts FFN (OVERVIEW.md v8.0 strategy #6, built
+    v8.3) -- replaces a single dense FFN with `n_experts` independent
+    copies of today's exact FFN (dense or SwiGLU, matching `_build_mlp`'s
+    own choice) plus a linear router selecting the top-`k` experts per
+    token, combined by the router's own softmax weight restricted to just
+    those top-k. Raises total capacity without a proportional per-token
+    compute increase (only `top_k` of `n_experts` FFNs run per token) --
+    the mechanism every recent frontier LLM uses to scale capacity past
+    what dense scaling can afford.
+
+    `self.last_aux_loss` (Switch Transformer's own load-balancing
+    formulation: `n_experts * sum_i(fraction of tokens whose TOP choice is
+    expert i * mean router probability mass on expert i)`) is recomputed
+    every forward call and read by the training loop's own
+    `moe_aux_loss()` -- without this term, MoE training is well
+    documented to collapse onto using only 1-2 experts regardless of
+    `n_experts`, wasting the added capacity entirely.
+
+    NOT optimized for scale (no token-capacity limit/dropping, a plain
+    per-(slot, expert) Python loop) -- honest for this project's current
+    ~5M-parameter model size (OVERVIEW.md v8.0 §63.4's own cost/risk
+    note): MoE's benefits are best-documented at a scale where a dense
+    equivalent would be prohibitively expensive, which this model isn't
+    yet. Worth testing because it's cheaper to try than dense scaling,
+    not because MoE is obviously right at this size.
+    """
+
+    def __init__(self, n_embd, dropout, use_swiglu, n_experts, top_k):
+        super().__init__()
+        self.n_experts = int(n_experts)
+        self.top_k = max(1, min(int(top_k), self.n_experts))
+        self.experts = nn.ModuleList([
+            _build_mlp(n_embd, dropout, use_swiglu) for _ in range(self.n_experts)
+        ])
+        self.router = nn.Linear(n_embd, self.n_experts, bias=False)
+        self.last_aux_loss = None
+
+    def forward(self, x):
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])                  # (N, n_embd)
+        logits = self.router(x_flat)                            # (N, n_experts)
+        probs = F.softmax(logits, dim=-1)
+        top_probs, top_idx = probs.topk(self.top_k, dim=-1)      # (N, top_k)
+        top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+
+        out = torch.zeros_like(x_flat)
+        for slot in range(self.top_k):
+            idx = top_idx[:, slot]                               # (N,)
+            weight = top_probs[:, slot].unsqueeze(-1)            # (N, 1)
+            for e in range(self.n_experts):
+                mask = idx == e
+                if not mask.any():
+                    continue
+                out[mask] = out[mask] + weight[mask] * self.experts[e](x_flat[mask])
+
+        top1_idx = top_idx[:, 0]
+        frac_tokens = torch.stack([
+            (top1_idx == e).float().mean() for e in range(self.n_experts)
+        ])
+        mean_prob = probs.mean(dim=0)
+        self.last_aux_loss = self.n_experts * (frac_tokens * mean_prob).sum()
+
+        return out.reshape(orig_shape)
+
+
+def _build_ffn(n_embd, dropout, use_swiglu, moe_experts=0, moe_top_k=2):
+    """`moe_experts<=0` (default) is byte-for-byte `_build_mlp()` -- every
+    existing arm/checkpoint unaffected. `moe_experts>0` builds
+    `MoEFeedForward` instead."""
+    if moe_experts and int(moe_experts) > 0:
+        return MoEFeedForward(n_embd, dropout, use_swiglu, moe_experts, moe_top_k)
+    return _build_mlp(n_embd, dropout, use_swiglu)
+
+
+def moe_aux_loss(model):
+    """Sum of every block's MoE load-balancing aux loss across `model.blocks`
+    -- `None` if no block uses MoE (`MOE_NUM_EXPERTS<=0`, the default),
+    exactly like every other new-mechanism accumulator in this project
+    (`ar_acc`, `aux_head_acc`, ...) being a true no-op at its default."""
+    total = None
+    for blk in model.blocks:
+        aux = getattr(blk.mlp, 'last_aux_loss', None)
+        if aux is not None:
+            total = aux if total is None else total + aux
+    return total
+
+
 # --------------------------------------------------------------------------- #
 # Blocks
 # --------------------------------------------------------------------------- #
@@ -285,12 +373,13 @@ class Block(nn.Module):
     """Pre-LN transformer block."""
 
     def __init__(self, n_embd, n_head, dropout=0.0, use_swiglu=False,
-                 attn_type='base', attn_impl='sdpa', bias=True, rope=None):
+                 attn_type='base', attn_impl='sdpa', bias=True, rope=None,
+                 moe_experts=0, moe_top_k=2):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embd)
         self.attn = _build_attention(n_embd, n_head, dropout, bias, attn_type, attn_impl, rope)
         self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = _build_mlp(n_embd, dropout, use_swiglu)
+        self.mlp = _build_ffn(n_embd, dropout, use_swiglu, moe_experts, moe_top_k)
 
     def forward(self, x, mask=None):
         x = x + self.attn(self.ln1(x))
@@ -313,14 +402,15 @@ class ConvBlock(nn.Module):
     KERNEL_SIZE = 3
 
     def __init__(self, n_embd, n_head, dropout=0.0, use_swiglu=False,
-                 attn_type='base', attn_impl='sdpa', bias=True, rope=None):
+                 attn_type='base', attn_impl='sdpa', bias=True, rope=None,
+                 moe_experts=0, moe_top_k=2):
         super().__init__()
         self.ln1 = nn.LayerNorm(n_embd)
         self.conv = nn.Conv1d(n_embd, n_embd, kernel_size=self.KERNEL_SIZE,
                               padding=0, groups=n_embd)
         self.attn = _build_attention(n_embd, n_head, dropout, bias, attn_type, attn_impl, rope)
         self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = _build_mlp(n_embd, dropout, use_swiglu)
+        self.mlp = _build_ffn(n_embd, dropout, use_swiglu, moe_experts, moe_top_k)
 
     def forward(self, x, mask=None):
         x_res = x
@@ -390,10 +480,13 @@ class BaseTransformer(nn.Module):
             self.space_embeddings = nn.Embedding(config.NUM_X, config.EMBED_SIZE)
 
         block_cls = ConvBlock if variant == 'conv' else Block
+        moe_experts = int(getattr(config, 'MOE_NUM_EXPERTS', 0))
+        moe_top_k = int(getattr(config, 'MOE_TOP_K', 2))
         self.blocks = nn.ModuleList([
             block_cls(config.EMBED_SIZE, config.N_HEADS, dropout=dropout,
                       use_swiglu=use_swiglu, attn_type=variant,
-                      attn_impl=self.attn_impl, bias=bias, rope=rope)
+                      attn_impl=self.attn_impl, bias=bias, rope=rope,
+                      moe_experts=moe_experts, moe_top_k=moe_top_k)
             for _ in range(config.N_LAYERS)
         ])
 
@@ -676,7 +769,9 @@ class FrameTransformer(nn.Module):
                   use_swiglu=use_swiglu,
                   attn_type=('mqa' if variant == 'mqa' else 'base'),
                   attn_impl=getattr(config, 'ATTN_IMPL', 'sdpa'),
-                  bias=bias, rope=rope)
+                  bias=bias, rope=rope,
+                  moe_experts=int(getattr(config, 'MOE_NUM_EXPERTS', 0)),
+                  moe_top_k=int(getattr(config, 'MOE_TOP_K', 2)))
             for _ in range(config.N_LAYERS)
         ])
         self.ln_f = nn.LayerNorm(config.EMBED_SIZE)
@@ -687,6 +782,19 @@ class FrameTransformer(nn.Module):
             if self.output_head.bias is not None:
                 nn.init.zeros_(self.output_head.bias)
 
+        # Non-autoregressive multi-horizon auxiliary head (OVERVIEW.md
+        # v7.18, Phase 2 menu item 2, `q2_sophia_auxhead`): predicts the
+        # next AUX_HEAD_FRAMES frames in ONE SHOT from the last context
+        # position's hidden state, entirely separate from the recurrent
+        # `output_head` path -- no feedback loop, so none of
+        # h10_ridge_residual's expansive-anchor-in-a-loop risk (§26.2)
+        # applies here. 0 (default) constructs nothing, so every other
+        # arm's parameter count/checkpoint shape is completely unaffected.
+        self.aux_head_frames = int(getattr(config, 'AUX_HEAD_FRAMES', 0))
+        if self.aux_head_frames > 0:
+            self.aux_head = nn.Linear(
+                config.EMBED_SIZE, self.aux_head_frames * self.frame_dim, bias=bias)
+
         self.register_buffer("frame_ids", torch.arange(config.NUM_TIME), persistent=False)
 
     def set_feature_stats(self, mean, std, eps=1e-6):
@@ -696,14 +804,15 @@ class FrameTransformer(nn.Module):
             std[std < eps] = 1.0
             self.feat_std.copy_(std)
 
-    def forward(self, frames):
-        """frames: (B, F, frame_dim + FRAME_META_COLS) -> (B, F, frame_dim).
+    def _encode(self, frames):
+        """frames: (B, F, frame_dim + FRAME_META_COLS) -> (B, F, EMBED_SIZE).
 
-        Output position f is the prediction of frame f+1, built from frames <= f.
+        Everything `forward()` did before its final `output_head` projection,
+        factored out so `forward_aux()` (the non-autoregressive multi-horizon
+        head, OVERVIEW.md v7.18) can reuse the SAME encoder pass instead of
+        running the transformer body twice.
         """
         B, F_, _ = frames.shape
-        anchor = frames[..., :self.frame_dim]
-
         h = frames
         if self.normalize_features:
             h = (h - self.feat_mean) / self.feat_std
@@ -714,11 +823,43 @@ class FrameTransformer(nn.Module):
 
         for blk in self.blocks:
             h = blk(h)
+        return h
 
+    def forward(self, frames):
+        """frames: (B, F, frame_dim + FRAME_META_COLS) -> (B, F, frame_dim).
+
+        Output position f is the prediction of frame f+1, built from frames <= f.
+        """
+        anchor = frames[..., :self.frame_dim]
+        h = self._encode(frames)
         out = self.output_head(self.ln_f(h))
         if self.predict_delta:
             out = out + anchor
         return out
+
+    def forward_aux(self, frames):
+        """Same as `forward()`, PLUS a one-shot, non-autoregressive
+        prediction of the next `aux_head_frames` frames from the last
+        context position's hidden state.
+
+        Returns `(out, aux)` where `out` is identical to plain `forward()`'s
+        output and `aux` is `(B, aux_head_frames, frame_dim)`. Only callable
+        when `AUX_HEAD_FRAMES > 0` (i.e. `self.aux_head` exists) -- every
+        other call site keeps using plain `forward()` and never sees this.
+        """
+        if self.aux_head_frames <= 0:
+            raise RuntimeError(
+                "forward_aux() called but AUX_HEAD_FRAMES<=0 -- no aux_head "
+                "was constructed. Use forward() instead, or set "
+                "Config.AUX_HEAD_FRAMES>0.")
+        anchor = frames[..., :self.frame_dim]
+        h = self._encode(frames)
+        out = self.output_head(self.ln_f(h))
+        if self.predict_delta:
+            out = out + anchor
+        B = frames.shape[0]
+        aux = self.aux_head(h[:, -1, :]).view(B, self.aux_head_frames, self.frame_dim)
+        return out, aux
 
 
 def get_model(config):

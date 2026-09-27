@@ -234,6 +234,7 @@ schema changes.
 
 import argparse
 import atexit
+import concurrent.futures
 import copy
 import shutil
 import socket
@@ -253,9 +254,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 try:
-    from model_variants import get_model, seq_to_frames, FRAME_META_COLS
+    from model_variants import get_model, seq_to_frames, FRAME_META_COLS, moe_aux_loss
 except ImportError:
-    from transformer_neurIPS.model_variants import get_model, seq_to_frames, FRAME_META_COLS
+    from transformer_neurIPS.model_variants import (
+        get_model, seq_to_frames, FRAME_META_COLS, moe_aux_loss)
 
 
 # --------------------------------------------------------------------------- #
@@ -369,8 +371,35 @@ def _print_checkpoint_status_banner(resumed, cross_version, warm_started,
 # checkpoint files. Deliberately simple (a JSON file + mtime staleness
 # check, no flock/fcntl) since the failure mode this guards against is a
 # human or a launcher script re-running the same command, not a tight race.
-# --------------------------------------------------------------------------- #
-LOCK_STALE_SECONDS = 1800  # 30 min: comfortably longer than one eval+checkpoint cycle
+#
+# release_run_lock() is atexit-registered, so it fires on a normal exit or
+# an uncaught Python exception -- but NOT on SIGKILL, which is exactly what
+# a CUDA OOM under real memory pressure can trigger indirectly (the Linux
+# OOM-killer reaping a process outright, not the Python-level
+# torch.OutOfMemoryError unwinding normally) -- confirmed happening for
+# real (OVERVIEW.md v7.11): a 3-way concurrent OOM left orphaned lock
+# files, and the OLD 1800s (30 min) threshold here meant every relaunch
+# attempt within that half hour kept refusing to start, with no live
+# process left to blame it on and no way to check across a brand-new pod
+# (different host/pid namespace) whether the recorded owner is really
+# dead. The staleness check is the ONLY recovery path for that case by
+# design (see release_run_lock()'s own docstring) -- so it needs a
+# threshold that's actually proportional to how often a truly-alive
+# process re-touches the lock (touch_run_lock() fires every
+# RUN_LOCK_TOUCH_EVERY_STEPS=25 steps, ~20-30s apart under normal CUDA
+# throughput -- confirmed against this session's own real run logs;
+# deliberately kept on this fast, fixed cadence and NOT tied to
+# CHECKPOINT_EVERY_STEPS, which was raised separately to stop the actual
+# checkpoint WRITE from firing every ~19s on fast hardware -- see both
+# constants' own comments in Config), not a blanket "comfortably long"
+# guess that was ~60-90x looser than needed.
+# 300s is still a healthy 10-15x margin over that real cadence (covers a
+# slow eval, a slow network-volume checkpoint write, or general GPU
+# contention) while cutting a crash's real recovery wait from 30 minutes
+# to 5. Overridable via PFD_LOCK_STALE_SECONDS for a regime that's
+# genuinely slower than this (e.g. an MPS run with a much longer
+# per-checkpoint-cycle wall-clock) without needing a code change.
+LOCK_STALE_SECONDS = int(os.environ.get("PFD_LOCK_STALE_SECONDS", "300"))
 
 
 def acquire_run_lock(cfg, run_name, log=print):
@@ -388,6 +417,7 @@ def acquire_run_lock(cfg, run_name, log=print):
                 prev = json.load(open(lock_path))
             except Exception:
                 prev = {}
+            remaining = LOCK_STALE_SECONDS - age
             raise SystemExit(_bold(
                 f"REFUSING TO START: another process appears to already be "
                 f"training arm '{run_name}' -- lock at {lock_path} was last "
@@ -396,7 +426,13 @@ def acquire_run_lock(cfg, run_name, log=print):
                 f"This is exactly the failure mode that produced two "
                 f"overlapping wandb histories in the same run (OVERVIEW.md "
                 f"v6.0) -- refusing rather than risking it again. If that "
-                f"process is actually dead, delete {lock_path} and relaunch.",
+                f"process is actually dead (e.g. it crashed/OOM'd and never "
+                f"got to clean up its own lock -- SIGKILL skips that, see "
+                f"release_run_lock()'s docstring), you have two options: "
+                f"wait {remaining:.0f}s for this lock to age past "
+                f"LOCK_STALE_SECONDS={LOCK_STALE_SECONDS}s and auto-reclaim on "
+                f"the next launch attempt, or delete {lock_path} yourself "
+                f"right now and relaunch immediately.",
                 "red"))
         log(_c(f"  [lock] reclaiming stale lock at {lock_path} "
                f"(age {age:.0f}s > {LOCK_STALE_SECONDS}s -- previous process "
@@ -480,21 +516,42 @@ class TrainRegime:
     banner: str
 
 
-def _regime_banner_mps_cpu(micro_batch):
-    header = _rainbow(f"🌈 MICRO-BATCH MODE (micro_batch={micro_batch})")
-    why = ("WHY: on MPS/CPU the caching allocator cannot reuse blocks across "
-           "the changing shapes of an autoregressive rollout, so peak memory "
-           "scales with the batch inside ONE rollout call and blows past the "
-           "device ceiling on the very first batch. micro_batch=1 keeps each "
-           "forward within budget (same rationale documented in "
-           "persistence_formal_documentation.py).")
+def _regime_banner_mps_cpu(micro_batch, eval_micro_batch=1):
+    header = _rainbow(f"🌈 MICRO-BATCH MODE (micro_batch={micro_batch}, "
+                      f"eval_micro_batch={eval_micro_batch})")
+    why = ("WHY (train micro_batch=1): on MPS/CPU the caching allocator "
+           "cannot reuse blocks across the changing shapes of an "
+           "autoregressive TRAINING rollout (backward graph retained per "
+           "step), so peak memory scales with the batch inside ONE rollout "
+           "call and blows past the device ceiling on the very first batch. "
+           "micro_batch=1 keeps each forward within budget (same rationale "
+           "documented in persistence_formal_documentation.py).")
+    why_eval = ("WHY eval_micro_batch stays 1 by default (but CAN be raised "
+                "via PFD_MPS_EVAL_BATCH=N): evaluate()'s teacher-forced pass "
+                "and rollout run under @torch.no_grad(), so the TRAINING "
+                "backward-graph argument above doesn't apply -- confirmed "
+                "live the real bottleneck is MPS's per-op dispatch overhead "
+                "(25,410 individual batch=1 forwards cost ~55min/eval for "
+                "the teacher-forced pass alone). But raising the batch is "
+                "its OWN real memory risk, for a DIFFERENT reason, also "
+                "confirmed live (two crashes, not a guess): "
+                "rollout_frames()'s context grows every one of its ~680 "
+                "iterations, so the caching allocator sees a new shape "
+                "almost every step and can't reuse blocks -- the same "
+                "'changing shapes' pathology as the training case above, "
+                "just via accumulation instead of backward-graph retention "
+                "-- compounding with whatever ELSE is using this machine's "
+                "shared Metal memory pool at that moment. Safe on a box "
+                "with headroom to spare (CUDA already runs the identical "
+                "code path at eval_micro_batch=32-64 safely); NOT a safe "
+                "default across machines/moments, so it stays opt-in.")
     what = ("WHAT CHANGES ON CUDA: micro_batch bumps to 32 (64 on H200), "
             "gradient accumulation collapses to 1, AMP bf16 turns on, "
             "torch.compile is attempted, cudnn.benchmark is enabled.")
-    return "\n".join([header, why, what])
+    return "\n".join([header, why, why_eval, what])
 
 
-def _regime_banner_cuda(micro_batch, virtual_batch):
+def _regime_banner_cuda(micro_batch, virtual_batch, compile_model):
     header = _bold("[CUDA DETECTED — H200 DEFAULTS ACTIVE]", "green")
     diff = [
         ("batch size",         str(micro_batch),  "1"),
@@ -502,7 +559,12 @@ def _regime_banner_cuda(micro_batch, virtual_batch):
         ("AR/aux batch",       str(micro_batch),  "1"),
         ("AR aux loss",        "enabled",          "DISABLED"),
         ("AMP dtype",          "bfloat16",         "off"),
-        ("torch.compile",      "on",               "off"),
+        # Was a hardcoded "on" regardless of the actual flag (OVERVIEW.md
+        # v7.19 follow-up) -- misleading the moment compile_model's CUDA
+        # default flipped to off, since this banner is printed before
+        # torch.compile is ever attempted and has no other way to reflect
+        # a PFD_COMPILE_MODEL=1 override either. Now reads the real value.
+        ("torch.compile",      "on" if compile_model else "off", "off"),
         ("cudnn.benchmark",    "on",               "off"),
         ("grad accumulation",  str(max(1, virtual_batch // micro_batch)), "32"),
     ]
@@ -526,9 +588,25 @@ def resolve_train_regime(device):
             name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
         except Exception:
             name = ""
-        micro = 64 if "H200" in name.upper() else 32
+        # OVERVIEW.md v10.6: live GPU-utilization check on a solo H200 run
+        # (round 320) found the default batch=64 leaves most of the card
+        # idle -- 17% memory used (24.5/143.8 GB), power draw 18-27% of
+        # the 700W cap, GPU-util oscillating 0-67% with SM clock already
+        # pinned at its max (P0, not thermally/power-limited) -- i.e.
+        # kernel-launch-overhead-bound, not compute-bound, with ample
+        # headroom to go wider. PFD_CUDA_MICRO_BATCH is an opt-in override
+        # (unset preserves the exact hardcoded 64/32 default byte-for-
+        # byte) rather than a blanket default change, since a larger
+        # batch changes gradient-noise characteristics (see AR_SCHED_MIX_P
+        # discussion) and hasn't been validated as safe for every existing
+        # arm/regime yet -- deliberately a single knob to test in
+        # isolation on the next run, not a silent default flip.
+        _cuda_batch_override = os.environ.get("PFD_CUDA_MICRO_BATCH", "")
+        if _cuda_batch_override:
+            micro = int(_cuda_batch_override)
+        else:
+            micro = 64 if "H200" in name.upper() else 32
         virtual = micro                       # accumulation off
-        banner = _regime_banner_cuda(micro, virtual)
         # CUDA-only side effects, guarded so this stays safe under a mocked
         # torch.cuda.is_available() in the tests.
         try:
@@ -540,20 +618,60 @@ def resolve_train_regime(device):
                 torch.backends.cudnn.benchmark = True
         except Exception:
             pass
+        # torch.compile disabled by default (OVERVIEW.md v7.19): diagnosed
+        # live on branch Q's launch -- 3 concurrent training processes each
+        # spawn their OWN torch._inductor compile_worker pool sized to the
+        # host's full core count (`--workers=64` per process observed on a
+        # 192-vCPU pod), so N-way concurrent launches oversubscribe the box
+        # N times over before a single real training step runs (confirmed:
+        # nvidia-smi showed 0% GPU util with ~195 compile_worker processes
+        # alive and no training-step log lines yet). The 15-30% steady-state
+        # speedup torch.compile buys isn't worth minutes of dead compile
+        # time against a ~1-2500-step, ≤1h budget, especially at 3x
+        # concurrency. Override with PFD_COMPILE_MODEL=1 to re-enable (e.g.
+        # for a single long solo run where the steady-state win amortizes).
+        compile_model = os.environ.get("PFD_COMPILE_MODEL", "0") == "1"
+        banner = _regime_banner_cuda(micro, virtual, compile_model)
         return TrainRegime(
             device="cuda", micro_batch=micro, virtual_batch=virtual,
             eval_micro_batch=micro, aux_micro_batch=micro,
             disable_ar=False,
             use_amp=True, amp_dtype=torch.bfloat16,
-            compile_model=True, cudnn_benchmark=True, banner=banner)
+            compile_model=compile_model, cudnn_benchmark=True, banner=banner)
 
-    # MPS / CPU: eval also runs singleton. The AR rollout at NUM_TIME=80 grows
-    # the sequence to SEQ_LEN=800 tokens (v3.1: NUM_X cut 26->10, see
-    # OVERVIEW.md §12.1); attention scores are (batch * n_heads * L^2 * 4B).
-    # The batch=1 clamp below predates that cut and was sized for the
-    # original L=2080 worst case -- still the safe conservative choice at
-    # L=800, just with more memory headroom than strictly required now.
-    banner = _regime_banner_mps_cpu(micro_batch=1)
+    # MPS / CPU training rollout: the AR training loop's batch=1 clamp
+    # predates the v3.1 NUM_X cut (26->10, see OVERVIEW.md §12.1) and was
+    # sized for the original L=2080 worst case under a RETAINED BACKWARD
+    # GRAPH (see _regime_banner_mps_cpu's "why" above) -- still the safe
+    # conservative choice at L=800 for TRAINING, so this stays 1.
+    #
+    # eval_micro_batch is a SEPARATE knob (OVERVIEW.md §8/§66 MoE-startup-
+    # cost follow-up), default kept at 1 -- NOT raised, after live testing
+    # on this exact machine, twice, at eval_micro_batch=16 AND 32, both
+    # hit real `RuntimeError: MPS backend out of memory`. The real
+    # bottleneck for eval wall-clock IS confirmed to be MPS's per-op
+    # dispatch overhead, not the STATIC byte math (attn_bytes below stays
+    # GiB-scale even at batch=32) -- the full 25,410-row teacher-forced
+    # pass at batch=1 measured ~55min/eval by itself. But raising the
+    # batch is riskier than that byte math alone suggests, for a SECOND,
+    # separate reason found live: rollout_frames()'s context grows by one
+    # token on every one of its ~680 iterations, so MPS's allocator sees a
+    # new shape almost every step and cannot reuse blocks -- the same
+    # "changing shapes defeat the caching allocator" mechanism
+    # `_regime_banner_mps_cpu`'s original training-side "why" describes,
+    # just via accumulation instead of backward-graph retention, so it
+    # was wrong to assume eval's @torch.no_grad() made it exempt. That
+    # compounds with whatever ELSE is using this machine's shared Metal
+    # memory pool at the time (confirmed live: 66->78 GiB "other
+    # allocations" over a few minutes, from unrelated GPU-using processes
+    # -- browser tabs, the IDE, WindowServer -- not this process at all).
+    # PFD_MPS_EVAL_BATCH=N is an OPT-IN override for a specific box/moment
+    # with real headroom to spare; _run_with_oom_backoff() (see evaluate())
+    # keeps any chosen value self-correcting rather than a hard crash, but
+    # is not a substitute for picking a value the machine can actually
+    # sustain for a whole run.
+    mps_eval_batch = max(1, int(os.environ.get("PFD_MPS_EVAL_BATCH", "1")))
+    banner = _regime_banner_mps_cpu(micro_batch=1, eval_micro_batch=mps_eval_batch)
     # AR / scheduled-sampling losses also clamp to singleton on MPS/CPU: the AR
     # loop is sequential and each intermediate forward keeps its full activation
     # graph for backward, so peak memory scales linearly with AR_SEQS. This
@@ -572,7 +690,7 @@ def resolve_train_regime(device):
     # arm-specified AR_SEQS).
     return TrainRegime(
         device=dev_str, micro_batch=1, virtual_batch=32,
-        eval_micro_batch=1, aux_micro_batch=1,
+        eval_micro_batch=mps_eval_batch, aux_micro_batch=1,
         disable_ar=True,
         use_amp=False, amp_dtype=None,
         compile_model=False, cudnn_benchmark=False, banner=banner)
@@ -593,6 +711,42 @@ N_TRIPLETS = 125
 CENTROID_TRIPLET_IDX = 62            # 0-based, middle of 125
 CENTROID_SLICE = slice(186, 189)     # inclusive/exclusive; gives vx, vy, vz
 V_LABELS = ("vx", "vy", "vz")
+
+# Index of the (dx,dy,dz) triplet within the flat 125-point cube, matching
+# `og_data_prep/Ordered_005_AllPossibleCombos.py`'s own generation order
+# EXACTLY (`offsets = [-2,-1,0,1,2]`, nested `for dx: for dy: for dz:`) --
+# confirmed by reading that script directly, not just inferred from
+# CENTROID_TRIPLET_IDX=62 being 125//2 (which would be true of the middle
+# index under ANY ordering, so doesn't by itself prove the 3-D layout).
+def _cube_idx(dx, dy, dz):
+    return (dx + 2) * 25 + (dy + 2) * 5 + (dz + 2)
+
+
+assert _cube_idx(0, 0, 0) == CENTROID_TRIPLET_IDX, (
+    "_cube_idx(0,0,0) should reproduce the existing, already-verified "
+    "CENTROID_TRIPLET_IDX -- if this ever fires, the offset-ordering "
+    "assumption above no longer matches og_data_prep's generator.")
+
+# The 6 face-adjacent neighbors of the centroid (dx,dy,dz each +-1 along
+# exactly one axis, the other two held at 0) -- NOT the 26-neighbor full
+# Moore neighborhood, and NOT diagonal. Used by CENTROID_LOSS_POINTS=
+# 'center_plus_6' (see centroid_velocity_loss()).
+CENTROID_NEIGHBOR_TRIPLET_IDXS = (
+    _cube_idx(-1, 0, 0), _cube_idx(1, 0, 0),
+    _cube_idx(0, -1, 0), _cube_idx(0, 1, 0),
+    _cube_idx(0, 0, -1), _cube_idx(0, 0, 1),
+)
+
+# Euclidean grid distance (in cube-cell units) of every one of the 125
+# points from the centroid, indexed 0-124 -- used by CENTROID_LOSS_POINTS=
+# 'distance_weighted' for a smooth falloff instead of center_plus_6's
+# hard 7-point cutoff or all125's binary center/non-center split.
+_CUBE_OFFSETS = [-2, -1, 0, 1, 2]
+CENTROID_DISTANCES = tuple(
+    (dx * dx + dy * dy + dz * dz) ** 0.5
+    for dx in _CUBE_OFFSETS for dy in _CUBE_OFFSETS for dz in _CUBE_OFFSETS
+)
+assert len(CENTROID_DISTANCES) == 125 and CENTROID_DISTANCES[CENTROID_TRIPLET_IDX] == 0.0
 
 
 class Config:
@@ -625,6 +779,18 @@ class Config:
     INPUT_DIM = 52
 
     TRAIN_SUBSET_RATIO = 1.0   # was 0.5; half the data was going unused
+    # "Half mode" (OVERVIEW.md v8.0): keep only EVEN time-step indices
+    # (0, 2, 4, ...) from every sequence, halving NUM_TIME/SEQ_LEN and the
+    # resident data volume -- for faster iteration while exploring the
+    # v8.0 strategy menu, not a claimed quality improvement on its own.
+    # NOT in PINNED_CONFIG_FIELDS (unlike NUM_TIME/SEQ_LEN themselves,
+    # which this derives) -- the sanctioned way to change effective
+    # temporal resolution is this switch, not setting NUM_TIME directly.
+    # False (default) is a no-op -- every existing arm's exact NUM_TIME=80
+    # behavior, unchanged. See resolve_derived_config_fields() (halving
+    # happens there, once, right after arm/--set overrides are applied)
+    # and TransformerDataset.__init__ (the actual even-index subsampling).
+    HALF_TIME_MODE = False
 
     # -- architecture -------------------------------------------------------
     EMBED_SIZE = 256
@@ -660,9 +826,81 @@ class Config:
     LEARNING_RATE = 1e-3       # peak LR
     WARMUP_FRAC = 0.03         # fraction of the step budget spent warming up
     LR_FINAL_FRAC = 0.02       # cosine floor, as a fraction of peak
+    # -- v8.0 strategy #2 (OVERVIEW.md v8.1) -- alternate LR schedules,
+    # selected via LR_SCHEDULE. 'cosine' (default) is BYTE-FOR-BYTE the
+    # single warmup+cosine-decay shape every arm before this has always
+    # used -- a no-op for every existing arm/checkpoint. 'wsd' (Warmup-
+    # Stable-Decay, MiniCPM/DeepSeek-style) holds LR at its peak between
+    # warmup and a final decay window, instead of annealing toward zero
+    # for the entire post-warmup budget -- targets the repeatedly-observed
+    # "peaks early, then declines" shape (§39/46/48/57/59): today's cosine
+    # schedule anneals LR toward its floor exactly as that decline starts,
+    # freezing the model into it rather than leaving room to recover.
+    # 'cosine_restarts' (SGDR-style) repeats N equal-length cosine cycles
+    # over the post-warmup budget, resetting back to peak LR at the start
+    # of each -- a different way of giving the optimizer room to escape a
+    # local rut instead of decaying into one permanently.
+    LR_SCHEDULE = 'cosine'     # 'cosine' | 'wsd' | 'cosine_restarts'
+    WSD_DECAY_FRAC = 0.1       # fraction of TOTAL steps spent in the final decay window (wsd only)
+    LR_NUM_RESTARTS = 1        # additional cosine cycles after the first, e.g. 1 = two total cycles (cosine_restarts only)
     WEIGHT_DECAY = 0.01
     GRAD_CLIP = 1.0
     ADAM_BETAS = (0.9, 0.95)
+    # Optimizer family (branch P, OVERVIEW.md v7.9) -- 'adamw' (default,
+    # every arm before branch P used exactly this, unconditionally) |
+    # 'lion' | 'sophia'. AdamW's own LEARNING_RATE/WEIGHT_DECAY/ADAM_BETAS
+    # above are untouched by this -- Lion/Sophia use their OWN LR/WD
+    # (still Config.LEARNING_RATE/WEIGHT_DECAY, just at different arm-
+    # specified values per their own tuning guidance, see branch P's
+    # arm descs) and their own beta/rho fields below, since Lion's and
+    # Sophia's own paper-recommended betas differ from AdamW's.
+    OPTIMIZER = 'adamw'
+    LION_BETAS = (0.9, 0.99)          # lucidrains/lion-pytorch's own default
+    SOPHIA_BETAS = (0.965, 0.99)      # Liuhong99/Sophia's own default
+    SOPHIA_RHO = 0.04
+    SOPHIA_WEIGHT_DECAY = 0.1         # Sophia's own default -- separate
+                                      # from WEIGHT_DECAY above so AdamW
+                                      # arms are never affected by it
+    # Steps between SophiaG diagonal-Hessian refreshes (the paper's own
+    # `k`). Refresh reuses the SAME gradient already computed for that
+    # step's ordinary update (sophia_opt's own update_hessian() just
+    # EMAs the squared gradient already sitting in `.grad` -- no
+    # synthetic/sampled loss needed, unlike the original repo's LM
+    # training script convention of resampling a categorical label for
+    # its own reasons; that's a training-script choice, not something
+    # update_hessian() itself requires).
+    SOPHIA_HESSIAN_UPDATE_EVERY = 10
+    # -- Phase 2 "think bigger" menu (OVERVIEW.md v7.18) -- each 0/1.0
+    # default preserves every existing arm's exact behavior; only
+    # branch Q's q1/q2/q3 arms override these.
+    EMA_DECAY = 0.0            # 0.0 disables EMA-of-weights entirely (q1_sophia_ema)
+    TF_LOSS_WEIGHT = 1.0       # multiplier on the primary teacher-forced loss (q3_sophia_rollout_dominant)
+    AUX_HEAD_FRAMES = 0        # >0 constructs FrameTransformer.aux_head (q2_sophia_auxhead); 0 = no extra params, no extra loss term
+    AUX_HEAD_LOSS_WEIGHT = 1.0
+    # -- Branch R (OVERVIEW.md v7.20, §32.2 item 5) -- soft spatial-
+    # consistency penalty. NOT real PINN: no governing equation (Navier-
+    # Stokes/divergence-free) is ever written down or checked, and there's
+    # no differentiable spatial/temporal coordinate input for a real PDE-
+    # residual to be computed against in the first place -- this is a
+    # plain smoothness/TV-style prior on the network's OWN predicted
+    # per-x-station output, purely self-referential (no ground truth
+    # involved). See spatial_smoothness_loss()'s own docstring. 0.0 is a
+    # no-op, preserving every existing arm's exact behavior.
+    SPATIAL_SMOOTH_WEIGHT = 0.0
+    SPATIAL_SMOOTH_WARMUP_FRAC = 0.05
+    # -- Strategy #6 (OVERVIEW.md v8.0 §63.4/§64.3, built v8.3) --
+    # Mixture-of-Experts FFN. MOE_NUM_EXPERTS=0 (default) is byte-for-byte
+    # today's single dense FFN per block -- every existing arm/checkpoint
+    # unaffected (model_variants.py's `_build_ffn()` only builds
+    # `MoEFeedForward` when this is >0). MOE_LOAD_BALANCE_WEIGHT gates the
+    # auxiliary load-balancing loss the training loop adds when MoE is
+    # active -- without it, MoE training collapses onto using only 1-2
+    # experts regardless of MOE_NUM_EXPERTS (see MoEFeedForward's own
+    # docstring). NOT weight-compatible with any existing checkpoint: a
+    # different Block.mlp structure, random-init/--fresh only.
+    MOE_NUM_EXPERTS = 0
+    MOE_TOP_K = 2
+    MOE_LOAD_BALANCE_WEIGHT = 0.01
     LOSS = 'l2norm'            # l2norm | mse | huber
     HUBER_DELTA = 0.01
     MAX_STEPS = 600_000           # OPTIMIZER steps -- the primary clock
@@ -699,6 +937,25 @@ class Config:
     # already slightly wrong", closer to the actual rollout failure mode.
     # 0.0 (off) preserves existing arm behavior exactly.
     AR_FEEDBACK_NOISE_STD = 0.0
+    # -- Branch S (OVERVIEW.md v7.21, §32.2 item 7) -- AROpt-style accept/
+    # reject rollout stabilization, adapted from DeepSeek-V3's accept/reject
+    # sampling mechanism to continuous-valued AR forecasting. Per-sequence:
+    # compute the model's own prediction error against ground truth, convert
+    # to an acceptance probability (worse predictions rejected more often),
+    # then either feed the model's own prediction through (accept) or
+    # substitute ground truth instead (reject) -- ground truth is
+    # non-expansive under repeated feedback by construction, the same
+    # safety property h10_ridge_residual's own anchor violated (§26.2).
+    # 0.0 (default) disables this entirely -- every existing arm's AR
+    # feedback stays byte-for-byte unchanged (always accepts, exactly
+    # today's `_feed(nxt)` behavior).
+    AROPT_TEMPERATURE = 0.0
+    # Classic scheduled sampling (Bengio 2015) layered on top of the
+    # AR_FRAMES_START rollout-horizon curriculum above -- see
+    # frame_ar_loss()'s `_feed_final` for the full mechanism (OVERVIEW.md
+    # v10.5). 0.0 (default) preserves every existing frame_ar arm's
+    # behavior byte-for-byte.
+    AR_SCHED_MIX_P = 0.0
 
     # Ridge-map DISTILLATION loss (v6.1, OVERVIEW.md Appendix A/B) -- the
     # safe reformulation of the abandoned h10_ridge_residual idea. Pulls
@@ -721,7 +978,40 @@ class Config:
     VAL_ROLLOUT_SEQS = 64      # fixed row set; model AND persistence both use it
     VAL_EVERY_STEPS = 25
     LOG_EVERY_STEPS = 25
-    CHECKPOINT_EVERY_STEPS = 25
+    # Real, MEASURED cadence on H100/H200 this session: 25 steps took
+    # ~19s (100 steps, step_0000875 -> step_0000975, 14:43:43 -> 14:44:58
+    # on a live pod) -- i.e. CHECKPOINT_EVERY_STEPS=25 was firing the
+    # ~76+19 MB `_latest.pt`+scripted write roughly every 19 SECONDS, not
+    # the "up to 10 minutes" CHECKPOINT_EVERY_SECONDS below was supposed
+    # to bound this to. The step-based trigger was always going to win
+    # that race on fast hardware -- it fires first almost every time,
+    # so CHECKPOINT_EVERY_SECONDS never got a chance to actually govern
+    # anything. Raised so CHECKPOINT_EVERY_SECONDS is the real, sole
+    # governor on any hardware this project has actually measured
+    # (fastest: ~0.19s/step dense H100/H200 => 5000 steps ~= 950s, still
+    # comfortably above 600s; slowest relevant: MoE at ~3.4s/step => 5000
+    # steps ~= 4.7 HOURS, so the 600s time-based trigger is what actually
+    # fires there too) -- it remains a real backstop, just no longer the
+    # dominant one everywhere.
+    CHECKPOINT_EVERY_STEPS = 5000
+    # Wall-clock floor on the same `_latest.pt` save, independent of step
+    # count -- fires whichever of CHECKPOINT_EVERY_STEPS / this comes first.
+    # 600s (10 min) caps how much progress an unattended run can lose to a
+    # crash regardless of how step-time varies across GPU types.
+    CHECKPOINT_EVERY_SECONDS = 600
+    # touch_run_lock()'s own heartbeat cadence -- DELIBERATELY SEPARATE
+    # from CHECKPOINT_EVERY_STEPS above. The stale-lock detector's 300s
+    # threshold (see acquire_run_lock()'s own comment) was calibrated
+    # against a heartbeat every ~20-30s, a 10-15x margin. If the lock
+    # touch were tied to the (now much rarer) checkpoint-write cadence
+    # instead, a perfectly healthy run would go up to CHECKPOINT_EVERY_
+    # SECONDS=600s between touches -- LONGER than the 300s staleness
+    # window -- and get its own lock reclaimed as "dead" out from under
+    # it. Touching a lock file is nearly free (unlike writing a 76+19 MB
+    # checkpoint), so it stays on the original fast, fixed cadence,
+    # independent of however rarely a full checkpoint actually gets
+    # written.
+    RUN_LOCK_TOUCH_EVERY_STEPS = 25
     # `_latest.pt` is overwritten in place every CHECKPOINT_EVERY_STEPS -- on
     # its own that means a run which quietly regresses for hours (see the
     # rollout-divergence case this Config.MAX_SANE_ROLLOUT_RMSE_MPS gate was
@@ -781,6 +1071,21 @@ class Config:
     CENTROID_WEIGHTS = (1.0, 1.0, 1.0)   # (w_vx, w_vy, w_vz); future emphasis knob
     CENTROID_LOSS = 'l2'                  # 'l2' = mean of vector-L2-norms;
                                           # 'mse' = mean of squared components
+    # Which of the 125-point cube's velocities the TRAINING LOSS is scored
+    # on -- 'center' (default, current/historical behavior, UNCHANGED) =
+    # just CENTROID_TRIPLET_IDX=62, exactly as every existing arm/result
+    # (r36, trial 112, etc.) was trained and reported. 'center_plus_6' =
+    # mean over the centroid plus its 6 face-adjacent neighbors (7 points,
+    # CENTROID_WEIGHTS still applied per-axis, uniformly across all 7).
+    # 'all125' = mean over the full cube, with the centroid up-weighted by
+    # CENTROID_LOSS_CENTER_WEIGHT relative to the other 124 (each at 1.0).
+    # Deliberately does NOT touch decode_centroid() or any EVAL/rollout/
+    # persistence code path (all of which call decode_centroid() directly,
+    # not centroid_velocity_loss()) -- changing what the model is TRAINED
+    # on must not change what "improvement_pct"/"rollout_mse" MEAN, or
+    # every historical result stops being comparable to new ones.
+    CENTROID_LOSS_POINTS = 'center'      # 'center' | 'center_plus_6' | 'all125' | 'distance_weighted'
+    CENTROID_LOSS_CENTER_WEIGHT = 10.0   # used by 'all125' (flat) and 'distance_weighted' (falloff scale)
     # _rollout_best.pt promotion gate: a rollout MSE that merely improves on
     # this run's own history is NOT sufficient -- it must also beat the
     # persistence baseline (see train()'s rollout-best block). This is a
@@ -797,12 +1102,16 @@ class Config:
     SEED = 1337
     ARM = 'a0_control'
     SWEEP_ROUND = 1
-    # Convention (OVERVIEW.md v4.1): WANDB_PROJECT's trailing `_vN` tracks
-    # OVERVIEW.md's latest documented MAJOR version only -- bump it when
-    # OVERVIEW.md crosses a new major boundary (v4.x -> v5.0), not on
-    # every point release. Kept in sync by
-    # tests/test_version_sync.py.
-    WANDB_PROJECT = "NI_Review_v6"
+    # Renamed from "NI_Review_v8" (OVERVIEW.md v9.1) -- a deliberate
+    # rebrand, not a version bump: every prior run under "NI_Review_*"
+    # is left alone in wandb, new runs land under this name/project
+    # going forward. This RETIRES the old OVERVIEW.md-v4.1 convention
+    # ("_vN" tracks OVERVIEW.md's latest documented major version) --
+    # "_v1" here is this NEW project name's own independent version 1,
+    # not tied to OVERVIEW.md's version at all anymore. See
+    # tests/test_version_sync.py, which no longer enforces the
+    # old equality check for exactly this reason.
+    WANDB_PROJECT = "Persistence_Linear_v1"
     # Set to a short label (e.g. "v5_stability") to have wandb group several
     # concurrently-launched runs together in its UI (native multi-run
     # comparison view) -- see OVERVIEW.md v5.0. None (default) omits the
@@ -1170,6 +1479,495 @@ ROUND2_ARMS = {
                                                 "RIDGE_DISTILL_WEIGHT": 0.5}},
         },
     },
+    # ---------------------------------------------------------------- branch M
+    "M": {
+        "title": "Objective mismatch: teacher-forced-dominant training vs "
+                 "full-AR-rollout scoring (OVERVIEW.md v7.3, §40.2)",
+        "arms": {
+            # §40.2 names this explicitly as the next real research question,
+            # NOT a --set sweep on the current recipe: every arm through h11
+            # trains mostly teacher-forced, with the AR rollout loss as a
+            # light additive augmentation, then gets scored on a full AR
+            # rollout it was never directly, heavily optimized against.
+            # Scoping this corrected an assumption along the way: on CUDA,
+            # accum_steps == virtual_batch // micro_batch == 1 (CUDA sets
+            # virtual_batch == micro_batch), so the `micro == 0`-only AR gate
+            # in the training loop is a no-op wherever AR actually runs --
+            # it only matters on MPS/CPU, where frame_ar is disabled anyway.
+            # The real "AR is a light touch" mechanism on CUDA is AR_SEQS
+            # (only 2 of a 64-row batch get the sequential AR rollout) plus
+            # AR always being purely additive on top of a fixed-weight
+            # teacher-forced loss. Each arm below changes exactly one of
+            # those axes against h9_ar_freq1's exact config (same
+            # one-variable-at-a-time discipline as branch V), so a result
+            # pattern identifies which axis actually matters, before m3
+            # combines all three into the real hypothesis test.
+            "m1_ar_weight": {"desc": "h9_ar_freq1's exact config with AR_LOSS_WEIGHT 1.0 -> 3.0 "
+                                     "-- isolates whether simply weighting the existing AR loss "
+                                     "term more heavily (same horizon, same AR_SEQS, same "
+                                     "warmup fraction) moves the needle at all.",
+                             "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                           "AR_FRAMES": 8, "AR_SEQS": 2,
+                                           "AR_EVERY_N_STEPS": 1}},
+            "m2_ar_curriculum": {"desc": "h9_ar_freq1's exact config with a faster, earlier "
+                                         "rollout-horizon curriculum than h11's "
+                                         "(AR_FRAMES_START 2->1, AR_FRAMES_WARMUP_FRAC 0.3->0.1) "
+                                         "-- reaches the full 8-frame horizon sooner and spends "
+                                         "more of the run training against it, weight left at "
+                                         "h9's 1.0 so this isolates the curriculum-timing axis "
+                                         "on its own.",
+                                 "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 1.0,
+                                               "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                               "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                               "AR_SEQS": 2, "AR_EVERY_N_STEPS": 1}},
+            "m3_ar_combined": {"desc": "The actual §40.2 hypothesis test: m1 + m2 combined, "
+                                       "plus a much larger AR_SEQS (6-8x h9/h11's 2) so more of "
+                                       "the batch is scored under a real rollout each step, with "
+                                       "a correspondingly faster AR_WEIGHT_WARMUP_FRAC 0.2->0.05 "
+                                       "so the heavier weight also arrives earlier -- a "
+                                       "combination never tried before. h5_ar_moreseqs (branch "
+                                       "H) and v3_h9_moreseqs (branch V) only pushed AR_SEQS to "
+                                       "8, at AR_EVERY_N_STEPS=8 and 1 respectively, with no "
+                                       "curriculum and no extra weight. A pre-launch memory "
+                                       "ESTIMATE (single calibration point, linearly "
+                                       "extrapolated) put AR_SEQS=16 at ~162GB (over an H200's "
+                                       "141GB), so this arm briefly shipped at AR_SEQS=12 "
+                                       "instead. A real cold-start run on H200 (2026-09-16, "
+                                       "WANDB_GROUP=Storage, completed all 2500 steps) then "
+                                       "MEASURED steady-state usage at only 63.6GB/143.8GB (44%) "
+                                       "-- AT AR_SEQS=12, confirmed directly from that run's own "
+                                       "dumped Config, NOT 16 as an earlier pass of this file's "
+                                       "desc/OVERVIEW.md briefly and incorrectly reported (the "
+                                       "code had already been edited back to 16 locally by the "
+                                       "time that run's result came back, and the two got "
+                                       "conflated). AR_SEQS=16 has NEVER actually been run -- "
+                                       "current value here reflects that still-UNCONFIRMED bet, "
+                                       "not a repeat of the confirmed-safe 12. Even the more "
+                                       "cautious 12-estimate (~126GB) overshot the real 63.6GB by "
+                                       "~2x, so 16 likely fits too, but that's still extrapolation "
+                                       "on top of a correction, not evidence -- see OVERVIEW.md "
+                                       "v7.6. That same confirmed run peaked at +34.4% (step 500) "
+                                       "and declined to +19.0% by step 2500 -- a 4th confirmed "
+                                       "instance of §39's overfitting/rollout-drift pattern, "
+                                       "notably earlier (20% into budget vs. 33-67% for s7/h11/ "
+                                       "s8) than any prior case. If AR_SEQS=16 OOMs, 12 "
+                                       "(confirmed real, produced that result) or 8 "
+                                       "(h5_ar_moreseqs's own proven ceiling) are the fallbacks.",
+                               "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                             "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                             "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                             "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                             "AR_SEQS": 16, "AR_EVERY_N_STEPS": 1}},
+            "m4_ar_combined_dropout": {"desc": "m3_ar_combined's exact config with DROPOUT "
+                                               "0.01->0.1 (default->10x, matching branch G's "
+                                               "g1_dropout value) -- isolates dropout alone as "
+                                               "the regularizer, not the combined WD+dropout=0.05 "
+                                               "bump §39.1 already tested on h11/s8. m3's own "
+                                               "first real run (OVERVIEW.md §46) is a 4th "
+                                               "confirmed instance of §39's overfitting/rollout-"
+                                               "drift pattern (peak +34.4% at step 500 of 2500, "
+                                               "declined to +19.0% by the end, at the standard "
+                                               "DROPOUT=0.01/WEIGHT_DECAY=0.01) -- §39.1 already "
+                                               "showed regularization measurably slows (not yet "
+                                               "reverses) that decline on h11/s8, so this is the "
+                                               "already-proven next lever, not a new idea.",
+                                       "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                     "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                     "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                     "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                     "AR_SEQS": 16, "AR_EVERY_N_STEPS": 1,
+                                                     "DROPOUT": 0.1}},
+            "m5_ar_combined_dropout03": {"desc": "m3_ar_combined's exact config with DROPOUT "
+                                                 "0.01->0.03 (gentler than m4's 0.1, which "
+                                                 "measured -137.4% and never promoted at all -- "
+                                                 "OVERVIEW.md §47). ALSO bumps "
+                                                 "EARLY_STOP_PATIENCE_STEPS 500->1500 (3 eval "
+                                                 "windows instead of 1): m4's own result is "
+                                                 "confounded by patience=500 (tuned around m3's "
+                                                 "OWN fast-promoting behavior) killing it after "
+                                                 "exactly ONE eval, before a slower-to-converge "
+                                                 "regularized variant could plausibly promote at "
+                                                 "all -- dropout is EXPECTED to slow early "
+                                                 "convergence as the tradeoff for a slower later "
+                                                 "decline (§39.1's own framing), so judging it on "
+                                                 "a single eval window isn't a fair test regardless "
+                                                 "of DROPOUT's value. IMPORTANT: this override only "
+                                                 "takes effect when the trainer is invoked WITHOUT "
+                                                 "an explicit --early-stop-patience-steps flag (CLI "
+                                                 "beats the arm) -- singleshot/provision_and_run.sh "
+                                                 "now ALWAYS passes that flag (defaulting to 500, "
+                                                 "OVERVIEW.md §46), which would silently clobber "
+                                                 "this 1500 back down to 500. Launching this arm "
+                                                 "through that script REQUIRES also setting "
+                                                 "EARLY_STOP_PATIENCE_STEPS=1500 as an env var on "
+                                                 "the launch command itself, or this whole fix is a "
+                                                 "no-op.",
+                                         "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                       "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                       "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                       "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                       "AR_SEQS": 16, "AR_EVERY_N_STEPS": 1,
+                                                       "DROPOUT": 0.03,
+                                                       "EARLY_STOP_PATIENCE_STEPS": 1500}},
+        },
+    },
+    # ---------------------------------------------------------------- branch P
+    "P": {
+        "title": "Does the optimizer family itself matter, or is AdamW fine "
+                 "(OVERVIEW.md v7.9, §40.2 follow-up)",
+        "arms": {
+            # AdamW has been the ONLY optimizer used across every arm in this
+            # entire investigation (45+ arms) -- never questioned, never
+            # compared against an alternative. m5_ar_combined_dropout03's
+            # exact AR/dropout recipe is the best-known result so far (peak
+            # +38.6% at step 500, OVERVIEW.md §48) -- these three arms hold
+            # that recipe fixed and vary ONLY the optimizer, each control's
+            # own LR/WD set per that optimizer's own published tuning
+            # guidance (see each arm's desc), not just re-using AdamW's
+            # values under a different optimizer name.
+            #
+            # AR_SEQS=6 here, NOT m5's own 16 -- OVERVIEW.md v7.10/v7.13:
+            # the first real 3-way concurrent launch at AR_SEQS=16 OOM'd
+            # (all three co-located on one H200, per provision_and_run.sh's
+            # own "multiple experiments concurrently" feature); dropping to
+            # AR_SEQS=8 reduced but did NOT confirm-fix the risk, and
+            # p2_bestyet_lion's second real 3-way launch crashed cleanly
+            # (an absent, not stale, run lock -- a caught
+            # torch.OutOfMemoryError, not the OOM-killer) around step
+            # 250-275 while p1/p3 were also running; a solo/2-way repro of
+            # the same arm ran past that point with no error, pointing at
+            # 3-way memory contention rather than a Lion-specific bug
+            # (§v7.13, evidence is circumstantial, not proven -- the
+            # traceback itself was never recovered). AR_SEQS=6 is lower
+            # than the still-open AR_SEQS=8 risk and further from the one
+            # real solo measurement that exists (AR_SEQS=12 ->
+            # 63.6GB/143.8GB, §48) -- still not a confirmed-safe number for
+            # 3-way concurrency (nobody has measured 3x AR_SEQS=6
+            # co-located), just a further reduction in the same direction.
+            # If it OOMs/crashes again, the fallback is separate pods per
+            # arm (no code change needed -- three separate
+            # provision_and_run.sh invocations instead of one 3-slot
+            # concurrent one), not another guess at a smaller AR_SEQS.
+            # provision_and_run.sh's launch_training() now also tees each
+            # arm's full output to sweep_logs/r{round}_{arm}.log on the pod
+            # (§v7.13), so a future crash's actual traceback survives the
+            # pod's termination instead of being lost like this one was.
+            #
+            # EARLY_STOP_PATIENCE_STEPS=1500 on every arm below -- m5 itself
+            # already discovered and fixed this exact trap (see m5's own
+            # "desc" above) but these three arms were copied from m5's AR/
+            # dropout recipe WITHOUT carrying that override forward, so they
+            # silently fell back to provision_and_run.sh's own default of
+            # 500. With --val-every 500, patience=500 means "if the very
+            # FIRST evaluation doesn't promote, stop immediately" -- exactly
+            # what happened to p1_bestyet_adamw's first real launch (§v7.13
+            # follow-up): early-stopped at step 500 with improvement_pct
+            # -21.5%, never getting a second eval window. 1500 (3 eval
+            # windows) matches m5's own fix. SAME CAVEAT AS M5'S, still not
+            # sidestepped by putting it in the arm dict: apply_arm() runs
+            # BEFORE main()'s CLI-args loop, and "CLI beats the arm" is
+            # enforced unconditionally there (`if value is not None:
+            # setattr(...)`) -- provision_and_run.sh ALWAYS passes
+            # --early-stop-patience-steps (defaulting to 500), so this 1500
+            # gets silently clobbered back down to 500 unless the LAUNCH
+            # COMMAND ITSELF also sets EARLY_STOP_PATIENCE_STEPS=1500 as an
+            # env var. Baking it into the arm dict here still helps (covers
+            # a direct/manual invocation that skips provision_and_run.sh
+            # entirely), but launching branch P through that script
+            # REQUIRES the env var too, exactly like m5.
+            "p1_bestyet_adamw": {"desc": "m5_ar_combined_dropout03's exact recipe again, under "
+                                        "a new arm name so all three optimizer arms land as "
+                                        "siblings in wandb/saved_models/ for a clean 3-way "
+                                        "comparison rather than reusing m5's own history. The "
+                                        "control: no optimizer/LR/WD change from m5 (AR_SEQS "
+                                        "6, not m5's 16 -- see branch comment above).",
+                                 "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                               "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                               "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                               "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                               "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                               "DROPOUT": 0.03, "OPTIMIZER": "adamw",
+                                               "EARLY_STOP_PATIENCE_STEPS": 1500}},
+            "p2_bestyet_lion": {"desc": "m5's exact AR/dropout recipe (AR_SEQS 6, not m5's 16 "
+                                       "-- see branch comment above), OPTIMIZER='lion' "
+                                       "(lucidrains/lion-pytorch). Per Lion's own README "
+                                       "tuning guidance: LR should be 3-10x smaller than the "
+                                       "AdamW LR it replaces, WD correspondingly 3-10x larger "
+                                       "(effective decay is lr*wd) -- picked the middle of "
+                                       "that range: LEARNING_RATE 1e-3->2e-4 (5x smaller), "
+                                       "WEIGHT_DECAY 0.01->0.05 (5x larger). Lion's own "
+                                       "recommended betas (0.9, 0.99) differ from AdamW's "
+                                       "(0.9, 0.95) here -- see Config.LION_BETAS.",
+                                "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                              "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                              "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                              "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                              "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                              "DROPOUT": 0.03, "OPTIMIZER": "lion",
+                                              "LEARNING_RATE": 2e-4, "WEIGHT_DECAY": 0.05,
+                                              "EARLY_STOP_PATIENCE_STEPS": 1500}},
+            "p3_bestyet_sophia": {"desc": "m5's exact AR/dropout recipe (AR_SEQS 6, not m5's "
+                                         "16 -- see branch comment above), OPTIMIZER='sophia' "
+                                         "(the sophia-opt package, a packaged fork of the "
+                                         "official Liuhong99/Sophia reference implementation). "
+                                         "Per Sophia's own README: LR slightly smaller than the "
+                                         "AdamW LR it replaces -- LEARNING_RATE 1e-3->8e-4. "
+                                         "Sophia's own betas/rho/weight_decay defaults (0.965, "
+                                         "0.99 / 0.04 / 0.1) are used via the dedicated "
+                                         "Config.SOPHIA_* fields, not AdamW's WEIGHT_DECAY. "
+                                         "NOTE on the Hessian estimate: sophia_opt's own "
+                                         "update_hessian() just EMAs the squared gradient "
+                                         "already sitting in .grad -- it does NOT require the "
+                                         "original repo's LM-training-script convention of "
+                                         "resampling a synthetic categorical label (that's a "
+                                         "training-script choice for cross-entropy heads, not "
+                                         "something the optimizer primitive itself needs), so "
+                                         "this arm's periodic refresh (every "
+                                         "SOPHIA_HESSIAN_UPDATE_EVERY=10 steps) reuses the SAME "
+                                         "real regression-loss gradient the ordinary update "
+                                         "already computed -- a standard, not an ad hoc, use of "
+                                         "the exposed primitive.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                               "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                               "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                               "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                               "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                               "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                               "LEARNING_RATE": 8e-4,
+                                               "EARLY_STOP_PATIENCE_STEPS": 1500}},
+        },
+    },
+    # ---------------------------------------------------------------- branch Q
+    "Q": {
+        "title": "Phase 2 'bigger lever' menu (OVERVIEW.md v7.9 §49.2, v7.18) -- "
+                 "three ways to attack the peak-early/decay exposure-bias shape, "
+                 "each layered on p3_bestyet_sophia (the surviving best-so-far "
+                 "config, +38.5% and still promoting when cut off, §57)",
+        "arms": {
+            # All three below share p3_bestyet_sophia's exact base recipe
+            # (AR_MODE/AR_LOSS_WEIGHT/AR_WEIGHT_WARMUP_FRAC/AR_FRAMES*/AR_SEQS/
+            # AR_EVERY_N_STEPS/DROPOUT/OPTIMIZER=sophia/LEARNING_RATE/
+            # EARLY_STOP_PATIENCE_STEPS -- see branch P's own comment above for
+            # why AR_SEQS=6 and why EARLY_STOP_PATIENCE_STEPS must ALSO be
+            # passed as a launch-time env var, since apply_arm() runs before
+            # main()'s CLI-args loop and provision_and_run.sh always passes
+            # --early-stop-patience-steps itself), varying ONLY the one new
+            # Phase-2 axis each arm is named for -- same one-variable-at-a-time
+            # discipline as every other branch here.
+            "q1_sophia_ema": {"desc": "Phase 2 menu item 1: EMA of weights on top of "
+                                      "p3_bestyet_sophia. Lowest cost of the three (no "
+                                      "architecture/loss change) and the most direct match "
+                                      "for the 'peaks early, drifts after' shape this "
+                                      "investigation keeps finding (§39/§46/§48) -- EMA'd "
+                                      "weights are evaluated as the primary rollout metric "
+                                      "each eval (raw non-EMA numbers kept as raw_* for "
+                                      "comparison only, see q1_sophia_ema's own runtime "
+                                      "comments). EMA_DECAY corrected 0.999->0.98 after this "
+                                      "arm's first real launch (OVERVIEW.md v7.19): 0.999's "
+                                      "~693-step half-life never caught up to the raw "
+                                      "trajectory within the run's own 1500-step early-stop "
+                                      "(EMA-gated improvement_pct=-182.7%, never promoted once, "
+                                      "vs. the SAME checkpoint's raw_improvement_pct=+41.9% -- "
+                                      "the best number of the whole session), and because the "
+                                      "EMA metric gates promotion/early-stop, the run stopped "
+                                      "itself on a shadow that was still catching up, not a "
+                                      "genuine plateau. 0.98 is a ~34-step half-life -- long "
+                                      "enough to smooth over noise between the AR curriculum's "
+                                      "own 250-step ramp-up, short enough to have converged well "
+                                      "before the first --val-every 500 eval.",
+                              "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                            "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                            "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                            "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                            "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                            "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                            "LEARNING_RATE": 8e-4,
+                                            "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                            "EMA_DECAY": 0.98}},
+            "q2_sophia_auxhead": {"desc": "Phase 2 menu item 2: a non-autoregressive "
+                                         "multi-horizon auxiliary head on top of "
+                                         "p3_bestyet_sophia -- 'the way to bypass error "
+                                         "compounding entirely rather than manage it' "
+                                         "(§32.2 item 4, never built before this branch). "
+                                         "AUX_HEAD_FRAMES=8 matches AR_FRAMES's own horizon "
+                                         "so the auxiliary loss and the AR rollout loss "
+                                         "supervise the same look-ahead distance. "
+                                         "AUX_HEAD_LOSS_WEIGHT=1.0 (default, additive "
+                                         "alongside TF and AR losses, not a replacement for "
+                                         "either) -- see aux_horizon_loss()'s own docstring "
+                                         "for why this has none of h10_ridge_residual's "
+                                         "expansive-anchor-in-a-loop risk (no feedback loop "
+                                         "at all, single forward pass). TOKENIZATION='frame' "
+                                         "added after this arm's first real launch crashed at "
+                                         "step 0 (OVERVIEW.md v7.19): aux_horizon_loss() only "
+                                         "supports frame-native models, but AR_MODE='frame_ar' "
+                                         "alone does NOT imply frame tokenization -- p1/p2/p3/ "
+                                         "q1/q3 all ran AR_MODE='frame_ar' on the default "
+                                         "TOKENIZATION='token' successfully, so this arm's own "
+                                         "desc wrongly assumed the base recipe was already "
+                                         "frame-native. Genuinely a second simultaneous change "
+                                         "(tokenization AND aux head), not a pure isolation of "
+                                         "the aux-head axis alone -- unavoidable, since the aux "
+                                         "head has no token-native code path at all.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                                "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                                "LEARNING_RATE": 8e-4,
+                                                "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                                "TOKENIZATION": "frame",
+                                                "AUX_HEAD_FRAMES": 8,
+                                                "AUX_HEAD_LOSS_WEIGHT": 1.0}},
+            "q3_sophia_rollout_dominant": {"desc": "Phase 2 menu item 3: make the loss "
+                                                   "ACTUALLY rollout-dominant rather than "
+                                                   "teacher-forced-dominant-plus-AR-add-on -- "
+                                                   "the still-unbuilt second half of §40.2's "
+                                                   "original hypothesis (branch M only ever "
+                                                   "ADDED AR loss on top of a fixed-weight TF "
+                                                   "loss, never actually flipped the balance). "
+                                                   "TF_LOSS_WEIGHT 1.0->0.3 against "
+                                                   "AR_LOSS_WEIGHT's already-elevated 3.0 -- a "
+                                                   "10x tilt toward the rollout term, not a "
+                                                   "full replacement (TF_LOSS_WEIGHT=0 would "
+                                                   "remove the one loss component that has no "
+                                                   "feedback-loop exposure at all, which isn't "
+                                                   "this arm's intent).",
+                                            "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                          "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                          "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                          "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                          "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                                          "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                                          "LEARNING_RATE": 8e-4,
+                                                          "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                                          "TF_LOSS_WEIGHT": 0.3}},
+        },
+    },
+    # ---------------------------------------------------------------- branch R
+    # NOTE: named "U" not "R" -- branch letter "R" was already taken (an
+    # earlier, unrelated branch below, "A linear map beats the transformer").
+    # A first attempt at this branch silently shadowed that one (later dict
+    # literal key wins), which made resolve_arm('r1_spatial_smooth') return
+    # the WRONG branch's arms until tests/test_branch_r_arms.py's collision
+    # check caught it (OVERVIEW.md v7.20 follow-up).
+    "U": {
+        "title": "Soft spatial-consistency penalty (OVERVIEW.md v7.20, §32.2 "
+                 "item 5) on top of p3_bestyet_sophia -- NOT real PINN, see "
+                 "spatial_smoothness_loss()'s own docstring for the contrast",
+        "arms": {
+            "r1_spatial_smooth": {"desc": "First real test of branch U's new "
+                                          "spatial_smoothness_loss() -- a self-referential "
+                                          "TV-style penalty between neighboring x-stations' "
+                                          "predicted centroid triplets, no ground truth "
+                                          "involved. Layered on p3_bestyet_sophia's exact base "
+                                          "recipe (the surviving best-so-far config, §57/59) "
+                                          "plus TOKENIZATION='frame' (required -- "
+                                          "spatial_smoothness_loss() has no per-x-station axis "
+                                          "to compare under token tokenization, same scoping "
+                                          "as q2_sophia_auxhead). SPATIAL_SMOOTH_WEIGHT=0.1 "
+                                          "with a 5%% warmup (mirrors AR_WEIGHT_WARMUP_FRAC's "
+                                          "own convention) -- a modest starting weight since "
+                                          "this term's real scale against the primary loss has "
+                                          "never been measured on a trained (non-random-init) "
+                                          "model; OVERVIEW.md v7.20's own MPS smoke test only "
+                                          "confirmed the mechanism produces a finite, "
+                                          "differentiable loss (~2.37 at random init), not what "
+                                          "a well-tuned weight looks like once the model has "
+                                          "actually learned anything.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                                "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                                "LEARNING_RATE": 8e-4,
+                                                "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                                "TOKENIZATION": "frame",
+                                                "SPATIAL_SMOOTH_WEIGHT": 0.1,
+                                                "SPATIAL_SMOOTH_WARMUP_FRAC": 0.05}},
+            "u2_frame_control": {"desc": "OVERVIEW.md v7.21: isolates frame tokenization's "
+                                         "own effect from r1_spatial_smooth's new loss term -- "
+                                         "r1 and q2_sophia_auxhead both switched "
+                                         "TOKENIZATION='frame' AT THE SAME TIME as introducing "
+                                         "their own new mechanism, so there was never a clean "
+                                         "'p3_bestyet_sophia + frame tokenization, nothing else "
+                                         "new' control. Identical to p3_bestyet_sophia except "
+                                         "TOKENIZATION='frame' -- SPATIAL_SMOOTH_WEIGHT and "
+                                         "AUX_HEAD_FRAMES both left at their 0.0 defaults.",
+                                  "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                                "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                                "LEARNING_RATE": 8e-4,
+                                                "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                                "TOKENIZATION": "frame"}},
+            "u3_frame_rollout_dominant": {"desc": "OVERVIEW.md v7.21: q3_sophia_"
+                                                  "rollout_dominant's own TF_LOSS_WEIGHT=0.3 "
+                                                  "rollout-dominant loss balance, combined with "
+                                                  "TOKENIZATION='frame' for the first time -- "
+                                                  "q3 itself ran token-native only. Directly "
+                                                  "comparable to u2_frame_control (isolates "
+                                                  "TF_LOSS_WEIGHT's own effect once frame "
+                                                  "tokenization is already the base) and to the "
+                                                  "original token-native q3 (isolates "
+                                                  "tokenization's effect on the same loss "
+                                                  "balance). Cheap to add: no new code, just "
+                                                  "combining two already-tested axes.",
+                                          "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                                        "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                                        "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                                        "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                                        "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                                        "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                                        "LEARNING_RATE": 8e-4,
+                                                        "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                                        "TOKENIZATION": "frame",
+                                                        "TF_LOSS_WEIGHT": 0.3}},
+        },
+    },
+    # NOTE: named "W" not "S" -- branch letter "S" was already taken (an
+    # earlier, unrelated branch), same collision-avoidance reasoning as
+    # branch U's own note above.
+    # ---------------------------------------------------------------- branch W
+    "W": {
+        "title": "AROpt-style accept/reject rollout stabilization (OVERVIEW.md "
+                 "v7.21, §32.2 item 7) on top of p3_bestyet_sophia + "
+                 "TOKENIZATION='frame' -- targets exposure bias directly instead "
+                 "of tuning around it",
+        "arms": {
+            "s1_aropt_frame": {"desc": "First real test of branch W's new AROpt-style "
+                                       "accept/reject feedback (Config.AROPT_TEMPERATURE). "
+                                       "Layered on the same p3_bestyet_sophia + "
+                                       "TOKENIZATION='frame' base as u2_frame_control -- "
+                                       "identical except AROPT_TEMPERATURE=0.1, so this is "
+                                       "directly comparable to u2_frame_control (isolates "
+                                       "the accept/reject mechanism's own effect) and to "
+                                       "r1_spatial_smooth (a different new axis on the same "
+                                       "base). 0.1 is a first-attempt value, not tuned -- "
+                                       "picked to be roughly the same order of magnitude as "
+                                       "this recipe's OWN per-step loss once past early "
+                                       "training (see OVERVIEW.md v7.21's own MPS smoke-test "
+                                       "note: at random init this temperature makes rejection "
+                                       "(ground-truth substitution) frequent, converging "
+                                       "toward mostly-accept as the model's own predictions "
+                                       "improve -- a plausible but unverified curriculum "
+                                       "effect, not a claimed result.",
+                              "overrides": {"AR_MODE": "frame_ar", "AR_LOSS_WEIGHT": 3.0,
+                                            "AR_WEIGHT_WARMUP_FRAC": 0.05,
+                                            "AR_FRAMES": 8, "AR_FRAMES_START": 1,
+                                            "AR_FRAMES_WARMUP_FRAC": 0.1,
+                                            "AR_SEQS": 6, "AR_EVERY_N_STEPS": 1,
+                                            "DROPOUT": 0.03, "OPTIMIZER": "sophia",
+                                            "LEARNING_RATE": 8e-4,
+                                            "EARLY_STOP_PATIENCE_STEPS": 1500,
+                                            "TOKENIZATION": "frame",
+                                            "AROPT_TEMPERATURE": 0.1}},
+        },
+    },
     # ---------------------------------------------------------------- branch V
     "V": {
         "title": "v5.0: is our best hope (h9_ar_freq1) actually stable, not just lucky",
@@ -1352,6 +2150,22 @@ def apply_arm(name):
     return spec
 
 
+def resolve_derived_config_fields():
+    """Recompute NUM_TIME/SEQ_LEN/VAL_ROLLOUT_STEPS after every override --
+    called once in main(), after arm/--set overrides are fully applied and
+    before anything (model construction, data loading) reads them.
+
+    HALF_TIME_MODE's halving MUST happen first, not after: SEQ_LEN and
+    VAL_ROLLOUT_STEPS both derive from NUM_TIME, so computing them before
+    the halving would leave them silently stale at the full-resolution
+    values (OVERVIEW.md v8.0).
+    """
+    if Config.HALF_TIME_MODE:
+        Config.NUM_TIME = Config.NUM_TIME // 2
+    Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
+    Config.VAL_ROLLOUT_STEPS = Config.NUM_X * (Config.NUM_TIME - Config.VAL_CONTEXT_STEPS)
+
+
 # --------------------------------------------------------------------------- #
 # Losses
 # --------------------------------------------------------------------------- #
@@ -1435,33 +2249,40 @@ def _load_decoder(device, cfg=Config, log=print):
     return entry
 
 
-def decode_centroid(latent, cfg=Config):
-    """`(..., 47) -> (..., 3)` via the frozen decoder, sliced at CENTROID_SLICE.
+def _decode_raw(latent, cfg=Config):
+    """`(..., 47) -> (..., 375)` via the frozen decoder, UNSLICED.
 
-    Assumes the decoder is already loadable onto `latent.device`. Preserves
-    all leading dimensions (batch, time, etc.) and returns the central
-    velocity triplet `(vx, vy, vz)` at index 62 of 125 spatial points.
+    Factored out of `decode_centroid()` so `centroid_velocity_loss()`'s
+    wider CENTROID_LOSS_POINTS modes ('center_plus_6'/'all125') can pull
+    additional triplets out of the SAME single decode call rather than
+    re-invoking the decoder once per point. `decode_centroid()` itself is
+    unchanged below (still just this call plus its original slice) --
+    every EVAL/rollout/persistence call site goes through
+    `decode_centroid()`, never this function directly, so none of them
+    are affected by anything CENTROID_LOSS_POINTS selects for training.
 
-    Forces float32 + disables CUDA autocast for just this call. This
-    function is called from inside train()'s per-step `with amp_ctx:`
-    block (a `torch.autocast('cuda', dtype=torch.bfloat16)` region), so by
-    the time the primary model's output reaches here it may already be
-    bf16 -- but the frozen decoder's weights (loaded via `torch.jit.load`,
-    never cast) are float32. Confirmed on H200/CUDA: without this guard,
-    `mod.decode(z_flat)` raises "mat1 and mat2 must have the same dtype,
-    but got BFloat16 and Float" on literally the first training step of
-    every CUDA arm. `device_type='cpu'` would NOT fix this -- autocast
-    state is tracked independently per device_type, so disabling only the
-    (inactive) cpu autocast leaves the ambient cuda autocast untouched;
-    the disable has to target 'cuda' specifically to actually override the
-    enclosing context. The decoder is frozen and never trained, so it
-    loses nothing by always running in full precision regardless of what
-    precision the rest of the step runs in.
+    Forces float32 + disables CUDA autocast for just this call -- see
+    `decode_centroid()`'s own docstring (unchanged below) for the full
+    "why" on this guard; identical reasoning applies here since this IS
+    that same decode call, just not yet sliced.
     """
     dec = _load_decoder(latent.device, cfg)
     with torch.autocast(device_type='cuda', enabled=False):
-        v = dec(latent.float())                          # (..., 375)
-    return v[..., CENTROID_SLICE]                         # (..., 3)
+        return dec(latent.float())                        # (..., 375)
+
+
+def decode_centroid(latent, cfg=Config):
+    """`(..., 47) -> (..., 3)` via the frozen decoder, sliced at CENTROID_SLICE.
+
+    Preserves all leading dimensions (batch, time, etc.) and returns the
+    central velocity triplet `(vx, vy, vz)` at index 62 of 125 spatial
+    points. Used by every EVAL/rollout/persistence-baseline call site in
+    this file -- deliberately UNAFFECTED by CENTROID_LOSS_POINTS (see
+    `centroid_velocity_loss()`), so "improvement_pct"/"rollout_mse" mean
+    the exact same thing regardless of what a given arm's TRAINING loss
+    was scored on, keeping every historical result comparable to new ones.
+    """
+    return _decode_raw(latent, cfg)[..., CENTROID_SLICE]   # (..., 3)
 
 
 def to_per_token_latent(t, cfg=Config):
@@ -1478,25 +2299,103 @@ def to_per_token_latent(t, cfg=Config):
     return t
 
 
+def _gather_triplets(decoded_375, idxs, cfg=Config):
+    """`(..., 375) -> (..., len(idxs), 3)` -- pull out an arbitrary set of
+    (vx,vy,vz) triplets by their 0-124 cube index. Shared by
+    `centroid_velocity_loss()`'s 'center_plus_6'/'all125' modes."""
+    idx_t = torch.as_tensor(idxs, device=decoded_375.device, dtype=torch.long)
+    starts = idx_t * 3
+    # (..., len(idxs), 3): gather each triplet's 3 contiguous channels.
+    offsets = torch.arange(3, device=decoded_375.device)
+    gather_idx = (starts.unsqueeze(-1) + offsets).reshape(-1)   # (len(idxs)*3,)
+    flat = decoded_375.index_select(-1, gather_idx)
+    return flat.reshape(*decoded_375.shape[:-1], len(idxs), 3)
+
+
 def centroid_velocity_loss(pred_latent, tgt_latent, cfg=Config):
     """Consistent L2-in-velocity-space training loss.
 
-    Decodes both latents through the frozen GEN3 AttentionSE decoder, takes
-    the central triplet (vx, vy, vz) at CENTROID_TRIPLET_IDX=62, applies the
-    per-dim weights from `cfg.CENTROID_WEIGHTS`, and returns the mean of the
-    per-token L2 norm of the weighted 3-vector error. Gradients flow through
-    the decoder (whose weights are frozen). `cfg.CENTROID_LOSS` selects
-    between `'l2'` (mean of vector-L2-norms, default) and `'mse'` (mean of
-    squared components). See OVERVIEW.md §10.9.7.
+    Decodes both latents through the frozen GEN3 AttentionSE decoder,
+    applies the per-dim weights from `cfg.CENTROID_WEIGHTS`, and returns
+    the mean of the per-token L2 norm (or MSE, per `cfg.CENTROID_LOSS`) of
+    the weighted velocity error. Gradients flow through the decoder (whose
+    weights are frozen).
+
+    `cfg.CENTROID_LOSS_POINTS` selects WHICH of the 125 spatial points
+    this is scored on (default 'center' = exactly the historical
+    behavior, just the central triplet at CENTROID_TRIPLET_IDX=62):
+      - 'center'        : unchanged original behavior (see above).
+      - 'center_plus_6' : mean over the centroid + its 6 face-adjacent
+                          neighbors (CENTROID_NEIGHBOR_TRIPLET_IDXS),
+                          uniformly weighted.
+      - 'all125'        : mean over the full cube, with the centroid
+                          up-weighted by `cfg.CENTROID_LOSS_CENTER_WEIGHT`
+                          relative to the other 124 (each at weight 1.0).
+      - 'distance_weighted' : mean over the full cube, weight per point =
+                          `cfg.CENTROID_LOSS_CENTER_WEIGHT / (1 + dist)`
+                          where `dist` is the point's Euclidean grid
+                          distance from the centroid (CENTROID_DISTANCES).
+                          A smooth falloff instead of 'center_plus_6's
+                          hard 7-point cutoff or 'all125's binary
+                          center/non-center split.
+    Deliberately does NOT affect `decode_centroid()` or anything that
+    calls it (every eval/rollout/persistence-baseline site) -- only this
+    training-loss function's own point selection changes. See
+    OVERVIEW.md §10.9.7 (original) and §73 (this extension).
     """
-    pv = decode_centroid(pred_latent, cfg)               # (..., 3)
-    tv = decode_centroid(tgt_latent, cfg)                # (..., 3)
-    w = torch.tensor(getattr(cfg, 'CENTROID_WEIGHTS', (1.0, 1.0, 1.0)),
-                     device=pv.device, dtype=pv.dtype)
-    err = (pv - tv) * w                                   # (..., 3)
+    points_mode = getattr(cfg, 'CENTROID_LOSS_POINTS', 'center')
+    w = None  # set per-branch below; per-axis (vx,vy,vz) weights, applied uniformly across whichever points are selected
+
+    if points_mode == 'center':
+        pv = decode_centroid(pred_latent, cfg)               # (..., 3)
+        tv = decode_centroid(tgt_latent, cfg)                # (..., 3)
+        w = torch.tensor(getattr(cfg, 'CENTROID_WEIGHTS', (1.0, 1.0, 1.0)),
+                         device=pv.device, dtype=pv.dtype)
+        err = (pv - tv) * w                                   # (..., 3)
+        if getattr(cfg, 'CENTROID_LOSS', 'l2') == 'mse':
+            return err.pow(2).mean()
+        return torch.linalg.vector_norm(err, dim=-1).mean()
+
+    if points_mode == 'center_plus_6':
+        idxs = (CENTROID_TRIPLET_IDX,) + CENTROID_NEIGHBOR_TRIPLET_IDXS   # 7 points
+        point_weights = None   # uniform across all 7 -- plain mean
+    elif points_mode == 'all125':
+        idxs = tuple(range(N_TRIPLETS))
+        center_w = float(getattr(cfg, 'CENTROID_LOSS_CENTER_WEIGHT', 10.0))
+        point_weights = [center_w if i == CENTROID_TRIPLET_IDX else 1.0 for i in idxs]
+    elif points_mode == 'distance_weighted':
+        idxs = tuple(range(N_TRIPLETS))
+        center_w = float(getattr(cfg, 'CENTROID_LOSS_CENTER_WEIGHT', 10.0))
+        point_weights = [center_w / (1.0 + CENTROID_DISTANCES[i]) for i in idxs]
+    else:
+        raise ValueError(f"unknown CENTROID_LOSS_POINTS={points_mode!r} "
+                         f"(expected 'center', 'center_plus_6', 'all125', "
+                         f"or 'distance_weighted')")
+
+    pred_full = _decode_raw(pred_latent, cfg)             # (..., 375)
+    tgt_full = _decode_raw(tgt_latent, cfg)
+    pv = _gather_triplets(pred_full, idxs, cfg)           # (..., P, 3)
+    tv = _gather_triplets(tgt_full, idxs, cfg)
+    axis_w = torch.tensor(getattr(cfg, 'CENTROID_WEIGHTS', (1.0, 1.0, 1.0)),
+                          device=pv.device, dtype=pv.dtype)
+    err = (pv - tv) * axis_w                              # (..., P, 3)
     if getattr(cfg, 'CENTROID_LOSS', 'l2') == 'mse':
-        return err.pow(2).mean()
-    return torch.linalg.vector_norm(err, dim=-1).mean()
+        per_point = err.pow(2).mean(dim=-1)               # (..., P)
+    else:
+        per_point = torch.linalg.vector_norm(err, dim=-1)  # (..., P)
+
+    if point_weights is None:
+        return per_point.mean()
+    pw = torch.tensor(point_weights, device=per_point.device, dtype=per_point.dtype)
+    # Weighted mean across the P axis (the last one here), NOT a plain
+    # mean -- the centroid's error counts CENTROID_LOSS_CENTER_WEIGHT
+    # times as much as any single one of the other 124 points'. `.mean()`
+    # (no args) at the end collapses every remaining leading dim (batch,
+    # time, ...) to the single scalar a loss must be -- matching the
+    # 'center' branch's own final `.mean()` above, which does the same
+    # collapse in one step since it has no separate points axis to
+    # reduce first.
+    return ((per_point * pw).sum(dim=-1) / pw.sum()).mean()
 
 
 def ridge_distill_targets(ground_truth_lat, ridge_A, cfg):
@@ -1616,6 +2515,174 @@ def centroid_per_dim_errors(pred_latent, tgt_latent, cfg=Config):
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
+def _read_h5_dataset_threaded(h5_path, dataset_key, length, n_threads=8, log=print):
+    """Read `f[dataset_key][:length]` via `n_threads` concurrent read-only
+    HDF5 file handles instead of one single-threaded sequential read
+    (OVERVIEW.md v7.20 follow-up -- diagnosed live: the data-load "warm-up"
+    at the start of every run was one CPU core, slowly, reading ~10-14 GiB
+    off the network volume).
+
+    `train_80.h5`/`val_80.h5` are chunked ONE ROW PER CHUNK (`chunks=(1,
+    NUM_TIME, NUM_X, INPUT_DIM)`, confirmed via `h5py.Dataset.chunks`) --
+    concurrent threads reading disjoint, chunk-aligned row ranges never
+    contend on a partial chunk. Each thread opens its OWN read-only file
+    handle rather than sharing one `h5py.File`/`Dataset` across threads
+    (not guaranteed thread-safe without a special libhdf5 build) --
+    multiple independent read-only handles to the same file are safe.
+    Overlapping I/O latency across threads is the same rationale
+    `scp_data_files.sh`'s own `LANES` already exploits for the network-
+    volume TRANSFER itself (confirmed ~268 MB/s at 10 lanes vs. far less
+    single-threaded, `singleshot/README.md`) -- this applies the same idea
+    to the READ side once the file has already landed on the pod.
+
+    Falls back to a single sequential read on `n_threads<=1` or any
+    exception, so this can only ever be as reliable as the old behavior,
+    never less.
+    """
+    t0 = time.time()
+    n_bytes_est = None
+    with h5py.File(h5_path, 'r') as f:
+        shape = f[dataset_key].shape
+        dtype = f[dataset_key].dtype
+    row_bytes = int(np.prod(shape[1:])) * np.dtype(dtype).itemsize
+    n_bytes_est = row_bytes * length
+    log(f"  [data]   reading {os.path.basename(h5_path)} rows[0:{length}] "
+        f"({n_bytes_est / 1e9:.2f} GB) from disk, n_threads={n_threads} ...")
+    if n_threads <= 1:
+        with h5py.File(h5_path, 'r') as f:
+            out = f[dataset_key][:length]
+        log(f"  [data]   {os.path.basename(h5_path)} read done in "
+            f"{time.time() - t0:.1f}s ({n_bytes_est / 1e9 / max(time.time() - t0, 1e-6):.2f} GB/s, single-threaded)")
+        return out
+    out = np.empty((length,) + shape[1:], dtype=dtype)
+    bounds = np.linspace(0, length, n_threads + 1, dtype=int)
+    ranges = [(int(bounds[i]), int(bounds[i + 1])) for i in range(n_threads)]
+    ranges = [(lo, hi) for lo, hi in ranges if hi > lo]
+
+    def _read_chunk(lo, hi):
+        with h5py.File(h5_path, 'r') as f:
+            out[lo:hi] = f[dataset_key][lo:hi]
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as ex:
+            for fut in [ex.submit(_read_chunk, lo, hi) for lo, hi in ranges]:
+                fut.result()
+    except Exception as e:
+        log(f"  [data] threaded read failed ({type(e).__name__}: {e}) -- "
+            f"falling back to a single sequential read")
+        with h5py.File(h5_path, 'r') as f:
+            out[:] = f[dataset_key][:length]
+    elapsed = time.time() - t0
+    log(f"  [data]   {os.path.basename(h5_path)} read done in {elapsed:.1f}s "
+        f"({n_bytes_est / 1e9 / max(elapsed, 1e-6):.2f} GB/s across {len(ranges)} threads)")
+    return out
+
+
+def raw_binary_sibling_paths(h5_path):
+    """Path convention for a flat raw-binary mirror of an HDF5 dataset file:
+    `foo.h5` -> `foo.raw` (the bytes) + `foo.raw.json` (shape/dtype sidecar,
+    since a flat binary blob carries no header of its own).
+    """
+    base = h5_path[:-3] if h5_path.endswith(".h5") else h5_path
+    return base + ".raw", base + ".raw.json"
+
+
+def convert_h5_to_raw(h5_path, dataset_key="data", batch_rows=512, log=print):
+    """One-off: stream `h5_path`'s dataset out to a flat, C-contiguous raw
+    binary file + a small JSON sidecar recording shape/dtype, then verify
+    byte-for-byte before returning.
+
+    WHY this exists (see also `_read_h5_dataset_threaded`'s own docstring):
+    `train_80.h5`/`val_80.h5` are chunked ONE ROW PER CHUNK. Reading that
+    shape requires one HDF5 chunk-index lookup + read PER ROW (59,280 of
+    them for train_80.h5) -- fine on a fast local disk with a warm page
+    cache (confirmed locally: 9.86GB in ~2s), but on a cold cache / network-
+    backed volume each of those becomes its own I/O round-trip rather than
+    one continuous stream, which is exactly the "one CPU core, slowly"
+    warm-up OVERVIEW.md's v7.20 note already diagnosed. A flat raw binary
+    file has no chunk structure at all -- reading it is a SINGLE sequential
+    stream from byte 0 to EOF, the fastest access pattern any storage layer
+    (local disk or network volume) supports, and needs no HDF5 machinery
+    (chunk B-tree, per-chunk filter pipeline, per-call Python/Cython
+    overhead) to get there.
+
+    Streams row-by-row like `decompress_h5.py` so memory stays bounded
+    regardless of file size, and only replaces/creates the final `.raw`
+    after a full row-batched byte-for-byte comparison against the source
+    passes -- same safety convention as `decompress_h5.py`.
+    """
+    raw_path, meta_path = raw_binary_sibling_paths(h5_path)
+    tmp_path = raw_path + ".tmp"
+    with h5py.File(h5_path, "r") as f:
+        dset = f[dataset_key]
+        shape = tuple(int(s) for s in dset.shape)
+        dtype = dset.dtype
+        n = shape[0]
+        log(f"  [raw-convert] {os.path.basename(h5_path)}: {shape} {dtype} "
+            f"-> {os.path.basename(raw_path)}")
+        with open(tmp_path, "wb") as out:
+            for start in range(0, n, batch_rows):
+                end = min(start + batch_rows, n)
+                out.write(np.ascontiguousarray(dset[start:end]).tobytes())
+
+    # Verify: read the raw file back via mmap and compare batch-by-batch
+    # against the source, same convention as decompress_h5.py.
+    row_elems = int(np.prod(shape[1:]))
+    mm = np.memmap(tmp_path, dtype=dtype, mode="r", shape=shape)
+    with h5py.File(h5_path, "r") as f:
+        dset = f[dataset_key]
+        for start in range(0, n, batch_rows):
+            end = min(start + batch_rows, n)
+            if not np.array_equal(dset[start:end], mm[start:end]):
+                del mm
+                os.remove(tmp_path)
+                raise RuntimeError(
+                    f"convert_h5_to_raw: mismatch in rows [{start}:{end}) "
+                    f"for {h5_path} -- refusing to keep a corrupt .raw file")
+    del mm
+    os.replace(tmp_path, raw_path)
+    with open(meta_path, "w") as f:
+        json.dump({"shape": list(shape), "dtype": str(dtype)}, f)
+    log(f"  [raw-convert] {os.path.basename(raw_path)}: verified byte-for-byte, "
+        f"{os.path.getsize(raw_path) / 1e9:.2f} GB, {row_elems * np.dtype(dtype).itemsize} "
+        f"bytes/row")
+    return raw_path, meta_path
+
+
+def _read_raw_binary_to_tensor(raw_path, meta_path, length, log=print):
+    """Memory-map `raw_path` straight into a torch tensor via
+    `torch.from_file` -- no HDF5, no numpy array, no intermediate copy.
+    `torch.from_file` reads the file as ONE flat, sequential mapping (the
+    same access pattern that made the local-disk benchmark fast, see
+    `convert_h5_to_raw`'s docstring), then a plain `.reshape()` (a view,
+    not a copy) recovers the on-disk (N, T, X, F) shape.
+
+    Only ever called when a `.raw`/`.raw.json` sibling pair already exists
+    next to the `.h5` file (see `TransformerDataset.__init__`) -- falls
+    back to the HDF5 threaded reader otherwise, so nothing breaks for data
+    that hasn't been converted yet.
+    """
+    t0 = time.time()
+    with open(meta_path) as f:
+        meta = json.load(f)
+    full_shape = tuple(int(s) for s in meta["shape"])
+    if str(meta["dtype"]) != "float32":
+        raise ValueError(
+            f"_read_raw_binary_to_tensor only supports float32 raw files, "
+            f"got dtype={meta['dtype']!r} for {raw_path}")
+    row_elems = int(np.prod(full_shape[1:]))
+    n_elems = row_elems * length
+    n_bytes = n_elems * 4
+    log(f"  [data]   mmapping {os.path.basename(raw_path)} rows[0:{length}] "
+        f"({n_bytes / 1e9:.2f} GB) via torch.from_file (no HDF5, no numpy) ...")
+    flat = torch.from_file(raw_path, shared=False, size=n_elems, dtype=torch.float32)
+    tensor = flat.reshape((length,) + full_shape[1:])
+    elapsed = time.time() - t0
+    log(f"  [data]   {os.path.basename(raw_path)} mapped in {elapsed:.3f}s "
+        f"(lazy -- pages fault in sequentially as the tensor is read)")
+    return tensor
+
+
 class TransformerDataset(torch.utils.data.Dataset):
     """The whole split, read from HDF5 once and held as one tensor.
 
@@ -1630,17 +2697,65 @@ class TransformerDataset(torch.utils.data.Dataset):
     re-open the HDF5 file per worker per epoch as long as it does.
     """
 
-    def __init__(self, h5_path, subset_ratio=1.0):
+    def __init__(self, h5_path, subset_ratio=1.0, log=print):
         self.h5_path = h5_path
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
         with h5py.File(self.h5_path, 'r') as f:
             total_length = f['data'].shape[0]
-            self.length = max(1, int(total_length * subset_ratio)) if total_length else 0
-            raw = f['data'][:self.length]
+        self.length = max(1, int(total_length * subset_ratio)) if total_length else 0
+
+        # Raw-binary fast path (see convert_h5_to_raw()'s docstring): if a
+        # `.raw`/`.raw.json` sibling already exists next to this .h5 file
+        # (produced once, offline, via `python h5_to_raw.py`), load through
+        # that instead -- a single sequential torch.from_file() mmap, no
+        # HDF5 per-row-chunk overhead and no numpy array at all. Falls back
+        # to the HDF5 threaded reader untouched when no sibling exists, so
+        # unconverted data (or a synthetic test .h5) behaves exactly as
+        # before. PFD_USE_RAW_BINARY=0 forces the HDF5 path even if a
+        # sibling is present, for A/B comparison.
+        raw_path, meta_path = raw_binary_sibling_paths(h5_path)
+        use_raw = (os.environ.get("PFD_USE_RAW_BINARY", "1") != "0"
+                   and os.path.exists(raw_path) and os.path.exists(meta_path))
+        if use_raw:
+            raw = _read_raw_binary_to_tensor(raw_path, meta_path, self.length, log=log)
+        else:
+            # Threaded read (OVERVIEW.md v7.20 follow-up) -- see
+            # _read_h5_dataset_threaded()'s own docstring for why this is
+            # safe against train_80.h5/val_80.h5's one-row-per-chunk
+            # layout. PFD_DATA_LOAD_THREADS=1 reverts to a single-threaded
+            # read. This read (disk -> host RAM numpy array) was the
+            # biggest silent gap in startup before this instrumentation
+            # existed (confirmed live: a >1min pause with no explanation
+            # on a pod where the .h5 files were already local, i.e. not a
+            # network-transfer cost) -- run h5_to_raw.py once to convert
+            # to the raw-binary path above instead of living with this.
+            n_threads = int(os.environ.get("PFD_DATA_LOAD_THREADS", "8"))
+            raw = _read_h5_dataset_threaded(h5_path, 'data', self.length,
+                                            n_threads=n_threads, log=log)
+        # Half mode (OVERVIEW.md v8.0): raw is still on-disk shape
+        # (length, NUM_TIME_ON_DISK, NUM_X, INPUT_DIM) at this point -- keep
+        # only EVEN time-step indices (0, 2, 4, ...), halving the time axis
+        # BEFORE the reshape below collapses it into Config.SEQ_LEN (already
+        # halved by resolve_derived_config_fields(), called in main() before
+        # this dataset is ever constructed). Skipping this would make the
+        # reshape below fail outright (raw's true element count wouldn't
+        # match the halved Config.SEQ_LEN*INPUT_DIM target) rather than
+        # silently corrupt the data -- a real, not just a "nicer," safety
+        # property of doing the two halvings in the same commit. Works the
+        # same whether `raw` is a numpy array (HDF5 path) or a torch tensor
+        # (raw-binary path) -- both support this step-slicing syntax.
+        if Config.HALF_TIME_MODE:
+            raw = raw[:, ::2, :, :]
         self.total_available = total_length
-        self.data = torch.from_numpy(raw).float().reshape(
-            self.length, Config.SEQ_LEN, Config.INPUT_DIM)
+        _t_reshape = time.time()
+        if torch.is_tensor(raw):
+            self.data = raw.float().reshape(self.length, Config.SEQ_LEN, Config.INPUT_DIM)
+        else:
+            self.data = torch.from_numpy(raw).float().reshape(
+                self.length, Config.SEQ_LEN, Config.INPUT_DIM)
+        log(f"  [data]   {os.path.basename(h5_path)} "
+            f"float+reshape done in {time.time() - _t_reshape:.1f}s")
 
     def __len__(self):
         return self.length
@@ -2200,6 +3315,60 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
             x = x + fb_noise_std * torch.randn_like(x)
         return x
 
+    aropt_temp = float(getattr(cfg, 'AROPT_TEMPERATURE', 0.0))
+
+    # OVERVIEW.md v10.5, hypothesis #1+#4 combined: classic scheduled
+    # sampling (Bengio 2015 -- randomly substitute GROUND TRUTH for the
+    # model's own fed-back prediction with fixed probability
+    # AR_SCHED_MIX_P) layered on top of frame_ar_loss's ALREADY-EXISTING
+    # rollout-horizon curriculum (AR_FRAMES_START/AR_FRAMES_WARMUP_FRAC,
+    # v6.3). Distinct from AR_MODE='sched' (sched_sampling_loss): that is
+    # a single-step, two-forward mix with no horizon/curriculum concept
+    # at all (SCHED_SAMPLING_P governs sched_sampling_loss ONLY, never
+    # this function). AR_SCHED_MIX_P applies PER STEP OF THE CHAIN, so as
+    # AR_FRAMES_START ramps the chain longer, the model is trained on
+    # progressively longer rollouts that are ALSO progressively more
+    # exposed to its own errors (whatever fraction isn't replaced by
+    # ground truth) -- attacking exposure bias on both axes at once
+    # instead of picking one. 0.0 (default) preserves every existing
+    # frame_ar arm's behavior byte-for-byte (falls straight through to
+    # _feed_or_aropt below, unchanged).
+    sched_mix_p = float(getattr(cfg, 'AR_SCHED_MIX_P', 0.0))
+
+    def _feed_or_aropt(nxt, gt_slice):
+        """Branch S (OVERVIEW.md v7.21, §32.2 item 7): AROpt-style
+        accept/reject feedback. `gt_slice` MUST be read by the caller
+        before it's overwritten (it's the ground-truth value already
+        sitting in the cloned next-frame/next-token tensor). Disabled
+        (`AROPT_TEMPERATURE<=0`) is byte-for-byte `_feed(nxt)` -- see
+        Config.AROPT_TEMPERATURE's own comment for the full mechanism and
+        the h10_ridge_residual safety argument (reject always falls back
+        to ground truth, never a model-derived anchor).
+        """
+        if aropt_temp <= 0:
+            return _feed(nxt)
+        with torch.no_grad():
+            err = (nxt.detach() - gt_slice).pow(2).mean(dim=tuple(range(1, nxt.dim())))
+            accept_p = torch.exp(-err / aropt_temp).clamp(0.0, 1.0).to('cpu')
+            accept = torch.bernoulli(accept_p, generator=generator).bool().to(nxt.device)
+        fed = _feed(nxt)
+        return torch.where(accept.view(-1, *([1] * (nxt.dim() - 1))), fed, gt_slice)
+
+    def _feed_final(nxt, gt_slice):
+        """Scheduled-sampling gate in front of `_feed_or_aropt`: with
+        probability `sched_mix_p` (per sequence in the batch), force
+        ground truth regardless of what `_feed_or_aropt` would have
+        picked; otherwise defer to it entirely (AROpt accept/reject if
+        AROPT_TEMPERATURE>0, else the plain `_feed(nxt)` used by every
+        pre-existing frame_ar arm). sched_mix_p=0.0 makes this an exact
+        passthrough to `_feed_or_aropt`."""
+        if sched_mix_p <= 0:
+            return _feed_or_aropt(nxt, gt_slice)
+        keep_gt = (torch.rand(nxt.shape[0], device='cpu', generator=generator)
+                   < sched_mix_p).to(nxt.device)
+        fed = _feed_or_aropt(nxt, gt_slice)
+        return torch.where(keep_gt.view(-1, *([1] * (nxt.dim() - 1))), gt_slice, fed)
+
     if getattr(model, 'frame_native', False):
         # NOTE: FrameTransformer.forward() has no `force_persistence_anchor`
         # param and no ridge-anchor option at all -- ridge_A is ignored on
@@ -2213,7 +3382,7 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
             nxt = model(curr)[:, -1:, :]
             preds.append(nxt)
             nf = frames[:, ctx_frames + i:ctx_frames + i + 1, :].clone()
-            nf[:, :, :width] = _feed(nxt)
+            nf[:, :, :width] = _feed_final(nxt, nf[:, :, :width])
             curr = torch.cat([curr, nf], dim=1)
         # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
         # physical quantity: its per-dimension scale is arbitrary, its
@@ -2224,9 +3393,27 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
         # the central triplet (vx, vy, vz) at index 62 of 125 spatial
         # points. See OVERVIEW.md §10.9.7 for the rationale and centroid-
         # index derivation.
+        #
+        # to_per_token_latent() is REQUIRED here (OVERVIEW.md v7.19): this
+        # frame-native branch's `preds`/target frames carry a trailing
+        # NX*LATENT_DIM=width axis (one frame per position), but
+        # decode_centroid()'s frozen AE decoder always expects a trailing
+        # LATENT_DIM=47 axis -- the same reshape the teacher-forced path
+        # already applies (`pred_lat = to_per_token_latent(pred, Config)`
+        # in the main training loop) before ever calling
+        # centroid_velocity_loss(). This branch is only reachable when
+        # `model.frame_native` is True (TOKENIZATION='frame'), which no
+        # AR_MODE='frame_ar' arm had ever actually combined with frame
+        # tokenization before q2_sophia_auxhead's first real launch --
+        # every prior frame_ar arm (branches M/P/Q) ran token-native, so
+        # this call went straight to decode_centroid() with the wrong
+        # trailing width and crashed with a linear-layer shape mismatch
+        # (confirmed: "mat1 and mat2 shapes cannot be multiplied (6x470
+        # and 47x100)") on the very first training step.
         return centroid_velocity_loss(
-            torch.cat(preds, 1),
-            frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg)
+            to_per_token_latent(torch.cat(preds, 1), cfg),
+            to_per_token_latent(
+                frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg), cfg)
 
     ctx_len = ctx_frames * NX
     horizon = n_fr * NX
@@ -2240,7 +3427,7 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
         nxt = model(curr, force_persistence_anchor=True)[:, -1:, :]
         preds.append(nxt)
         tok = seqs[:, ctx_len + i:ctx_len + i + 1, :].clone()
-        tok[:, :, :LD] = _feed(nxt)
+        tok[:, :, :LD] = _feed_final(nxt, tok[:, :, :LD])
         curr = torch.cat([curr, tok], dim=1)
     # LATENT-SPACE ERROR RETIRED -- the 47-dim autoencoder latent is NOT a
     # physical quantity: its per-dimension scale is arbitrary, its
@@ -2264,6 +3451,108 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
     ridge_rollout = ridge_rollout_targets(last_frame, ridge_A, cfg, n_fr)
     ridge_loss = centroid_velocity_loss(network_preds, ridge_rollout, cfg)
     return gt_loss, ridge_loss
+
+
+def aux_horizon_loss(model, batch, cfg, generator=None):
+    """Non-autoregressive multi-horizon auxiliary loss (OVERVIEW.md v7.18,
+    Phase 2 menu item 2, `q2_sophia_auxhead`): predicts the next
+    `cfg.AUX_HEAD_FRAMES` frames in ONE SHOT, from a single random-length
+    context window, via `model.forward_aux()`. There is no feedback loop at
+    all here (unlike `frame_ar_loss`'s sequential unroll), so none of
+    `h10_ridge_residual`'s expansive-anchor-in-a-loop risk (§26.2) applies
+    -- this is a plain teacher-forced-style MSE against ground truth, just
+    predicting several frames ahead instead of one.
+
+    Uses the FULL `batch` (not `batch[:AR_SEQS]`) -- AR_SEQS exists to bound
+    `frame_ar_loss`'s expensive SEQUENTIAL unroll's memory footprint, which
+    has no bearing here: this is a single forward pass, so it's cheap
+    enough to run at the model's normal training batch size for a stronger
+    gradient signal.
+
+    Only supports frame-native models (`getattr(model, 'frame_native',
+    False)`) -- `q2_sophia_auxhead`, this function's only caller so far,
+    always uses `AR_MODE='frame_ar'`, which is frame-native. Returns `None`
+    if `AUX_HEAD_FRAMES` isn't positive or there isn't room for a valid
+    context+horizon split.
+    """
+    if not getattr(model, 'frame_native', False):
+        raise RuntimeError(
+            "aux_horizon_loss() only supports frame-native models "
+            "(FrameTransformer) -- got a token-level model instead.")
+    NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
+    k = int(cfg.AUX_HEAD_FRAMES)
+    if batch.shape[0] == 0 or k < 1:
+        return None
+    max_ctx = NT - k
+    if max_ctx < 2:
+        return None
+    lo = min(4, max_ctx)
+    ctx_frames = int(torch.randint(lo, max_ctx + 1, (1,), generator=generator,
+                                    device='cpu').item())
+    width = NX * LD
+    frames = seq_to_frames(batch, NX, LD)
+    context = frames[:, :ctx_frames, :]
+    _, aux_pred = model.forward_aux(context)
+    target = frames[:, ctx_frames:ctx_frames + k, :width]
+    # to_per_token_latent() is REQUIRED here (OVERVIEW.md v7.19 follow-up):
+    # the sibling bug to frame_ar_loss()'s own fix above -- `aux_pred`/
+    # `target` carry a trailing NX*LATENT_DIM=width axis, but
+    # decode_centroid()'s frozen AE decoder always expects a trailing
+    # LATENT_DIM=47 axis. Missed on the first fix because that pass only
+    # exercised frame_ar_loss() directly; this is a DIFFERENT function
+    # (aux_horizon_loss(), q2_sophia_auxhead's own new code path) with the
+    # identical shape bug, confirmed by the identical crash signature
+    # ("mat1 and mat2 shapes cannot be multiplied (512x470 and 47x100)")
+    # on q2's second real launch, after the first bug's fix let it get
+    # this far.
+    return centroid_velocity_loss(
+        to_per_token_latent(aux_pred, cfg), to_per_token_latent(target, cfg), cfg)
+
+
+def spatial_smoothness_loss(pred_lat, cfg):
+    """Self-referential spatial-consistency penalty across x-stations within
+    each predicted frame (branch R, OVERVIEW.md v7.20, §32.2 item 5).
+
+    NOT real PINN -- worth stating plainly since this is explicitly
+    motivated by PINN literature without adopting its machinery. Real PINN
+    work (e.g. the PSTNet divergence-free-layer paper cited in §32.2)
+    requires continuous, differentiable spatial/temporal coordinates as
+    network INPUTS so autograd can compute actual PDE-residual derivatives
+    (`d v/d x`, `d v/d t`) against real governing equations (Navier-Stokes
+    momentum/continuity, divergence-free constraints). This model has no
+    such differentiable-coordinate input at all, and no governing equation
+    is ever written down or checked here. This is a generic smoothness/
+    TV-style prior on the network's OWN predicted output at neighboring
+    x-stations, borrowing PINN literature's MOTIVATION ("physics-based
+    penalties reduce the solution space") without its machinery.
+
+    `pred_lat` is the model's prediction AFTER `to_per_token_latent()`'s
+    reshape (i.e. `pred_lat = to_per_token_latent(pred, cfg)`, exactly as
+    already computed for the primary teacher-forced loss) -- trailing shape
+    `(..., NUM_X, LATENT_DIM)`. Purely self-referential: decodes every
+    x-station's predicted centroid triplet through the frozen AE decoder,
+    then penalizes the squared first-difference (a discrete
+    total-variation-style term) between neighboring stations -- large jumps
+    between adjacent x-stations get penalized, no ground truth involved at
+    all, unlike every other loss term in this file.
+
+    Only supports frame-native models (`cfg.TOKENIZATION == 'frame'`): a
+    token-native model's teacher-forced prediction has no explicit
+    per-x-station axis to compare (the off-by-one next-token shift breaks
+    clean NUM_X-sized frame grouping) -- same scoping precedent as
+    `aux_horizon_loss()`. Returns `None` if `NUM_X < 2` (nothing to
+    compare against).
+    """
+    if getattr(cfg, 'TOKENIZATION', 'token') != 'frame':
+        raise RuntimeError(
+            "spatial_smoothness_loss() only supports frame-native models "
+            "(TOKENIZATION='frame') -- pred_lat has no explicit "
+            "per-x-station axis to compare under token tokenization.")
+    if pred_lat.shape[-2] < 2:
+        return None
+    v = decode_centroid(pred_lat, cfg)                    # (..., NX, 3)
+    diff = v[..., 1:, :] - v[..., :-1, :]                 # (..., NX-1, 3)
+    return diff.pow(2).sum(dim=-1).mean()
 
 
 def sched_sampling_loss(model, batch, cfg, p, generator=None):
@@ -2316,6 +3605,71 @@ def sched_sampling_loss(model, batch, cfg, p, generator=None):
     return centroid_velocity_loss(model(inp), tgt, cfg)
 
 
+def _is_oom_error(e):
+    msg = str(e).lower()
+    return "out of memory" in msg or "resource exhausted" in msg
+
+
+def _run_with_oom_backoff(fn, batch, device, min_chunk=1):
+    """Call `fn(batch)` (expected to return a tensor, or a tuple of
+    tensors all sharing `batch`'s leading dim) as one shot; on an
+    MPS/CUDA out-of-memory RuntimeError, free cached allocator memory,
+    split `batch` in half, retry each half recursively, and concatenate
+    the results back together.
+
+    WHY this exists (OVERVIEW.md v8.3): raising `eval_micro_batch` above 1
+    on MPS (see `resolve_train_regime`'s eval-batch note) is a real, large
+    speedup -- confirmed by direct measurement -- but is a memory trade,
+    and MPS's actual headroom at any given moment depends on what ELSE is
+    resident (other allocations, allocator fragmentation from PRIOR
+    `evaluate()` calls earlier in the same long training run -- the MPS
+    caching allocator does not necessarily release blocks back between
+    calls). A live test on this exact machine hit
+    `RuntimeError: MPS backend out of memory` at `eval_micro_batch=16`
+    with 69+ GiB already held by other allocations at that moment, even
+    though the SAME batch size succeeds comfortably in a fresh process.
+    Rather than pick one "safe" constant that's really just "safe on this
+    machine, right now" (not a property that holds), this makes
+    `eval_micro_batch` self-correcting: try the configured (optimistic)
+    batch, and only pay the finer-grained/slower path on the rare chunk
+    that actually doesn't fit *right now*, on this exact machine.
+
+    IMPORTANT (confirmed live -- this was a real bug in an earlier version
+    of this function, not a hypothetical): the cache-clear + retry must
+    happen OUTSIDE the `except` block, not inside it. While still inside
+    `except RuntimeError as e:`, the caught exception's traceback keeps
+    the failed call's entire frame -- including whatever partial
+    activation tensors it had allocated -- alive and reachable, so
+    `torch.mps.empty_cache()` has nothing to actually free yet and the
+    retry (even down to a single-element chunk that is independently
+    known to fit) OOMs again with the exact same "stuck" byte count.
+    Falling through to `pass` lets the `except` block exit normally first
+    (Python then clears `e` and its traceback per the language spec),
+    THEN `empty_cache()` runs against a heap that can truly release that
+    memory. Reproduced and fixed live: without this, retries never
+    succeeded no matter how small `min_chunk` was set.
+    """
+    try:
+        return fn(batch)
+    except RuntimeError as e:
+        B = int(batch.shape[0])
+        if not _is_oom_error(e) or B <= min_chunk:
+            raise
+    # Reached only after the `except` block above has exited normally --
+    # `e`/its traceback are gone, so the failed attempt's tensors are now
+    # actually collectible before we ask the allocator to free them.
+    if device.split(':')[0] == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+    elif device.split(':')[0] == "cuda":
+        torch.cuda.empty_cache()
+    mid = max(min_chunk, B // 2)
+    first = _run_with_oom_backoff(fn, batch[:mid], device, min_chunk)
+    second = _run_with_oom_backoff(fn, batch[mid:], device, min_chunk)
+    if isinstance(first, tuple):
+        return tuple(torch.cat([a, b], dim=0) for a, b in zip(first, second))
+    return torch.cat([first, second], dim=0)
+
+
 # --------------------------------------------------------------------------- #
 # Evaluation
 # --------------------------------------------------------------------------- #
@@ -2352,7 +3706,8 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         if b.device.type != device.split(':')[0]:
             b = b.to(device, non_blocking=True)
         with _autocast():
-            pred, tgt = teacher_forced(model, b, cfg)
+            pred, tgt = _run_with_oom_backoff(
+                lambda bb: teacher_forced(model, bb, cfg), b, device)
         pred, tgt = pred.float(), tgt.float()
         # val_tf_loss is the same centroid_velocity_loss quantity train() is
         # minimised on; val_tf_mse is kept as an informational latent-space
@@ -2381,7 +3736,8 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         pers_f = b[:, (ctx - 1) * NX:ctx * NX, :LD].unsqueeze(1).float() \
                   .expand(-1, n_frames, -1, -1)
         with _autocast():
-            pred_f = rollout_frames(model, b, cfg)
+            pred_f = _run_with_oom_backoff(
+                lambda bb: rollout_frames(model, bb, cfg), b, device)
         pred_f = pred_f.float()
         k = pred_f.shape[1]
         frames_scored = min(frames_scored, k)
@@ -2519,8 +3875,20 @@ class _Telemetry:
         existing = [p for p in paths if p and os.path.exists(p)]
         if not existing:
             return
+        # wandb's own JSON encoder for Artifact metadata is stricter than
+        # Python's `json` module: it rejects `inf`/`-inf`/`nan` outright
+        # (`ValueError: Out of range float values are not JSON compliant`)
+        # instead of encoding them as literal `Infinity`/`NaN` tokens.
+        # Several real fields flow through here as those exact sentinels
+        # before anything has ever been promoted yet (e.g.
+        # `best['rollout_mse'] = float('inf')`, see `train()`'s init) --
+        # sanitize rather than let every early checkpoint's upload fail.
+        safe_metadata = {
+            k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in (metadata or {}).items()
+        }
         try:
-            art = self.wandb.Artifact(name, type=artifact_type, metadata=metadata or {})
+            art = self.wandb.Artifact(name, type=artifact_type, metadata=safe_metadata)
             for p in existing:
                 art.add_file(p)
             self.run.log_artifact(art)
@@ -2535,23 +3903,111 @@ class _Telemetry:
 # Scheduling
 # --------------------------------------------------------------------------- #
 def make_lr_lambda(cfg):
-    """Warmup then cosine decay, over the ACTUAL step budget.
+    """Warmup then one of three post-warmup shapes, over the ACTUAL step
+    budget, selected by `cfg.LR_SCHEDULE` (OVERVIEW.md v8.1, strategy #2).
 
     The old `OneCycleLR(epochs=100000, pct_start=0.1)` put the end of warmup
     10,000 epochs out and the cosine floor 90,000 epochs out, so in practice the
     LR only ever ramped and never annealed.
+
+    `LR_SCHEDULE='cosine'` (default) is BYTE-FOR-BYTE the original single
+    warmup+cosine-decay shape -- every existing arm/checkpoint is
+    unaffected. `'wsd'` (Warmup-Stable-Decay) holds LR at its peak
+    (multiplier 1.0) between the end of warmup and a final decay window of
+    length `WSD_DECAY_FRAC * MAX_STEPS`, only then cosine-decaying to
+    `LR_FINAL_FRAC` -- unlike plain cosine, LR stays at its peak exactly
+    through the region where this project's own history shows a model
+    starting to decline (§39/46/48/57/59), instead of already being
+    annealed toward zero there. `'cosine_restarts'` (SGDR-style) splits
+    the post-warmup budget into `LR_NUM_RESTARTS + 1` equal-length cosine
+    cycles, each identical in shape to the plain-cosine decay (peak ->
+    `LR_FINAL_FRAC`), resetting back to peak at the start of every cycle.
     """
     total = max(1, int(cfg.MAX_STEPS))
     warmup = max(1, int(total * float(cfg.WARMUP_FRAC)))
     floor = float(cfg.LR_FINAL_FRAC)
+    schedule = str(getattr(cfg, 'LR_SCHEDULE', 'cosine')).lower()
+
+    def _cosine_decay(prog):
+        return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * prog))
+
+    if schedule == 'wsd':
+        decay_steps = max(1, int(total * float(cfg.WSD_DECAY_FRAC)))
+        decay_start = max(warmup, total - decay_steps)
+
+        def fn(step):
+            if step < warmup:
+                return (step + 1) / warmup
+            if step < decay_start:
+                return 1.0
+            prog = min(1.0, (step - decay_start) / max(1, total - decay_start))
+            return _cosine_decay(prog)
+
+        return fn
+
+    if schedule == 'cosine_restarts':
+        n_cycles = max(1, int(cfg.LR_NUM_RESTARTS) + 1)
+        total_post = max(1, total - warmup)
+        cycle_len = max(1, total_post // n_cycles)
+
+        def fn(step):
+            if step < warmup:
+                return (step + 1) / warmup
+            pos_in_cycle = (step - warmup) % cycle_len
+            prog = min(1.0, pos_in_cycle / max(1, cycle_len))
+            return _cosine_decay(prog)
+
+        return fn
+
+    if schedule != 'cosine':
+        raise ValueError(
+            f"Config.LR_SCHEDULE={schedule!r} not recognized -- expected "
+            f"'cosine', 'wsd', or 'cosine_restarts'.")
 
     def fn(step):
         if step < warmup:
             return (step + 1) / warmup
         prog = min(1.0, (step - warmup) / max(1, total - warmup))
-        return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * prog))
+        return _cosine_decay(prog)
 
     return fn
+
+
+def build_optimizer(model, cfg):
+    """Construct the optimizer named by `cfg.OPTIMIZER` (branch P,
+    OVERVIEW.md v7.9) -- `'adamw'` (default, byte-for-byte the single
+    hardcoded call every arm before branch P used), `'lion'`
+    (lucidrains/lion-pytorch), or `'sophia'` (the `sophia-opt` package,
+    a packaged fork of the official Liuhong99/Sophia reference
+    implementation). Raises `ValueError` on anything else rather than
+    silently falling back to AdamW -- a typo'd arm override should fail
+    loudly, not quietly run the wrong optimizer.
+
+    Lion/Sophia are imported HERE, not at module top, so a Mac dev
+    session (or any environment) without either package installed can
+    still import this module and run every AdamW-only arm/test
+    untouched -- confirmed neither package is a hard runtime dependency
+    for anything else in this file.
+    """
+    name = str(getattr(cfg, 'OPTIMIZER', 'adamw')).lower()
+    if name == 'adamw':
+        return torch.optim.AdamW(
+            model.parameters(), lr=cfg.LEARNING_RATE,
+            weight_decay=cfg.WEIGHT_DECAY, betas=tuple(cfg.ADAM_BETAS))
+    if name == 'lion':
+        from lion_pytorch import Lion
+        return Lion(
+            model.parameters(), lr=cfg.LEARNING_RATE,
+            weight_decay=cfg.WEIGHT_DECAY, betas=tuple(cfg.LION_BETAS))
+    if name == 'sophia':
+        from sophia_opt import SophiaG
+        return SophiaG(
+            model.parameters(), lr=cfg.LEARNING_RATE,
+            betas=tuple(cfg.SOPHIA_BETAS), rho=float(cfg.SOPHIA_RHO),
+            weight_decay=float(cfg.SOPHIA_WEIGHT_DECAY))
+    raise ValueError(
+        f"Config.OPTIMIZER={name!r} not recognized -- expected "
+        f"'adamw', 'lion', or 'sophia'.")
 
 
 def ar_frames_for_step(step, cfg):
@@ -2935,8 +4391,51 @@ def save_scripted_model(script_path, model, cfg=Config, device=None, log=print):
     return result
 
 
+def average_state_dicts(state_dicts):
+    """Uniform "model soup" average of N state dicts (Wortsman et al.,
+    "Model Soups" -- OVERVIEW.md v8.1 strategy #1): elementwise mean of
+    every floating-point tensor, across checkpoints that share IDENTICAL
+    keys and shapes.
+
+    Raises `ValueError` on any key or shape mismatch rather than silently
+    skipping or broadcasting -- averaging is only meaningful across
+    genuinely identical architectures (same TOKENIZATION/VARIANT/EMBED_
+    SIZE/N_LAYERS/N_HEADS/AUX_HEAD_FRAMES), and a would-be caller
+    souping e.g. a plain arm with `q2_sophia_auxhead` (extra `aux_head.*`
+    keys) needs a loud error, not a model quietly missing half its
+    ingredients' contribution.
+
+    Integer/bool buffers (e.g. `frame_ids`) are copied from the FIRST
+    state_dict unchanged -- nothing to average for those, same convention
+    `q1_sophia_ema`'s own EMA update already uses.
+    """
+    if not state_dicts:
+        raise ValueError("average_state_dicts() needs at least one state_dict")
+    keys = set(state_dicts[0].keys())
+    for i, sd in enumerate(state_dicts[1:], start=1):
+        if set(sd.keys()) != keys:
+            raise ValueError(
+                f"state_dict #{i} has different keys than #0 -- not the "
+                f"same architecture, cannot be souped together. "
+                f"only-in-#0: {keys - set(sd.keys())}, "
+                f"only-in-#{i}: {set(sd.keys()) - keys}")
+    out = {}
+    for k in keys:
+        tensors = [sd[k] for sd in state_dicts]
+        shapes = {tuple(t.shape) for t in tensors}
+        if len(shapes) != 1:
+            raise ValueError(
+                f"key {k!r} has mismatched shapes across checkpoints: {shapes}")
+        if tensors[0].is_floating_point():
+            out[k] = torch.stack([t.float() for t in tensors], dim=0).mean(dim=0).to(tensors[0].dtype)
+        else:
+            out[k] = tensors[0].clone()
+    return out
+
+
 def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
-                    save_scripted=None, cfg=Config, log=print, tel=None):
+                    save_scripted=None, cfg=Config, log=print, tel=None,
+                    ema_model=None):
     """Write a state-dict checkpoint (atomically) and, if enabled, a
     TorchScript companion at `<path without .pt>_scripted.pt`. If `tel` (a
     `_Telemetry` instance) is given, ALSO attempts to upload both files to
@@ -2978,6 +4477,13 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
             payload['wandb_run_id'] = tel.run.id
         except Exception:
             pass
+    # q1_sophia_ema (OVERVIEW.md v7.18): persist the EMA shadow weights
+    # alongside the live ones, purely for inspectability/future resume --
+    # every other caller passes nothing here, so `ema_state_dict` simply
+    # doesn't exist in their checkpoints, unchanged from before this field
+    # was added.
+    if ema_model is not None:
+        payload['ema_state_dict'] = ema_model.state_dict()
     payload.update(extra)
     tmp = path + ".tmp"
     torch.save(payload, tmp)
@@ -3064,7 +4570,8 @@ def _wsc(text, color):
     return f"{codes.get(color, '')}{text}\033[0m"
 
 
-def load_warm_start(model, ckpt_path, device, log=print):
+def load_warm_start(model, ckpt_path, device, log=print,
+                     extra_benign_missing=frozenset()):
     """Warm-start `model` from a v1.0 checkpoint under the v2.0 (NUM_TIME=80)
     shape.
 
@@ -3080,6 +4587,13 @@ def load_warm_start(model, ckpt_path, device, log=print):
         the checkpoint and the current model disagree about architecture,
         which no amount of warm-start will fix).
       * Transferred vs. reinitialised parameter counts are logged in colour.
+
+    `extra_benign_missing` (OVERVIEW.md v7.18): additional key names allowed
+    to be MISSING from the checkpoint entirely (as opposed to present with a
+    mismatched shape, which is `WARM_START_LENGTH_DEPENDENT_KEYS`'s job) --
+    e.g. `q2_sophia_auxhead`'s `aux_head.weight`/`aux_head.bias`, genuinely
+    NEW parameters that don't exist in an older checkpoint at all. Empty by
+    default, so every existing caller's strictness is unchanged.
 
     Returns a dict summarising what happened, for W&B / audit logging.
     """
@@ -3109,6 +4623,23 @@ def load_warm_start(model, ckpt_path, device, log=print):
     else:
         state_dict = ck
         ck_meta = {}
+
+    # Strip a leading `_orig_mod.` prefix -- the exact same unwrap this
+    # file already applies before SCRIPTING a model (`getattr(model,
+    # "_orig_mod", model)`, see save_scripted_model()/moe_aux_loss()),
+    # just never applied on the WARM-START read path. A checkpoint saved
+    # while wrapped in `torch.compile()` has every key prefixed this way
+    # in its raw `state_dict()`; without stripping it here, EVERY key
+    # mismatches the current (unwrapped) model and this function's own
+    # architecture-drift guard below hard-`SystemExit`s on what looks
+    # like total drift but is actually just the compile wrapper's naming
+    # convention. Confirmed happening for real: warm-starting from
+    # `r2_h11_ridge_distill_rollout_best.pt` (saved under torch.compile)
+    # crashed here with ~80 "unexpected keys", one per real parameter.
+    state_dict = {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state_dict.items()
+    }
 
     model_sd = model.state_dict()
 
@@ -3145,7 +4676,8 @@ def load_warm_start(model, ckpt_path, device, log=print):
     # `missing_keys` after load = (target params never present in the
     # sanitised state_dict). Allowed = union(dropped-by-shape, BENIGN).
     allowed_missing = (set(dropped_shape_mismatch)
-                       | WARM_START_BENIGN_MISSING_KEYS)
+                       | WARM_START_BENIGN_MISSING_KEYS
+                       | set(extra_benign_missing))
     bad_missing = [k for k in incompatible.missing_keys
                    if k not in allowed_missing]
     if bad_missing:
@@ -3277,11 +4809,31 @@ def load_resume_checkpoint(model, optimizer, scheduler, latest_path, device,
         # optimizer/scheduler skip still applies for the regular
         # (no-dropped) resume path.
         cross_version = bool(dropped)
-        if ck.get('optimizer_state_dict') and not cross_version:
+        # Branch P (OVERVIEW.md v7.9): AdamW/Lion/Sophia keep incompatible
+        # per-parameter state (Lion's exp-avg-only vs. AdamW's exp_avg +
+        # exp_avg_sq vs. Sophia's exp_avg + hessian) -- loading one
+        # optimizer's state_dict into another crashes on a key mismatch,
+        # not a silent no-op. A checkpoint's own 'config' blob already
+        # records Config.OPTIMIZER at save time (config_dict() dumps every
+        # Config field generically, no special-casing needed) -- compare
+        # it against the CURRENT run's optimizer before ever attempting
+        # load_state_dict, same "skip with a clear log line" pattern as
+        # the cross_version branch below (which this piggybacks on: model
+        # weights are still perfectly good to warm-start from either way,
+        # only the optimizer's own internal buffers are incompatible).
+        ckpt_optimizer = str(ck.get('config', {}).get('OPTIMIZER', 'adamw')).lower()
+        optimizer_mismatch = ckpt_optimizer != str(Config.OPTIMIZER).lower()
+        if ck.get('optimizer_state_dict') and not cross_version and not optimizer_mismatch:
             optimizer.load_state_dict(ck['optimizer_state_dict'])
         elif ck.get('optimizer_state_dict') and cross_version:
             log(f"  [resume] skipping optimizer state: length-dependent "
                 f"tensors were reinitialised ({sorted(dropped)})")
+        elif ck.get('optimizer_state_dict') and optimizer_mismatch:
+            log(f"  [resume] skipping optimizer state: checkpoint was saved "
+                f"under OPTIMIZER={ckpt_optimizer!r}, this run uses "
+                f"{str(Config.OPTIMIZER).lower()!r} -- incompatible "
+                f"per-parameter state, starting the optimizer fresh "
+                f"(model weights are unaffected).")
         if cross_version:
             log(f"  [resume] cross-version detected (v1.0 -> v2.0): "
                 f"resetting step=0 and best/* -- v1.0 metrics at "
@@ -3354,6 +4906,95 @@ def load_resume_checkpoint(model, optimizer, scheduler, latest_path, device,
 
 
 # --------------------------------------------------------------------------- #
+# Ridge/linear map, lazily loaded for the per-epoch report's third column
+# --------------------------------------------------------------------------- #
+_RIDGE_MAP_CACHE: dict = {}
+_RIDGE_MAP_WARNED: set = set()
+
+
+def _load_ridge_map_for_report(cfg, device, log=print):
+    """Lazily load and cache the fitted ridge/linear frame map for the
+    per-epoch report's THIRD comparison column (model vs. this closed-form
+    linear baseline vs. persistence) -- independent of whether the CURRENT
+    arm actually trains against it (`Config.RIDGE_DISTILL_WEIGHT` can be
+    0.0). This is the same map OVERVIEW.md's own +69%-vs-persistence
+    ceiling number comes from (§32.1) -- seeing it live, every epoch,
+    answers "how much of the achievable gap has the model actually closed"
+    without waiting for a post-hoc analysis.
+
+    Returns `None` (once, with a single dim-colored warning per path) if
+    `RIDGE_MAP_PATH` doesn't exist yet (e.g. diagnostics haven't run) or
+    `TOKENIZATION` isn't `'token'` (`ridge_rollout_targets()`'s own
+    scoping) -- the report just omits the ridge column rather than
+    failing the whole eval over a missing/inapplicable file.
+    """
+    if getattr(cfg, 'TOKENIZATION', 'token') != 'token':
+        return None
+    path = getattr(cfg, 'RIDGE_MAP_PATH', None)
+    if not path:
+        return None
+    key = (path, str(device))
+    if key in _RIDGE_MAP_CACHE:
+        return _RIDGE_MAP_CACHE[key]
+    if not os.path.exists(path):
+        if path not in _RIDGE_MAP_WARNED:
+            _RIDGE_MAP_WARNED.add(path)
+            log(_c(f"  [report] no ridge map at {path} -- skipping the "
+                   f"linear-baseline column (run diagnostics to fit one)", "dim"))
+        return None
+    # weights_only=True is safe -- this file is always our own locally-fitted
+    # output (linear_frame_baseline()'s payload is a plain dict of tensors),
+    # same as the RIDGE_DISTILL_WEIGHT load path above.
+    payload = torch.load(path, map_location=device, weights_only=True)
+    ridge_A = payload['A'].to(device=device, dtype=torch.float32)
+    expected_d = cfg.NUM_X * cfg.LATENT_DIM
+    if tuple(ridge_A.shape) != (expected_d + 1, expected_d):
+        log(_c(f"  [report] ridge map at {path} has shape {tuple(ridge_A.shape)}, "
+               f"expected {(expected_d + 1, expected_d)} -- skipping the linear-"
+               f"baseline column (fit under a different data/shape configuration)",
+               "yellow"))
+        _RIDGE_MAP_CACHE[key] = None
+        return None
+    _RIDGE_MAP_CACHE[key] = ridge_A
+    return ridge_A
+
+
+def pct_improvement(m, p):
+    """% improvement of `m` (model or ridge error) over `p` (persistence
+    error) -- positive means `m` is smaller/better. Module-level (not a
+    closure inside `per_epoch_persistence_report`) so it's independently
+    unit-testable and reusable."""
+    return (p - m) / max(p, 1e-12) * 100.0
+
+
+def pct_ceiling_captured(m, p, r):
+    """What fraction of the ridge map's own margin over persistence the
+    model has captured -- 100% means the model matches the ridge ceiling,
+    >100% means it beats it, negative means the model is WORSE than
+    persistence even though the ceiling itself is reachable. Returns
+    `nan` when there's no usable ceiling to divide by (the ridge map
+    doesn't beat persistence on this metric, e.g. right at the start of
+    training before the ridge map itself has been validated as a real
+    ceiling here)."""
+    d_ridge = pct_improvement(r, p)
+    if abs(d_ridge) < 1e-9:
+        return float('nan')
+    return pct_improvement(m, p) / d_ridge * 100.0
+
+
+def ceiling_bar(pct, width=10):
+    """Fixed-width ASCII bar for `pct_ceiling_captured()`'s result --
+    clamped to [0, 100] for the fill itself (a negative or >100% value
+    still prints via the numeric `captured=...%` text next to it; the bar
+    just saturates rather than drawing outside its own box). `nan` (no
+    usable ceiling) renders as an all-dash bar."""
+    if pct != pct:  # nan
+        return "[" + "-" * width + "]"
+    filled = int(round(max(0.0, min(100.0, pct)) / 100.0 * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+# --------------------------------------------------------------------------- #
 # Per-epoch persistence report
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -3363,13 +5004,26 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
                                  log=print):
     """Roll out `n_frames` on a fixed 32-sequence val subset and compare
     MAE / RMSE / L2 against a persistence baseline (last-context-frame held
-    constant), scored in DECODED CENTROID VELOCITY space (m/s) -- both the
-    model rollout and the persistence baseline are decoded through the
-    frozen GEN3 decoder before the error is computed, matching the training
-    objective (`centroid_velocity_loss`) and OVERVIEW.md's stated metric
-    space. Prints one colored line per metric with the `Δ` in green
-    when the model beats persistence and red otherwise; optionally logs
-    the numbers to W&B under the ``persistence/*`` namespace.
+    constant) AND, when a fitted ridge/linear map is available (see
+    `_load_ridge_map_for_report()`), against that closed-form linear
+    baseline too -- scored in DECODED CENTROID VELOCITY space (m/s), all
+    three decoded through the same frozen GEN3 decoder, matching the
+    training objective (`centroid_velocity_loss`) and OVERVIEW.md's stated
+    metric space.
+
+    Prints one colored line per metric: `Δmodel` (model vs. persistence,
+    green when the model wins), and -- when the ridge map is available --
+    `Δridge` (the ridge map's own margin over persistence, i.e. the
+    achievable ceiling per OVERVIEW.md §32.1) and `captured` (what
+    fraction of that ceiling the model has actually reached:
+    `Δmodel / Δridge * 100`, green >=50%, yellow 0-50%, red negative --
+    i.e. moving the wrong direction even though the ceiling itself is
+    reachable). Logs the same numbers to W&B under `persistence/*`
+    (unchanged keys, for continuity, plus new `*_ridge*` keys), and the
+    three `captured_pct` headline numbers ALSO under `00_ceiling/*` -- the
+    leading `00_` is deliberate, wandb's default workspace panel/sidebar
+    ordering is alphabetical by section, so this is the section most
+    workspaces will show first.
     """
     was_training = model.training
     model.eval()
@@ -3388,6 +5042,8 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
     if batch.device != target_device:
         batch = batch.to(target_device, non_blocking=True)
 
+    ridge_A = _load_ridge_map_for_report(cfg, target_device, log=log)
+
     # Chunked rollout: at NUM_TIME=80 the AR loop grows the sequence to
     # SEQ_LEN=800 tokens (pre-v3.1: 2080) and the attention scores are
     # (chunk * n_heads * L^2 * 4B) PER LAYER. On MPS the caller passes
@@ -3399,8 +5055,9 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
     n_out = None
     sum_abs_m = sum_sq_m = sum_l2_m = 0.0
     sum_abs_p = sum_sq_p = sum_l2_p = 0.0
-    n_elems_m = n_elems_p = 0     # element count for MAE/RMSE means
-    n_l2_m = n_l2_p = 0           # vector count for L2 means
+    sum_abs_r = sum_sq_r = sum_l2_r = 0.0
+    n_elems_m = n_elems_p = n_elems_r = 0     # element count for MAE/RMSE means
+    n_l2_m = n_l2_p = n_l2_r = 0               # vector count for L2 means
     for start in range(0, n_seqs, chunk):
         end = min(start + chunk, n_seqs)
         sub = batch[start:end]
@@ -3434,39 +5091,93 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
         n_l2_m += dm.shape[0] * dm.shape[1] * dm.shape[2]
         n_l2_p += dp.shape[0] * dp.shape[1] * dp.shape[2]
 
+        if ridge_A is not None:
+            # Same starting context (last frame before the horizon) as the
+            # persistence baseline above -- the ridge map's OWN independent
+            # multi-frame rollout from there, never touching the network
+            # (ridge_rollout_targets()'s own safety property, see its
+            # docstring). Reshape (b, k*NX, LD) -> (b, k, NX, LD) to match
+            # gt_v/pred_v/pers_v's shape for an elementwise diff.
+            last_frame_lat = gt_all[start:end, ctx_frames - 1].reshape(end - start, NX * LD)
+            ridge_c = ridge_rollout_targets(last_frame_lat, ridge_A, cfg, k)
+            ridge_c = ridge_c.reshape(end - start, k, NX, LD)
+            ridge_v = decode_centroid(ridge_c, cfg)
+            dr = (ridge_v - gt_v).float()
+            sum_abs_r += dr.abs().sum().item()
+            sum_sq_r += dr.pow(2).sum().item()
+            sum_l2_r += torch.linalg.vector_norm(dr, dim=-1).sum().item()
+            n_elems_r += dr.numel()
+            n_l2_r += dr.shape[0] * dr.shape[1] * dr.shape[2]
+
     mae_m = sum_abs_m / max(n_elems_m, 1)
     rmse_m = (sum_sq_m / max(n_elems_m, 1)) ** 0.5
     l2_m = sum_l2_m / max(n_l2_m, 1)
     mae_p = sum_abs_p / max(n_elems_p, 1)
     rmse_p = (sum_sq_p / max(n_elems_p, 1)) ** 0.5
     l2_p = sum_l2_p / max(n_l2_p, 1)
+    if ridge_A is not None:
+        mae_r = sum_abs_r / max(n_elems_r, 1)
+        rmse_r = (sum_sq_r / max(n_elems_r, 1)) ** 0.5
+        l2_r = sum_l2_r / max(n_l2_r, 1)
+    else:
+        mae_r = rmse_r = l2_r = None
 
-    def _delta(m, p):
-        return (p - m) / max(p, 1e-12) * 100.0
+    def _line(name, m, p, r):
+        d_model = pct_improvement(m, p)
+        colored_dm = _c(f"Δmodel={d_model:+7.2f}%", "green" if d_model > 0 else "red")
+        if r is None:
+            log(f"epoch {epoch:>3}  {name:<5} model={m:.3e}  pers={p:.3e}   {colored_dm}")
+            return
+        d_ridge = pct_improvement(r, p)
+        colored_dr = _c(f"Δridge={d_ridge:+7.2f}%", "green" if d_ridge > 0 else "red")
+        cap = pct_ceiling_captured(m, p, r)
+        bar = ceiling_bar(cap)
+        if cap != cap:  # nan
+            colored_cap = _c(f"captured=  n/a {bar}", "dim")
+        elif cap >= 50.0:
+            colored_cap = _c(f"captured={cap:+6.1f}% {bar}", "green")
+        elif cap >= 0.0:
+            colored_cap = _c(f"captured={cap:+6.1f}% {bar}", "yellow")
+        else:
+            colored_cap = _c(f"captured={cap:+6.1f}% {bar}", "red")
+        log(f"epoch {epoch:>3}  {name:<5} model={m:.3e}  ridge={r:.3e}  pers={p:.3e}   "
+            f"{colored_dm}  {colored_dr}  {colored_cap}")
 
-    def _line(name, m, p):
-        d = _delta(m, p)
-        colored_delta = _c(f"Δ={d:+.2f}%", "green" if d > 0 else "red")
-        log(f"epoch {epoch:>3}  {name:<5} model={m:.3e}  pers={p:.3e}  {colored_delta}")
-
-    _line("MAE",  mae_m,  mae_p)
-    _line("RMSE", rmse_m, rmse_p)
-    _line("L2",   l2_m,   l2_p)
+    _line("MAE",  mae_m,  mae_p,  mae_r)
+    _line("RMSE", rmse_m, rmse_p, rmse_r)
+    _line("L2",   l2_m,   l2_p,   l2_r)
 
     payload = {
         "persistence/mae_model": mae_m,
         "persistence/mae_pers": mae_p,
-        "persistence/mae_delta_pct": _delta(mae_m, mae_p),
+        "persistence/mae_delta_pct": pct_improvement(mae_m, mae_p),
         "persistence/rmse_model": rmse_m,
         "persistence/rmse_pers": rmse_p,
-        "persistence/rmse_delta_pct": _delta(rmse_m, rmse_p),
+        "persistence/rmse_delta_pct": pct_improvement(rmse_m, rmse_p),
         "persistence/l2_model": l2_m,
         "persistence/l2_pers": l2_p,
-        "persistence/l2_delta_pct": _delta(l2_m, l2_p),
+        "persistence/l2_delta_pct": pct_improvement(l2_m, l2_p),
         "persistence/epoch": int(epoch),
         "persistence/horizon_frames": int(n_out),
         "persistence/n_seqs": int(n_seqs),
     }
+    if ridge_A is not None:
+        payload.update({
+            "persistence/mae_ridge": mae_r,
+            "persistence/mae_ridge_delta_pct": pct_improvement(mae_r, mae_p),
+            "persistence/rmse_ridge": rmse_r,
+            "persistence/rmse_ridge_delta_pct": pct_improvement(rmse_r, rmse_p),
+            "persistence/l2_ridge": l2_r,
+            "persistence/l2_ridge_delta_pct": pct_improvement(l2_r, l2_p),
+            # Leading "00_" is deliberate -- see the docstring above. These
+            # three numbers ("how much of the achievable ceiling has the
+            # model actually captured") are the headline result this whole
+            # objective-mismatch investigation (OVERVIEW.md §40.2 on) is
+            # ultimately trying to move, so they're worth surfacing first.
+            "00_ceiling/mae_captured_pct": pct_ceiling_captured(mae_m, mae_p, mae_r),
+            "00_ceiling/rmse_captured_pct": pct_ceiling_captured(rmse_m, rmse_p, rmse_r),
+            "00_ceiling/l2_captured_pct": pct_ceiling_captured(l2_m, l2_p, l2_r),
+        })
     if telemetry is not None:
         try:
             telemetry.log(payload, step=int(optimizer_step))
@@ -3484,11 +5195,15 @@ def per_epoch_persistence_report(model, val_data, cfg, device, epoch,
 def train(args, log=print):
     t_start = time.time()
 
+    def _mark(label):
+        log(f"  [startup] {label} @ +{time.time() - t_start:.1f}s")
+
     # Claim this arm before spending any time loading data/model -- refuses
     # to start (rather than silently training alongside) a second launch of
     # the SAME arm while one is already live. See OVERVIEW.md v6.0.
     run_name_for_lock = f"r{Config.SWEEP_ROUND}_{Config.ARM}"
     run_lock_path = acquire_run_lock(Config, run_name_for_lock, log=log)
+    _mark("run lock acquired")
 
     device = Config.DEVICE
     torch.manual_seed(Config.SEED)
@@ -3498,6 +5213,7 @@ def train(args, log=print):
     # loop is allowed to know about the hardware flows through this object.
     regime = resolve_train_regime(device)
     print(regime.banner, flush=True)
+    _mark("device regime resolved")
 
     if Config.USE_TF32 and torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
@@ -3536,13 +5252,17 @@ def train(args, log=print):
             f"Pass --subset-ratio 1.0 if the pre-sampled fraction is already what "
             f"you intended.", "yellow"))
 
-    train_ds = TransformerDataset(Config.TRAIN_H5, subset_ratio=Config.TRAIN_SUBSET_RATIO)
-    val_ds = TransformerDataset(Config.VAL_H5, subset_ratio=1.0)
+    _mark("starting train_ds load")
+    train_ds = TransformerDataset(Config.TRAIN_H5, subset_ratio=Config.TRAIN_SUBSET_RATIO, log=log)
+    _mark("train_ds loaded")
+    val_ds = TransformerDataset(Config.VAL_H5, subset_ratio=1.0, log=log)
+    _mark("val_ds loaded")
     log(f"  [data] train={len(train_ds):,}/{train_ds.total_available:,} sequences  "
         f"val={len(val_ds):,}")
     if not args.cpu_data:
         _preload_to_device(train_ds, "train", device, log)
         _preload_to_device(val_ds, "val", device, log)
+    _mark("data resident on compute device")
 
     # Three generators because a torch Generator is bound to a device and these
     # three consumers can legitimately live on different ones (e.g. --cpu-data
@@ -3574,12 +5294,14 @@ def train(args, log=print):
         f"E={Config.EMBED_SIZE} L={Config.N_LAYERS} H={Config.N_HEADS} "
         f"params={n_params / 1e6:.2f}M attn_impl={Config.ATTN_IMPL} "
         f"delta={Config.PREDICT_DELTA} rope={Config.USE_ROPE}")
+    _mark("model constructed + moved to device")
 
     if Config.NORMALIZE_FEATURES:
         mean, std = compute_feature_stats(train_ds.data, Config, frame_level)
         model.set_feature_stats(mean, std)
         log(f"  [model] feature stats installed: mean|max|={mean.abs().max():.3f} "
             f"std range [{std.min():.4g}, {std.max():.4g}]")
+        _mark("feature stats computed")
 
     # -- warm-start (v2.0) --------------------------------------------------
     # Loads the v1.0 rollout-best winner and transfers all shape-compatible
@@ -3600,10 +5322,37 @@ def train(args, log=print):
             f"  [warm-start] skipped: {latest_path_check} exists and "
             "--fresh is off; resume will supply the weights.", "dim"))
     else:
+        # AUX_HEAD_FRAMES>0 (q2_sophia_auxhead, OVERVIEW.md v7.18) means
+        # model.aux_head exists but almost certainly isn't in an OLDER
+        # checkpoint at all -- genuinely new params, not a shape mismatch,
+        # so they go through load_warm_start()'s extra_benign_missing path
+        # rather than WARM_START_LENGTH_DEPENDENT_KEYS.
+        aux_missing = ({"aux_head.weight", "aux_head.bias"}
+                       if Config.AUX_HEAD_FRAMES > 0 else frozenset())
         warm_start_summary = load_warm_start(
-            model, args.warm_start, device, log=lambda s: log("  " + s))
+            model, args.warm_start, device, log=lambda s: log("  " + s),
+            extra_benign_missing=aux_missing)
 
     warm_started = warm_start_summary is not None
+    _mark("warm-start/resume decision resolved")
+
+    # -- EMA of weights (OVERVIEW.md v7.18, Phase 2 menu item 1,
+    # q1_sophia_ema) ---------------------------------------------------------
+    # A second, independent model instance (not torch.optim.swa_utils.
+    # AveragedModel -- its wrapper doesn't forward arbitrary attributes,
+    # and rollout_frames()/frame_ar_loss() read `model.frame_native`
+    # directly, which would silently resolve to False against a bare
+    # AveragedModel and take the wrong code path). Deep-copied AFTER
+    # warm-start/resume so it starts from the exact same weights as
+    # `model`, and BEFORE torch.compile wraps `model` below, so it stays
+    # a plain eager module -- it's only ever called at VAL_EVERY_STEPS
+    # cadence, not worth its own compiled graph.
+    ema_model = None
+    if Config.EMA_DECAY > 0:
+        ema_model = copy.deepcopy(model).to(device)
+        ema_model.eval()
+        ema_model.requires_grad_(False)
+        log(_wsc(f"  [ema] shadow model created, decay={Config.EMA_DECAY}", "cyan"))
 
     # -- torch.compile (CUDA only, never fatal) ----------------------------
     if regime.compile_model:
@@ -3628,12 +5377,18 @@ def train(args, log=print):
         except Exception as e:
             log(f"  [compile] torch.compile(model) failed "
                 f"({type(e).__name__}: {e}); continuing eager")
+    _mark("torch.compile stage done")
 
     # -- causality gate -----------------------------------------------------
+    # NOTE: probe_causality() runs real forward passes -- with torch.compile
+    # active this is where the FIRST graph capture/compilation actually
+    # happens (lazy), so on a fresh CUDA process this step can itself take
+    # real wall-clock time the first time it's hit, not just microseconds.
     probe = probe_causality(model, Config, device)
     log(f"  [causality] before_cut={probe['max_change_before_cut']:.3e} "
         f"after_cut={probe['max_change_after_cut']:.3e} "
         f"tol={probe['tolerance']:.3e} -> causal={probe['causal']}")
+    _mark("causality probe done")
     if not probe['causal'] and not args.allow_leak:
         raise RuntimeError(
             f"CAUSALITY PROBE FAILED for arm {Config.ARM}: perturbing inputs at/after "
@@ -3646,9 +5401,7 @@ def train(args, log=print):
             "the probe may not be exercising the model.")
 
     # -- optimiser ----------------------------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=Config.LEARNING_RATE,
-        weight_decay=Config.WEIGHT_DECAY, betas=tuple(Config.ADAM_BETAS))
+    optimizer = build_optimizer(model, Config)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, make_lr_lambda(Config))
     scaler = torch.amp.GradScaler(device='cuda', enabled=use_scaler)
 
@@ -3676,6 +5429,15 @@ def train(args, log=print):
     # promotion and falsely trigger on the very first eval).
     last_promotion_step = step
     early_stopped = False
+    # Time-based `_latest.pt` cadence (Config.CHECKPOINT_EVERY_SECONDS),
+    # alongside the existing step-based CHECKPOINT_EVERY_STEPS -- whichever
+    # fires first triggers the save. Steps alone under-save when step time
+    # varies a lot across GPUs (e.g. an H100 run vs. the B300/H200 runs this
+    # was tuned against): a slow box goes too long between checkpoints, a
+    # fast one wastes I/O checkpointing far more often than needed. Seeded
+    # to `t_start` (not 0) so a resumed process doesn't immediately fire a
+    # save on its very first step.
+    last_checkpoint_wall = t_start
 
     # THE mechanism that guarantees any future run picks up an existing
     # checkpoint from Config.CHECKPOINT_DIR rather than silently starting
@@ -3792,6 +5554,19 @@ def train(args, log=print):
     ar_target_w = float(Config.AR_LOSS_WEIGHT)
     ar_warm = max(1, int(Config.MAX_STEPS * float(Config.AR_WEIGHT_WARMUP_FRAC)))
 
+    # -- spatial-smoothness penalty (branch R, OVERVIEW.md v7.20) -----------
+    # Self-referential (no ground truth), so it's independent of ridge
+    # distillation / AR mode entirely -- computed from whatever `pred_lat`
+    # the primary teacher-forced loss already built, no extra forward pass.
+    spatial_smooth_w_target = float(Config.SPATIAL_SMOOTH_WEIGHT)
+    spatial_smooth_warm = max(1, int(Config.MAX_STEPS * float(Config.SPATIAL_SMOOTH_WARMUP_FRAC)))
+    if spatial_smooth_w_target > 0 and Config.TOKENIZATION != 'frame':
+        raise ValueError(
+            f"SPATIAL_SMOOTH_WEIGHT={spatial_smooth_w_target} requires "
+            f"TOKENIZATION='frame' (got {Config.TOKENIZATION!r}) -- "
+            f"spatial_smoothness_loss() has no per-x-station axis to "
+            f"compare under token tokenization.")
+
     # -- ridge-map distillation loss (v6.1) ---------------------------------
     # Safe reformulation of the abandoned h10_ridge_residual idea -- see
     # ridge_distill_targets()'s docstring for why this can't reproduce that
@@ -3896,8 +5671,12 @@ def train(args, log=print):
     latent_width = (Config.NUM_X * Config.LATENT_DIM) if frame_level else Config.LATENT_DIM
 
     # The sanity floor, logged before the first step so the whole run can be read
-    # against it instead of in a vacuum.
+    # against it instead of in a vacuum. First call also lazily loads+jit's the
+    # frozen decoder (get_decoder(), cached after this) -- the "[start-from:
+    # decoder]" rainbow line comes from inside this call, not before it.
+    _mark("starting null_baselines (incl. first decoder load)")
     nulls = null_baselines(val_ds.data, Config, frame_level=frame_level)
+    _mark("null_baselines done")
     # Floor = the best CONSTANT predictor, not specifically zeros. Which of the
     # two is lower depends on how far the latents are offset from zero, and using
     # only "zeros" would hand an easy pass to any data with a mean offset.
@@ -3923,6 +5702,7 @@ def train(args, log=print):
         f"steps_per_epoch~{steps_per_epoch}  "
         f"amp={amp_dtype}  loss=centroid_l2 (latent-space {Config.LOSS} is "
         f"informational-only)  device={regime.device}")
+    _mark("entering training loop (step 0)")
 
     stop_reason = "completed"
     # Rate is measured from where this PROCESS started, not from step 0, so an
@@ -3932,13 +5712,17 @@ def train(args, log=print):
     while step < Config.MAX_STEPS:
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = 0.0
+        primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = aux_head_acc = 0.0
+        smooth_acc = 0.0
+        moe_aux_acc = 0.0
         last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
                   and step % max(1, int(Config.AR_EVERY_N_STEPS)) == 0)
         distill_w = (ridge_distill_w_target * min(1.0, (step + 1) / ridge_distill_warm)
                      if ridge_A is not None else 0.0)
+        smooth_w = (spatial_smooth_w_target * min(1.0, (step + 1) / spatial_smooth_warm)
+                    if spatial_smooth_w_target > 0 else 0.0)
         current_ar_frames = ar_frames_for_step(step, Config)
 
         micro_count = 0
@@ -3956,7 +5740,13 @@ def train(args, log=print):
                                            noise_std=Config.NOISE_STD, generator=dev_gen)
                 pred_lat = to_per_token_latent(pred, Config)
                 tgt_lat = to_per_token_latent(tgt, Config)
-                loss = centroid_velocity_loss(pred_lat, tgt_lat, Config)
+                tf_loss = centroid_velocity_loss(pred_lat, tgt_lat, Config)
+                # TF_LOSS_WEIGHT=1.0 (default) is a no-op multiply, exactly
+                # today's behavior for every arm that doesn't touch it.
+                # q3_sophia_rollout_dominant (OVERVIEW.md v7.18) sets this
+                # below 1.0 to shift the loss balance toward AR_LOSS_WEIGHT's
+                # rollout term instead.
+                loss = Config.TF_LOSS_WEIGHT * tf_loss
                 # Accumulate as a GPU tensor, NOT via .item() here -- .item()
                 # forces a CUDA sync that drains the whole queue and stalls
                 # the GPU until the CPU catches up, `accum_steps` times per
@@ -3964,7 +5754,12 @@ def train(args, log=print):
                 # Python float exactly once below, after the loop, which is
                 # the only place a float is actually needed every step (for
                 # best["train_loss"]/checkpoint gating).
-                primary_acc = primary_acc + loss.detach()
+                # NOTE: accumulates the RAW (unweighted) tf_loss, matching
+                # ar_acc/distill_acc's own convention below of storing the
+                # pre-weight component value -- keeps "train_loss"'s meaning
+                # (compared against `anchor`/`floor` elsewhere) consistent
+                # regardless of TF_LOSS_WEIGHT.
+                primary_acc = primary_acc + tf_loss.detach()
                 last_pred, last_tgt = pred_lat.detach(), tgt_lat.detach()
                 # Ridge-distillation term: one matmul against a frozen buffer,
                 # no sequential loop -- cheap enough to run on EVERY
@@ -4008,6 +5803,38 @@ def train(args, log=print):
                         else:
                             ar_acc = aux.detach()
                             loss = loss + ar_w * aux
+                # Non-autoregressive multi-horizon auxiliary head
+                # (OVERVIEW.md v7.18, q2_sophia_auxhead): a single forward
+                # pass, not sequential like the AR loss above, so it runs
+                # on EVERY micro-batch (matching the ridge-distill term's
+                # own reasoning) rather than being gated to micro==0. No
+                # warmup curriculum for a first cut -- unlike AR_LOSS_WEIGHT,
+                # this loss has no feedback-loop risk to ramp into cautiously.
+                if Config.AUX_HEAD_FRAMES > 0:
+                    aux_h = aux_horizon_loss(model, batch, Config, generator=cpu_gen)
+                    if aux_h is not None:
+                        aux_head_acc = aux_h.detach()
+                        loss = loss + Config.AUX_HEAD_LOSS_WEIGHT * aux_h
+                # Spatial-smoothness penalty (branch R, OVERVIEW.md v7.20):
+                # self-referential, reuses `pred_lat` the primary loss above
+                # already built -- no extra forward pass, so it runs on
+                # every micro-batch like the ridge-distill term.
+                if smooth_w > 0:
+                    smooth = spatial_smoothness_loss(pred_lat, Config)
+                    if smooth is not None:
+                        smooth_acc = smooth.detach()
+                        loss = loss + smooth_w * smooth
+                # MoE load-balancing auxiliary loss (strategy #6, OVERVIEW.md
+                # v8.3): self-referential (router statistics only, no ground
+                # truth), computed from the SAME forward pass teacher_forced()
+                # already ran above -- no extra forward pass needed. `None`
+                # when MOE_NUM_EXPERTS<=0 (every block's mlp is the plain
+                # dense FFN, no `last_aux_loss` attribute at all).
+                if Config.MOE_NUM_EXPERTS > 0:
+                    aux_moe = moe_aux_loss(getattr(model, "_orig_mod", model))
+                    if aux_moe is not None:
+                        moe_aux_acc = aux_moe.detach()
+                        loss = loss + Config.MOE_LOAD_BALANCE_WEIGHT * aux_moe
                 loss = loss / accum_steps
 
             if use_scaler:
@@ -4034,15 +5861,48 @@ def train(args, log=print):
         else:
             grad_norm = torch.tensor(float('nan'))
 
+        # SophiaG's diagonal-Hessian EMA (OVERVIEW.md v7.9) -- reuses the
+        # SAME (already clipped) gradient this step's ordinary update is
+        # about to use, no extra forward/backward pass. True no-op for
+        # every non-Sophia arm (doesn't even evaluate the step-modulo).
+        if Config.OPTIMIZER == 'sophia' and step % max(1, int(Config.SOPHIA_HESSIAN_UPDATE_EVERY)) == 0:
+            optimizer.update_hessian()
+
         # optimizer.step() + zero_grad() only when accumulated == accum_steps,
         # which is enforced by the accum_steps-length inner for-loop above.
+        # SophiaG's step() takes a `bs` kwarg (scales its per-parameter
+        # update ratio, see sophia_opt's own sophiag() -- defaults to
+        # 5120, which is NOT this run's real effective batch size) that
+        # AdamW/Lion don't accept at all -- only passed when relevant.
+        step_kwargs = ({'bs': Config.BATCH_SIZE * Config.ACCUMULATION_STEPS}
+                       if Config.OPTIMIZER == 'sophia' else {})
         if use_scaler:
             scaler.step(optimizer)
             scaler.update()
         else:
-            optimizer.step()
+            optimizer.step(**step_kwargs)
         scheduler.step()
         step += 1
+
+        # EMA shadow update (q1_sophia_ema, OVERVIEW.md v7.18) -- true
+        # no-op when EMA_DECAY<=0 (ema_model is None). Integer/bool
+        # buffers (e.g. frame_ids) are copied verbatim, not EMA'd -- there
+        # is nothing to average for those.
+        if ema_model is not None:
+            with torch.no_grad():
+                # `getattr(model, "_orig_mod", model)`: if torch.compile
+                # wrapped `model`, its own .state_dict() keys are prefixed
+                # "_orig_mod." (same unwrap this file already does before
+                # TorchScript-exporting a compiled model, :3162) -- without
+                # this, `live_sd[k]` would KeyError against ema_model's
+                # (never-compiled) unprefixed keys.
+                live_sd = getattr(model, "_orig_mod", model).state_dict()
+                for k, v_ema in ema_model.state_dict().items():
+                    v_live = live_sd[k]
+                    if v_ema.is_floating_point():
+                        v_ema.mul_(Config.EMA_DECAY).add_(v_live, alpha=1.0 - Config.EMA_DECAY)
+                    else:
+                        v_ema.copy_(v_live)
 
         # The one sync per optimizer step that's actually unavoidable: this
         # value is needed as a Python float every step (best["train_loss"]
@@ -4096,6 +5956,16 @@ def train(args, log=print):
                 payload["ridge_distill_loss"] = (distill_acc / accum_steps).item() \
                     if torch.is_tensor(distill_acc) else distill_acc / accum_steps
                 payload["ridge_distill_weight"] = distill_w
+            if Config.AUX_HEAD_FRAMES > 0:
+                payload["aux_head_loss"] = (
+                    aux_head_acc.item() if torch.is_tensor(aux_head_acc) else aux_head_acc)
+            if smooth_w > 0:
+                payload["spatial_smooth_loss"] = (
+                    smooth_acc.item() if torch.is_tensor(smooth_acc) else smooth_acc)
+                payload["spatial_smooth_weight"] = smooth_w
+            if Config.MOE_NUM_EXPERTS > 0:
+                payload["moe_aux_loss"] = (
+                    moe_aux_acc.item() if torch.is_tensor(moe_aux_acc) else moe_aux_acc)
             if torch.cuda.is_available():
                 payload["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
             # `step=step` EXPLICITLY -- without it, wandb auto-increments its
@@ -4112,13 +5982,34 @@ def train(args, log=print):
             # Every tel.log() call in this file must pass the SAME real step
             # value -- never mix implicit (auto-increment) and explicit.
             tel.log(payload, step=step)
+            # OVERVIEW.md v10.8: the old middle branch here ("worse than the
+            # previous-frame anchor", red) fired on 100% of 73 logged steps
+            # across round 320's entire run -- including at its clean,
+            # noise-free validation checkpoints, including its OWN peak
+            # (step 250, val_tf_loss=0.009874 vs anchor=0.00740, at the
+            # exact same step the real rollout metric read +46.60% vs
+            # persistence). Confirmed NOT a training-noise artifact (the
+            # comparison against clean val_tf_loss showed the identical
+            # pattern) but a real, structural mismatch: `anchor` is a
+            # ONE-STEP, never-compounding "copy the previous frame"
+            # baseline -- unusually strong on smooth physical data
+            # specifically BECAUSE it never compounds -- while the metric
+            # that actually matters (`improvement_pct`) is a MULTI-STEP
+            # autoregressive rollout comparison, where persistence's error
+            # compounds and a genuinely-learned model can win by a wide
+            # margin while still losing the one-step comparison every time.
+            # Removed as a per-step alarm entirely -- it was structurally
+            # incapable of ever showing green on a real run and provided no
+            # signal. `floor` (below) is a different, real problem
+            # (failing to beat a trivial CONSTANT predictor genuinely does
+            # mean something is broken) and stays. The positive case
+            # (`crossed_anchor`, still green) is now the only anchor-
+            # related signal ever shown, since it's the rare, actually
+            # informative direction -- not because it happens often, but
+            # because it happens when it means something.
             flag = ""
             if train_loss > floor:
                 flag = _c(f"  <-- WORSE THAN PREDICTING ZERO ({floor:.6f})", "red")
-            elif train_loss > anchor:
-                flag = _c(
-                    f"  <-- worse than the previous-frame anchor ({anchor:.6f})",
-                    "red")
             elif crossed_anchor:
                 flag = _c(
                     f"  <-- beats previous-frame anchor ({anchor:.6f}); "
@@ -4144,7 +6035,7 @@ def train(args, log=print):
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_train_best.pt"),
                     model, optimizer, step,
                     {'train_l2': train_loss, 'best': dict(best)},
-                    scheduler=scheduler, tel=tel)
+                    scheduler=scheduler, tel=tel, ema_model=ema_model)
                 tel.set_summary("best_train_loss", best["train_loss"])
 
         hit_budget = step >= Config.MAX_STEPS
@@ -4166,10 +6057,44 @@ def train(args, log=print):
                     f"({type(e).__name__}: {e}); continuing")
 
         if step % Config.VAL_EVERY_STEPS == 0 or hit_budget:
+            # Printed BEFORE the eval, not just after (the existing "[eval]"
+            # line below only reports rollout_seconds retroactively) --
+            # `rollout_frames()` is a small-batch, sequential autoregressive
+            # decode with no KV-cache reuse (a full re-forward over the
+            # growing context on every one of its NUM_TIME-VAL_CONTEXT_STEPS
+            # iterations), which is inherently GPU-underutilizing compared
+            # to a batched training step. Flagged as the likely cause of
+            # periodic GPU-utilization dips observed on a live `nvidia-smi`
+            # trace even with 3 arms training concurrently (OVERVIEW.md
+            # v7.16) -- this marker lets a live trace be correlated to the
+            # exact wall-clock moment without waiting for the eval to finish.
+            log(f"  [eval] step {step}: starting rollout eval "
+                f"({Config.VAL_ROLLOUT_SEQS} seqs, sequential decode)...")
             m = evaluate(model, val_ds.data, Config, device,
                          amp_dtype=amp_dtype,
                          chunk=regime.eval_micro_batch,
                          tf_batch_size=regime.eval_micro_batch)
+            if ema_model is not None:
+                # q1_sophia_ema exists specifically to test whether EMA'd
+                # weights roll out better than the raw trajectory -- so the
+                # EMA numbers become the primary ones this loop's
+                # best/promotion-gate tracking (below) and wandb see; the
+                # raw (non-EMA) numbers are kept under raw_* purely for
+                # side-by-side comparison, not used for any decision.
+                log(f"  [eval] step {step}: starting EMA rollout eval "
+                    f"({Config.VAL_ROLLOUT_SEQS} seqs, sequential decode)...")
+                m_ema = evaluate(ema_model, val_ds.data, Config, device,
+                                 amp_dtype=amp_dtype,
+                                 chunk=regime.eval_micro_batch,
+                                 tf_batch_size=regime.eval_micro_batch)
+                for k in ("rollout_mse", "improvement_pct", "val_tf_mse",
+                         "val_tf_loss", "improvement_pct_frame1",
+                         "improvement_pct_frame_last"):
+                    m[f"raw_{k}"] = m[k]
+                m.update(m_ema)
+                log(f"  [eval] step {step}: raw IMPROVEMENT="
+                    f"{m['raw_improvement_pct']:+.2f}%  EMA IMPROVEMENT="
+                    f"{m['improvement_pct']:+.2f}%")
             m["step"] = step
             m["train_loss"] = train_loss
             m["lr"] = scheduler.get_last_lr()[0]
@@ -4234,7 +6159,7 @@ def train(args, log=print):
                     {'rollout_mse': m['rollout_mse'], 'val_l2': m['val_tf_loss'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
                      'best': dict(best)},
-                    scheduler=scheduler, tel=tel)
+                    scheduler=scheduler, tel=tel, ema_model=ema_model)
                 log(f"  --> new best rollout ({m['rollout_mse']:.6f}, "
                     f"{m['improvement_pct']:+.2f}% vs persistence)")
             elif found_new_low and not promotable:
@@ -4300,16 +6225,30 @@ def train(args, log=print):
                 # silently dropped between CHECKPOINT_EVERY_STEPS ticks.
                 hit_budget = True
 
-        if step % Config.CHECKPOINT_EVERY_STEPS == 0 or hit_budget:
+        due_for_time_checkpoint = (
+            (time.time() - last_checkpoint_wall) >= Config.CHECKPOINT_EVERY_SECONDS)
+        if step % Config.CHECKPOINT_EVERY_STEPS == 0 or due_for_time_checkpoint or hit_budget:
             save_checkpoint(latest_path, model, optimizer, step,
                             {'train_l2': train_loss, 'best': dict(best),
                              'val_l2': best['val_tf_mse'],
                              'rollout_mse': best['rollout_mse'],
                              'improvement': best['improvement_pct']},
                             scheduler=scheduler, tel=tel)
+            last_checkpoint_wall = time.time()
             archive_latest_checkpoint(Config, run_name, latest_path, step, log=log)
             write_status_json(Config, run_name, step, train_loss, best,
                               last_metrics, t_start, log=log)
+            touch_run_lock(run_lock_path)
+        elif step % Config.RUN_LOCK_TOUCH_EVERY_STEPS == 0:
+            # Cheap heartbeat-only touch (no checkpoint write) -- keeps
+            # the stale-lock detector's real cadence intact now that a
+            # full checkpoint save is far rarer than every
+            # RUN_LOCK_TOUCH_EVERY_STEPS steps (see Config's own comment
+            # on why these two are deliberately decoupled). `elif`, not
+            # a second independent `if`: the block above already touches
+            # the lock on every iteration it fires (including whenever
+            # `hit_budget` is set, so no need to repeat that check here),
+            # this only covers the gap in between.
             touch_run_lock(run_lock_path)
 
         if (time.time() - t_start) / 3600.0 > Config.MAX_HOURS:
@@ -4698,13 +6637,13 @@ def main(argv=None):
                 f"--set cannot override pinned v2.0 Config field {k!r}")
         setattr(Config, k, _coerce(v))
 
-    # Derived fields, recomputed after every override so the `config` dict stored
-    # in each checkpoint is self-consistent. VAL_ROLLOUT_STEPS in particular is
+    # Derived fields, recomputed after every override (including
+    # HALF_TIME_MODE's NUM_TIME halving) so the `config` dict stored in
+    # each checkpoint is self-consistent. VAL_ROLLOUT_STEPS in particular is
     # read back by tests/test_model_vs_baseline.py to size its horizon, and a
     # stale 728 against an overridden VAL_CONTEXT_STEPS would silently mis-scope
     # the evaluation.
-    Config.SEQ_LEN = Config.NUM_X * Config.NUM_TIME
-    Config.VAL_ROLLOUT_STEPS = Config.NUM_X * (Config.NUM_TIME - Config.VAL_CONTEXT_STEPS)
+    resolve_derived_config_fields()
 
     os.makedirs(args.out_dir, exist_ok=True)
 

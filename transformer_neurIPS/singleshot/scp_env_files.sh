@@ -132,10 +132,9 @@ fi
 echo ""
 
 SSH_OPTS=(-p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new)
-SCP_OPTS=(-P "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new)
 
 # Pre-create every remote directory once, up front -- avoids N separate
-# "mkdir -p" round-trips interleaved with N scp calls.
+# "mkdir -p" round-trips interleaved with N transfers.
 REMOTE_DIRS=$(printf '%s\n' "${FILES[@]}" | cut -d: -f2 | sort -u)
 MKDIR_CMD="mkdir -p"
 while IFS= read -r d; do
@@ -143,18 +142,48 @@ while IFS= read -r d; do
 done <<< "$REMOTE_DIRS"
 ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "$MKDIR_CMD"
 
-echo "Sending files..."
+# rsync, not scp: the whole point of the network volume
+# (NETWORK_VOLUME_ID, provision_and_run.sh) is that $REMOTE_ROOT
+# persists across pod terminations, so on every relaunch after the
+# first, most of these files (the AE decoder, the ridge map, an old
+# arm's checkpoint) are BYTE-IDENTICAL to what's already sitting on the
+# volume. Plain scp re-sends the full file regardless; rsync compares
+# first and skips anything unchanged, so repeated launches only pay
+# for what actually changed (usually just the trainer .py files, and
+# only when this session actually edited them).
+#
+# --checksum (not the default mtime+size quick check): a `git checkout`
+# or file copy can change a file's mtime without changing its content,
+# which would make the default check re-send something that's actually
+# identical -- these files are all small enough (largest is a ~single-
+# digit-GB checkpoint) that paying for a real checksum comparison
+# instead of trusting mtime is cheap and removes that false-positive
+# entirely. -i (itemize-changes) is what lets the loop below report
+# "unchanged, skipped" vs "updated" per file instead of rsync's
+# otherwise-silent no-op on a skip.
+#
+# --no-owner --no-group: -a (archive) implies -o/-g (preserve owner/
+# group), which needs CAP_CHOWN on the RECEIVING end to `chown` the
+# landed file to match the sender's UID/GID. Confirmed the hard way --
+# RunPod's container images don't grant CAP_CHOWN even to root inside
+# the container, so every transfer failed with "chown ... Operation
+# not permitted" (rsync exit 23) despite `ssh root@...`. Ownership
+# doesn't matter here anyway (single-user pod, everything already runs
+# as root) -- dropping just those two archive components avoids the
+# chown call entirely while keeping -a's other pieces (recursive,
+# symlinks, perms, times, devices).
+RSYNC_SSH="ssh -p $POD_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new"
+
+echo "Sending files (rsync -- unchanged files are skipped)..."
 for pair in "${FILES[@]}"; do
   rel="${pair%%:*}"
   remote_dir="${pair##*:}"
-  local_size="$(stat -f%z "$REPO_ROOT/$rel" 2>/dev/null || stat -c%s "$REPO_ROOT/$rel" 2>/dev/null)"
-  scp "${SCP_OPTS[@]}" "$REPO_ROOT/$rel" \
-    "$POD_USER@$POD_HOST:$REMOTE_ROOT/cgan/$remote_dir/"
-  remote_size="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" \
-    "stat -c%s '$REMOTE_ROOT/cgan/$remote_dir/$(basename "$rel")' 2>/dev/null || stat -f%z '$REMOTE_ROOT/cgan/$remote_dir/$(basename "$rel")'")"
-  if [[ "$local_size" != "$remote_size" ]]; then
-    echo "  SIZE MISMATCH on $rel: local=$local_size remote=$remote_size" >&2
-    exit 1
+  itemized="$(rsync -az --no-owner --no-group --checksum -i -e "$RSYNC_SSH" "$REPO_ROOT/$rel" \
+    "$POD_USER@$POD_HOST:$REMOTE_ROOT/cgan/$remote_dir/")"
+  if [[ -n "$itemized" ]]; then
+    printf "  [SENT]    %s\n" "$rel"
+  else
+    printf "  [SKIPPED] %s (unchanged on pod)\n" "$rel"
   fi
 done
 

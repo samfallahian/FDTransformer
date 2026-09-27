@@ -1,13 +1,16 @@
-"""Enforces the version-sync convention introduced in OVERVIEW.md v4.1:
-`Config.WANDB_PROJECT`'s trailing `_vN` suffix must track OVERVIEW.md's
+"""Enforced the version-sync convention introduced in OVERVIEW.md v4.1:
+`Config.WANDB_PROJECT`'s trailing `_vN` suffix tracked OVERVIEW.md's
 latest documented MAJOR version (not every point release -- see §21.1 for
 the rationale on major-only tracking).
 
-Without this test, the convention is just a comment someone has to
-remember to honour by hand every time either side changes -- exactly the
-kind of drift this whole file has repeatedly caught elsewhere (see e.g.
-the split_version attr sitting one version behind its own policy in
-§16.4, before this test's pattern existed).
+RETIRED (OVERVIEW.md v9.1): `WANDB_PROJECT` was deliberately renamed from
+"NI_Review_v8" to "Persistence_Linear_v1" -- a rebrand, not a version
+bump. Enforcing equality with OVERVIEW.md's version (then v9) against a
+project deliberately restarting its own numbering at 1 would make this
+test permanently, correctly-failingly wrong, not catch real drift. Kept
+the "has SOME trailing _vN suffix" check (still a real, useful
+convention -- every wandb project name should be versioned), dropped the
+"and it must equal OVERVIEW.md's version" equality check.
 """
 import os
 import re
@@ -64,17 +67,10 @@ class TestVersionSync(unittest.TestCase):
             f"trailing '_vN' suffix. See OVERVIEW.md §21.1 for the "
             f"convention this is supposed to follow.")
 
-    def test_wandb_project_major_version_matches_overview_md(self):
-        doc_major, doc_minor = latest_documented_version()
-        project_major = wandb_project_major_version(T.Config.WANDB_PROJECT)
-        self.assertEqual(
-            project_major, doc_major,
-            f"Config.WANDB_PROJECT={T.Config.WANDB_PROJECT!r} is tagged "
-            f"major version {project_major}, but OVERVIEW.md's latest "
-            f"documented version is v{doc_major}.{doc_minor} (major "
-            f"{doc_major}). Per the convention in OVERVIEW.md §21.1, "
-            f"WANDB_PROJECT's '_vN' suffix tracks the MAJOR version only "
-            f"-- update whichever side is behind.")
+    # test_wandb_project_major_version_matches_overview_md RETIRED
+    # (OVERVIEW.md v9.1): see this module's docstring -- WANDB_PROJECT
+    # was deliberately renamed/rebranded ("Persistence_Linear_v1"),
+    # restarting its own version count independent of OVERVIEW.md's.
 
 
 if __name__ == "__main__":

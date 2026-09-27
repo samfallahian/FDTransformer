@@ -46,26 +46,23 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo ""
 fi
 
-echo "apt-get update + installing midnight commander (mc, a terminal file"
-echo "manager) and screen (found MISSING on a real pod image this session --"
-echo "the whole 'run bootstrap/exp-a/exp-b in named screens over one SSH"
-echo "connection' workflow in singleshot/README.md silently doesn't work"
-echo "without this)..."
-apt-get update -qq
-apt-get install -y -qq mc screen
+# apt packages: `dpkg -s` is a purely local metadata lookup (no
+# network round-trip), unlike `apt-get update` -- checking first avoids
+# paying for a full package-index refresh on every relaunch against the
+# SAME pod/image just to reconfirm two packages that are already there.
+if dpkg -s mc screen >/dev/null 2>&1; then
+  echo "mc/screen already installed -- skipping apt-get."
+else
+  echo "apt-get update + installing midnight commander (mc, a terminal file"
+  echo "manager) and screen (found MISSING on a real pod image this session --"
+  echo "the whole 'run bootstrap/exp-a/exp-b in named screens over one SSH"
+  echo "connection' workflow in singleshot/README.md silently doesn't work"
+  echo "without this)..."
+  apt-get update -qq
+  apt-get install -y -qq mc screen
+fi
 echo ""
 
-echo "Creating venv at $VENV_DIR..."
-"$PYTHON_BIN" -m venv "$VENV_DIR"
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip
-
-echo ""
-echo "Installing numpy/h5py/wandb (pinned, per requirements.txt)..."
-pip install "numpy==2.4.2" "h5py==3.15.1" "wandb>=0.29.0"
-
-echo ""
 echo "Detecting CUDA driver for the correct STABLE torch index..."
 CUDA_TAG="cu121"   # conservative fallback if detection fails
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -80,9 +77,71 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 fi
 CUDA_TAG="${CUDA_TAG_OVERRIDE:-$CUDA_TAG}"
 
-echo ""
-echo "Installing torch (stable, index: https://download.pytorch.org/whl/$CUDA_TAG)..."
-pip install torch --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+# venv on the network volume (REPO_ROOT is under /workspace whenever
+# NETWORK_VOLUME_ID is set) survives pod termination just like
+# saved_models/ does -- so on every relaunch after the first, this
+# venv is almost always ALREADY fully built. Re-running every `pip
+# install` anyway means N network round-trips per relaunch just to
+# have pip re-confirm "requirement already satisfied", which is what
+# was actually slow, not the venv/package state itself. A fingerprint
+# file (requirements pins + CUDA_TAG + interpreter version) plus one
+# cheap local `import` check is enough to tell "genuinely already
+# built, matching THESE inputs" apart from "stale/partial/first run"
+# without trusting the fingerprint blindly.
+FINGERPRINT_FILE="$VENV_DIR/.bootstrap_fingerprint"
+FINGERPRINT="numpy==2.4.2 h5py==3.15.1 wandb>=0.29.0 lion-pytorch sophia-opt torch@$CUDA_TAG py@$("$PYTHON_BIN" -V 2>&1)"
+
+already_bootstrapped=0
+if [[ -x "$VENV_DIR/bin/python" ]] \
+   && [[ -f "$FINGERPRINT_FILE" ]] \
+   && [[ "$(cat "$FINGERPRINT_FILE" 2>/dev/null)" == "$FINGERPRINT" ]] \
+   && "$VENV_DIR/bin/python" -c "import torch, h5py, numpy, wandb, lion_pytorch, sophia_opt" >/dev/null 2>&1; then
+  already_bootstrapped=1
+fi
+
+if [[ "$already_bootstrapped" == "1" ]]; then
+  echo ""
+  echo "venv at $VENV_DIR already matches this bootstrap's exact pins and"
+  echo "imports cleanly -- skipping venv creation and every pip install."
+  echo "(delete $FINGERPRINT_FILE, or the venv itself, to force a rebuild)"
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+else
+  echo ""
+  echo "Creating venv at $VENV_DIR..."
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
+  python -m pip install --upgrade pip
+
+  echo ""
+  echo "Installing numpy/h5py/wandb (pinned, per requirements.txt)..."
+  pip install "numpy==2.4.2" "h5py==3.15.1" "wandb>=0.29.0"
+
+  # Branch P (OVERVIEW.md v7.9): optimizer bake-off arms (p2_bestyet_lion,
+  # p3_bestyet_sophia) need these -- both import lazily inside
+  # build_optimizer(), so every OTHER arm runs fine even if this step ever
+  # fails; only fails loudly for an arm that actually selects OPTIMIZER=
+  # 'lion'/'sophia'. lion-pytorch: tiny, single dependency on torch,
+  # actively maintained. sophia-opt: a packaged fork of the official
+  # Liuhong99/Sophia reference implementation -- confirmed importable as
+  # `from sophia_opt import SophiaG` (NOT `from sophia import ...` --
+  # verified directly against the installed package this session, PyPI
+  # project name and import name don't always match).
+  echo ""
+  echo "Installing lion-pytorch/sophia-opt (branch P optimizer arms)..."
+  pip install "lion-pytorch" "sophia-opt"
+
+  echo ""
+  echo "Installing torch (stable, index: https://download.pytorch.org/whl/$CUDA_TAG)..."
+  pip install torch --index-url "https://download.pytorch.org/whl/$CUDA_TAG"
+
+  # Written ONLY after every install above actually succeeded (set -e
+  # would have already aborted the script on a failed pip install) --
+  # a fingerprint file left behind by a partially-failed run would be
+  # worse than not caching at all.
+  printf '%s' "$FINGERPRINT" > "$FINGERPRINT_FILE"
+fi
 
 echo ""
 echo "Verifying the interpreter has everything and can see the GPU..."
@@ -96,6 +155,11 @@ try:
     print('wandb', wandb.__version__, '(not logged in yet -- see below)')
 except ImportError:
     print('wandb NOT INSTALLED')
+try:
+    import lion_pytorch, sophia_opt
+    print('lion_pytorch/sophia_opt OK')
+except ImportError as e:
+    print('lion_pytorch/sophia_opt NOT INSTALLED:', e)
 "
 
 echo ""

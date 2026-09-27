@@ -16,6 +16,12 @@ numpy==2.4.2
 h5py==3.15.1
 wandb>=0.29.0
 
+# Branch P (OVERVIEW.md v7.9) -- optimizer bake-off arms only
+# (p2_bestyet_lion, p3_bestyet_sophia). Imported lazily inside
+# build_optimizer(), so every other arm runs fine even without these.
+lion-pytorch
+sophia-opt
+
 # --- torch: read this before installing -------------------------------
 #
 # STABLE branch, not nightly -- the nightly build used during local

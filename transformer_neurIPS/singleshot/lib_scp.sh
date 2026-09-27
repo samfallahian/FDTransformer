@@ -195,8 +195,17 @@ scp_reassemble_verify() {
   local remote_bytes remote_sha rc=0
 
   info "  reassembling and verifying $remote_filename on $POD_HOST..."
+  # Appends and deletes ONE piece at a time, NOT `cat piece_* > final`
+  # (which needs every piece AND the full final file on disk
+  # simultaneously -- confirmed the hard way against a size-constrained
+  # RunPod network volume: reassembling two files concurrently hit
+  # "Disk quota exceeded" partway through at a volume sized for just the
+  # final data, not this ~2x transient peak). Appending piece-by-piece
+  # keeps peak usage close to 1x the file size instead -- each piece's
+  # bytes move from "piece form" to "final form" and are freed
+  # immediately, never double-counted for long.
   ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" \
-    "mkdir -p '$remote_dir' && cd '$remote_scratch' && cat \$(ls piece_* | sort) > '$remote_dir/$remote_filename' && rm -f piece_*"
+    "mkdir -p '$remote_dir' && cd '$remote_scratch' && : > '$remote_dir/$remote_filename' && for p in \$(ls piece_* | sort); do cat \"\$p\" >> '$remote_dir/$remote_filename' && rm -f \"\$p\"; done"
   remote_bytes="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "stat -c%s '$remote_dir/$remote_filename' 2>/dev/null || stat -f%z '$remote_dir/$remote_filename'")"
   remote_sha="$(ssh "${SSH_OPTS[@]}" "$POD_USER@$POD_HOST" "shasum -a 256 '$remote_dir/$remote_filename' 2>/dev/null | awk '{print \$1}'")"
 

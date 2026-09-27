@@ -120,8 +120,28 @@
 #
 # ENV VARS (all optional)
 #   GPU_ID             exact GPU type string from `runpodctl gpu list`
-#                       (default: auto-picks the first available H200 or
-#                       H300 listing; override if neither is in stock)
+#                       (default: auto-picks the first available match
+#                       for GPU_AUTO_DETECT_PATTERN below; override if
+#                       nothing in that pool is in stock)
+#   GPU_AUTO_DETECT_PATTERN  case-insensitive regex against gpu list's
+#                       id/gpuId/displayName/name, used by the auto-pick
+#                       above (default "H200|H300|RTX PRO 6000 Blackwell
+#                       (Server|Workstation) Edition$" -- the trailing
+#                       `Edition$` anchor is load-bearing, it excludes
+#                       that card's much-smaller MIG-sliced variants,
+#                       24GB/48GB, which would NOT fit this workload).
+#                       Widen or narrow the auto-detect pool by
+#                       overriding this instead of editing the script.
+#   GPU_WAIT_SECS       when auto-picking (GPU_ID unset), how long to
+#                       keep polling for matching stock before giving up
+#                       (default 300 = 5min). Real stock -- ESPECIALLY
+#                       when pinned to one datacenter via
+#                       NETWORK_VOLUME_ID/DATA_CENTER_IDS -- can be
+#                       genuinely zero for a few minutes and then free
+#                       up; only ever applies to the auto-detect path,
+#                       an explicit GPU_ID never waits.
+#   GPU_POLL_INTERVAL_SECS  how often to recheck while waiting above
+#                       (default 10)
 #   TEMPLATE_ID         RunPod template id (default: runpod-torch-v280,
 #                       verified via `runpodctl template search pytorch`
 #                       to actually exist -- do NOT hand-type an --image
@@ -192,15 +212,46 @@
 #   POD_ID              reuse an already-running pod instead of creating one
 #   KEEP_POD            set to 1 to skip the final `pod delete` (for
 #                       debugging a run without losing the box)
+#   NETWORK_VOLUME_ID   attach a persistent RunPod network volume instead
+#                       of re-uploading train_80.h5/val_80.h5 every run
+#                       (~14GB, minutes each time otherwise). A network
+#                       volume is pinned to ONE datacenter -- setting
+#                       this looks that datacenter up automatically and
+#                       pins BOTH pod creation and H200/H300 GPU
+#                       selection to it (stock elsewhere doesn't help;
+#                       the pod can't be created anywhere else and still
+#                       attach the volume), and replaces the whole
+#                       "Phase 2/2: data files" step with a quick remote
+#                       size check against what's already on the volume
+#                       -- training refuses to launch if that check
+#                       fails, rather than silently training on stale or
+#                       missing data. Unset (default) preserves the
+#                       original re-upload-every-run behavior exactly,
+#                       with no datacenter pinning. One-time setup to
+#                       populate a fresh volume: create/attach a pod
+#                       with this same --network-volume-id (e.g. via
+#                       this script's own pod-creation step, or by hand)
+#                       and run scp_data_files.sh against it once.
+#   DATA_CENTER_IDS     override/skip NETWORK_VOLUME_ID's automatic
+#                       datacenter lookup -- set this directly if you
+#                       already know it, or to pin a datacenter for a
+#                       run that isn't using a network volume at all.
 #   FORCE_TERMINATE_ON_PULL_FAILURE
-#                       the final artifact pull-back (checkpoints,
-#                       sweep_logs) retries a few times, then -- if it's
-#                       still failing -- refuses to delete the pod so a
-#                       transient SSH/network failure can't cost you the
-#                       run's actual output. Set this to 1 to delete the
-#                       pod anyway even if that pull-back never succeeded
-#                       (i.e. you've confirmed there's nothing worth
-#                       keeping, or already retrieved it manually).
+#                       DEFAULTS TO 1 -- the pod is terminated on exit
+#                       regardless of whether the artifact pull-back
+#                       (checkpoints, sweep_logs) succeeded. This was
+#                       flipped from an earlier default of 0 (which left
+#                       a failed-pull-back pod running, billing, for a
+#                       human to clean up by hand) after exactly that
+#                       happened on a real run and the cost/inconvenience
+#                       of a dangling pod was judged worse than the risk
+#                       of losing a run's local artifacts -- wandb's own
+#                       versioned Artifact upload (every save_checkpoint()
+#                       call) is the fallback recovery path in that case.
+#                       Set this to 0 explicitly if you want the OLD
+#                       protective behavior back for a specific run (e.g.
+#                       a long/expensive run where you'd rather babysit a
+#                       failed pull-back than risk losing the result).
 #   SSH_KEY             local private key to use (default ~/.ssh/id_ed25519
 #                       -- must match a key added via `runpodctl ssh add-key`
 #                       or already present on the pod's image)
@@ -210,6 +261,16 @@
 #                       entirely, see singleshot/CROC_JOURNEY.md for
 #                       that investigation and bench_scp_variants.sh for
 #                       why plain parallel scp beat it).
+#   EARLY_STOP_PATIENCE_STEPS  passed to every slot as
+#                       --early-stop-patience-steps (default 500,
+#                       OVERVIEW.md §42's own stated "going forward"
+#                       value). Set to "" to disable and always run the
+#                       full step budget. Confirmed the hard way this
+#                       needed a default, not opt-in: a real run peaked
+#                       at step 500/2500, never re-promoted, and burned
+#                       the remaining ~2/3 of its wall-clock on a
+#                       strictly worse checkpoint because nothing passed
+#                       this flag (OVERVIEW.md §46).
 #   GLOBAL_TIMEOUT_SECS  hard wall-clock cap on this ENTIRE script, no
 #                       matter what it's stuck on -- see "GLOBAL TIMEOUT
 #                       WRAPPER" near the top of this file for the
@@ -414,6 +475,28 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 KEEP_POD="${KEEP_POD:-0}"
 LANES="${LANES:-10}"
 WANDB_GROUP="${WANDB_GROUP:-}"
+# Defaults to 500 (OVERVIEW.md §42's own stated "going forward" value,
+# matching --val-every 500 below -- stops on the very next non-promoting
+# eval after a promotion, one eval of slack) -- confirmed the hard way
+# this was worth defaulting rather than leaving opt-in-only: a real
+# m3_ar_combined run (OVERVIEW.md §46) peaked at step 500 of a 2500-step
+# budget, never re-promoted, and ran the full remaining ~1500 steps (2/3
+# of its wall-clock) for a strictly worse checkpoint, purely because
+# neither its launch command nor this script ever passed
+# --early-stop-patience-steps. Set to empty ("") to disable and run the
+# full step budget regardless, matching the pre-this-default behavior.
+EARLY_STOP_PATIENCE_STEPS="${EARLY_STOP_PATIENCE_STEPS-500}"
+# NETWORK_VOLUME_ID (optional): attach a persistent RunPod network volume
+# instead of re-uploading train_80.h5/val_80.h5 every run. A network
+# volume is pinned to ONE datacenter -- setting this looks that
+# datacenter up automatically (below) and pins pod creation + GPU
+# selection to it, and skips scp_data_files.sh entirely in favor of a
+# quick remote existence/size check against what's already on the
+# volume. Unset (default) preserves the original re-upload-every-run
+# behavior exactly. DATA_CENTER_IDS can be set directly instead (or in
+# addition, to override the auto-lookup) if you already know it.
+NETWORK_VOLUME_ID="${NETWORK_VOLUME_ID:-}"
+DATA_CENTER_IDS="${DATA_CENTER_IDS:-}"
 
 # Slots 2 and 3 are entirely optional, only active if ARM2/ARM3 end up
 # non-empty (set via --arm2=/--arm3= or ARM2=/ARM3=). SLOT_* arrays
@@ -450,20 +533,100 @@ if [[ -n "$ARM3" ]]; then
   SLOT_STEPS+=("$MAX_STEPS3"); SLOT_HOURS+=("$MAX_HOURS3"); SLOT_FRESH+=("$FRESH3"); SLOT_EXTRA+=("$EXTRA3")
 fi
 
+if [[ -n "$NETWORK_VOLUME_ID" && -z "$DATA_CENTER_IDS" && -z "${POD_ID:-}" ]]; then
+  echo "NETWORK_VOLUME_ID=$NETWORK_VOLUME_ID set -- looking up its datacenter"
+  echo "(a network volume is pinned to one datacenter; the pod has to be"
+  echo "created there too, or the volume can't be attached)..."
+  VOL_JSON="$("$RUNPODCTL" network-volume get "$NETWORK_VOLUME_ID" -o json 2>&1)"
+  DATA_CENTER_IDS="$(echo "$VOL_JSON" | jq -r '.dataCenterId // empty' 2>/dev/null)"
+  if [[ -z "$DATA_CENTER_IDS" ]]; then
+    echo "" >&2
+    echo "Could not look up NETWORK_VOLUME_ID=$NETWORK_VOLUME_ID's datacenter --" >&2
+    echo "check it exists ('runpodctl network-volume get $NETWORK_VOLUME_ID')," >&2
+    echo "or set DATA_CENTER_IDS explicitly if this keeps failing:" >&2
+    echo "$VOL_JSON" >&2
+    exit 1
+  fi
+  echo "  volume is in datacenter $DATA_CENTER_IDS -- pod will be pinned there"
+  echo ""
+fi
+
+GPU_WAIT_SECS="${GPU_WAIT_SECS:-300}"            # 5 min default
+GPU_POLL_INTERVAL_SECS="${GPU_POLL_INTERVAL_SECS:-10}"
+# Case-insensitive regex against gpu list's id/gpuId/displayName/name --
+# override to widen/narrow the auto-detect pool without touching this
+# script. Default includes the RTX PRO 6000 Blackwell 96GB cards
+# (Server AND Workstation edition -- both real 96GB parts, $2.09-2.19/hr,
+# CHEAPER than H100 at $3.49/hr) alongside H200/H300: AR-rollout-loss
+# memory scales with an arm's AR_SEQS, not micro_batch, so h9_ar_freq1/
+# h11_ridge_distill/m1_ar_weight/m2_ar_curriculum (all AR_SEQS=2, ~34GB
+# observed on H200) fit comfortably in 96GB. The trailing `Edition$`
+# anchor is load-bearing -- WITHOUT it this would also match the MIG-
+# sliced variants ("... Edition MIG 1g.24gb" / "... MIG 2g.48gb", 24GB/
+# 48GB respectively), which are real, much smaller partitions of the
+# same physical card and would NOT fit this workload.
+# NOTE: m3_ar_combined (AR_SEQS=16) is estimated at ~150-200GB actual --
+# it does NOT fit on these 96GB cards, and likely not even on a 141GB
+# H200 either. That's a pre-existing sizing question independent of
+# this GPU pool, not something widening the pool here fixes.
+GPU_AUTO_DETECT_PATTERN="${GPU_AUTO_DETECT_PATTERN:-H200|H300|RTX PRO 6000 Blackwell (Server|Workstation) Edition\$}"
 if [[ -z "$GPU_ID" && -z "${POD_ID:-}" ]]; then
-  echo "Looking up an available H200/H300 GPU (override with GPU_ID=...)..."
-  GPU_JSON="$("$RUNPODCTL" gpu list -o json 2>&1)"
-  GPU_ID="$(echo "$GPU_JSON" | jq -r '
-    [.[]? // .gpus[]? |
-     select((.id // .gpuId // .displayName // .name // "") | test("H200|H300"; "i")) |
-     (.id // .gpuId // .displayName // .name)
-    ] | .[0] // empty' 2>/dev/null || true)"
+  if [[ -n "$DATA_CENTER_IDS" ]]; then
+    echo "Looking up an available GPU ($GPU_AUTO_DETECT_PATTERN) in datacenter"
+    echo "$DATA_CENTER_IDS (pinned there by NETWORK_VOLUME_ID/DATA_CENTER_IDS;"
+    echo "override with GPU_ID=... or widen/narrow via GPU_AUTO_DETECT_PATTERN=...)."
+  else
+    echo "Looking up an available GPU ($GPU_AUTO_DETECT_PATTERN)."
+    echo "Override with GPU_ID=... or widen/narrow via GPU_AUTO_DETECT_PATTERN=...)."
+  fi
+  # Stock -- ESPECIALLY pinned to ONE datacenter via a network volume --
+  # can be genuinely zero for a while and then free up minutes later --
+  # confirmed hitting exactly this against US-GA-2 in practice. Poll
+  # instead of failing on the very first empty check: every
+  # GPU_POLL_INTERVAL_SECS (default 10s) for up to GPU_WAIT_SECS
+  # (default 300s = 5min) before giving up for real. A GPU_ID explicitly
+  # set by the caller never reaches this block at all (the outer `if`
+  # above), so this retry only ever applies to the auto-detect path.
+  echo "Will retry every ${GPU_POLL_INTERVAL_SECS}s for up to ${GPU_WAIT_SECS}s if none is available yet."
+  SECONDS=0
+  while true; do
+    GPU_JSON="$("$RUNPODCTL" gpu list -o json 2>&1)"
+    # $dc empty (the common, non-network-volume case) matches every GPU
+    # regardless of per-datacenter stock, exactly like the original
+    # global search -- $dc non-empty additionally requires THIS specific
+    # datacenter to actually carry real stock ("none" means zero, an
+    # empty stockStatus string appears to mean "not currently tracked",
+    # NOT "unlimited" -- confirmed empirically against US-GA-2's own
+    # listing, so only "none" is excluded here, not blank).
+    GPU_ID="$(echo "$GPU_JSON" | jq -r --arg dc "$DATA_CENTER_IDS" --arg pat "$GPU_AUTO_DETECT_PATTERN" '
+      [.[]? // .gpus[]? |
+       select((.id // .gpuId // .displayName // .name // "") | test($pat; "i")) |
+       select($dc == "" or ((.dataCenterAvailability // []) | any(.dataCenterId == $dc and .stockStatus != "none"))) |
+       (.id // .gpuId // .displayName // .name)
+      ] | .[0] // empty' 2>/dev/null || true)"
+    if [[ -n "$GPU_ID" ]]; then
+      break
+    fi
+    if [[ "$SECONDS" -ge "$GPU_WAIT_SECS" ]]; then
+      break
+    fi
+    echo "  no stock yet (${SECONDS}s/${GPU_WAIT_SECS}s elapsed) -- retrying in ${GPU_POLL_INTERVAL_SECS}s..."
+    sleep "$GPU_POLL_INTERVAL_SECS"
+  done
   if [[ -z "$GPU_ID" ]]; then
     echo "" >&2
-    echo "Could not auto-find an H200/H300 in the GPU list (either none are" >&2
-    echo "in stock right now, or the JSON field names didn't match what this" >&2
-    echo "script guessed -- see the raw output below). Set GPU_ID explicitly" >&2
-    echo "and re-run:" >&2
+    if [[ -n "$DATA_CENTER_IDS" ]]; then
+      echo "Still no matching GPU stock in $DATA_CENTER_IDS after ${GPU_WAIT_SECS}s" >&2
+      echo "of polling -- a network volume pins the pod to this one datacenter, so" >&2
+      echo "stock elsewhere doesn't help. Set GPU_ID explicitly to whatever IS in" >&2
+      echo "stock there, or re-run (optionally with a longer GPU_WAIT_SECS) once" >&2
+      echo "stock frees up -- see the raw list below:" >&2
+    else
+      echo "Still no matching GPU stock after ${GPU_WAIT_SECS}s of polling (pattern:" >&2
+      echo "$GPU_AUTO_DETECT_PATTERN -- or the JSON field names didn't match what" >&2
+      echo "this script guessed -- see the raw output below). Set GPU_ID explicitly" >&2
+      echo "and re-run:" >&2
+    fi
     echo "" >&2
     echo "$GPU_JSON" >&2
     exit 1
@@ -483,6 +646,20 @@ else
     echo "Creating pod (gpu=$GPU_ID, template=$TEMPLATE_ID, disk=${CONTAINER_DISK_GB}GB)..."
     IMAGE_FLAGS=(--template-id "$TEMPLATE_ID")
   fi
+  # Plain scalar, spliced in UNQUOTED below (not a bash array) -- matches
+  # this file's own existing convention for optional flags
+  # ($fresh_flags/$group_flags in launch_training()). NOT an array:
+  # macOS's stock bash (3.2.57) raises "unbound variable" under `set -u`
+  # when expanding "${arr[@]}" on a genuinely EMPTY array (confirmed
+  # directly, see select_fastest_pod.sh's own history of this exact
+  # bug) -- an empty unquoted scalar just expands to zero words instead,
+  # which is exactly "no flag" here. Safe to word-split unquoted:
+  # NETWORK_VOLUME_ID/DATA_CENTER_IDS are plain IDs, never contain
+  # spaces or glob characters.
+  NETWORK_VOLUME_FLAG=""
+  [[ -n "$NETWORK_VOLUME_ID" ]] && NETWORK_VOLUME_FLAG="--network-volume-id $NETWORK_VOLUME_ID"
+  DATA_CENTER_FLAG=""
+  [[ -n "$DATA_CENTER_IDS" ]] && DATA_CENTER_FLAG="--data-center-ids $DATA_CENTER_IDS"
   # 22/tcp only -- plain scp needs nothing beyond SSH itself. An earlier
   # version of this line requested a croc relay's port range directly;
   # confirmed across 5 real pod rentals that RunPod's Secure Cloud pods
@@ -493,6 +670,8 @@ else
   POD_JSON="$("$RUNPODCTL" pod create \
     --gpu-id "$GPU_ID" \
     "${IMAGE_FLAGS[@]}" \
+    $NETWORK_VOLUME_FLAG \
+    $DATA_CENTER_FLAG \
     --container-disk-in-gb "$CONTAINER_DISK_GB" \
     --ports "22/tcp" \
     --public-ip \
@@ -510,9 +689,10 @@ fi
 echo ""
 
 PULL_BACK_OK=1  # flipped to 0 by rsync_with_retry() on a genuine failure
-                # (see the pull-back step below) -- cleanup_pod() below
-                # refuses to auto-terminate on 0, since the artifacts this
-                # whole run was for might not have made it off the pod yet.
+                # (see the pull-back step below). FORCE_TERMINATE_ON_PULL_
+                # FAILURE defaults to 1 (see its header doc above) --
+                # cleanup_pod() below terminates the pod regardless, unless
+                # that's explicitly set to 0 for this run.
 
 cleanup_pod() {
   if [[ "$KEEP_POD" == "1" ]]; then
@@ -520,7 +700,7 @@ cleanup_pod() {
     echo "yourself when done: runpodctl pod delete $POD_ID"
     return
   fi
-  if [[ "$PULL_BACK_OK" != "1" && "${FORCE_TERMINATE_ON_PULL_FAILURE:-0}" != "1" ]]; then
+  if [[ "$PULL_BACK_OK" != "1" && "${FORCE_TERMINATE_ON_PULL_FAILURE:-1}" != "1" ]]; then
     # CRITICAL: cancel Layer 2's blind timer (see "GLOBAL TIMEOUT WRAPPER"
     # near the top of this file) -- without this, a real incident: Layer 2
     # doesn't know this branch just decided to KEEP the pod for manual
@@ -545,8 +725,10 @@ cleanup_pod() {
     done
     echo "   runpodctl pod delete $POD_ID" >&2
     echo "" >&2
-    echo " Or, if you're confident nothing of value is on this pod, re-run" >&2
-    echo " with FORCE_TERMINATE_ON_PULL_FAILURE=1 to delete it anyway." >&2
+    echo " (You're seeing this because FORCE_TERMINATE_ON_PULL_FAILURE=0" >&2
+    echo " was explicitly set for this run -- it defaults to 1, i.e." >&2
+    echo " terminate regardless, since a dangling pod costs more than a" >&2
+    echo " lost local artifact wandb likely still has a copy of.)" >&2
     echo "==================================================================" >&2
     echo "" >&2
     echo " (Layer 2's backup pod-deletion timer has been cancelled -- this" >&2
@@ -666,14 +848,47 @@ fi
 echo ""
 
 export POD_HOST POD_PORT SSH_KEY LANES
-echo "=================================================================="
-echo " Phase 2/2: data files, IN THE BACKGROUND, starting IMMEDIATELY --"
-echo " it only needs SSH (creates its own remote directory), no"
-echo " dependency on phase 1 or bootstrap. Now that scp replaced croc,"
-echo " there's no relay/tunnel setup to wait on either."
-echo "=================================================================="
-bash "$HERE/scp_data_files.sh" &
-DATA_SCP_PID=$!
+DATA_SCP_PID=""
+if [[ -n "$NETWORK_VOLUME_ID" ]]; then
+  echo "=================================================================="
+  echo " Phase 2/2: data files -- SKIPPED (NETWORK_VOLUME_ID=$NETWORK_VOLUME_ID"
+  echo " is attached). Verifying the expected files are already on the"
+  echo " mounted volume instead of re-uploading ~14GB every run."
+  echo "=================================================================="
+  DATA_OK=1
+  for f in train_80.h5 val_80.h5; do
+    local_path="$REPO_ROOT/transformer_neurIPS/data/$f"
+    local_size="$(stat -f%z "$local_path" 2>/dev/null || stat -c%s "$local_path" 2>/dev/null || echo "")"
+    remote_size="$(ssh -p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+      "root@$POD_HOST" "stat -c%s '/workspace/cgan/transformer_neurIPS/data/$f' 2>/dev/null" 2>/dev/null || echo "")"
+    if [[ -n "$remote_size" && -n "$local_size" && "$remote_size" == "$local_size" ]]; then
+      echo "  [OK]      $f ($remote_size bytes, matches local)"
+    else
+      echo "  [MISSING] $f (local=${local_size:-<none>} remote=${remote_size:-<none>})" >&2
+      DATA_OK=0
+    fi
+  done
+  if [[ "$DATA_OK" != "1" ]]; then
+    echo "" >&2
+    echo "==================================================================" >&2
+    echo " Expected data not found (or size mismatch) on volume" >&2
+    echo " $NETWORK_VOLUME_ID -- training will NOT launch. Upload it once" >&2
+    echo " (from a pod with this SAME --network-volume-id attached):" >&2
+    echo "   POD_HOST=<host> POD_PORT=<port> SSH_KEY=<key> bash $HERE/scp_data_files.sh" >&2
+    echo "==================================================================" >&2
+    exit 1
+  fi
+  echo ""
+else
+  echo "=================================================================="
+  echo " Phase 2/2: data files, IN THE BACKGROUND, starting IMMEDIATELY --"
+  echo " it only needs SSH (creates its own remote directory), no"
+  echo " dependency on phase 1 or bootstrap. Now that scp replaced croc,"
+  echo " there's no relay/tunnel setup to wait on either."
+  echo "=================================================================="
+  bash "$HERE/scp_data_files.sh" &
+  DATA_SCP_PID=$!
+fi
 
 echo ""
 echo "=================================================================="
@@ -685,7 +900,11 @@ echo "=================================================================="
 bash "$HERE/scp_env_files.sh"
 
 echo ""
-echo "Bootstrapping the venv while the data transfer above keeps running..."
+if [[ -n "$DATA_SCP_PID" ]]; then
+  echo "Bootstrapping the venv while the data transfer above keeps running..."
+else
+  echo "Bootstrapping the venv (data already verified on the attached volume)..."
+fi
 ssh -p "$POD_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
   "root@$POD_HOST" bash -s <<'REMOTE'
 set -euo pipefail
@@ -693,30 +912,32 @@ cd /workspace/cgan/transformer_neurIPS
 bash singleshot/bootstrap_remote.sh
 REMOTE
 
-echo ""
-echo "Waiting for the data transfer to finish (if it hasn't already)..."
-# NOT a bare `wait` -- under `set -euo pipefail`, a nonzero exit from
-# scp_data_files.sh (e.g. a lane's retries all exhausted -- see
-# lib_scp.sh's scp_lane_with_retry) would trip errexit RIGHT HERE and
-# silently kill the entire pipeline before training ever launches, with
-# no clearer diagnostic than whatever scp_data_files.sh itself printed.
-# The pod still gets cleanly terminated either way (the EXIT trap fires
-# regardless), so this isn't an orphaned-billing risk -- but a pod
-# rental producing zero training results with no loud, unambiguous
-# reason why is exactly the kind of failure worth naming explicitly.
-if ! wait "$DATA_SCP_PID"; then
-  echo "" >&2
-  echo "==================================================================" >&2
-  echo " DATA TRANSFER FAILED -- see scp_data_files.sh's own output above" >&2
-  echo " for which file/lane. Training will NOT launch. This pod will" >&2
-  echo " still be terminated normally (nothing to pull back yet), but" >&2
-  echo " this run produced no results -- re-run once the underlying" >&2
-  echo " network/SSH issue is understood (a single transient failure" >&2
-  echo " should have been absorbed by scp_lane_with_retry's 3 attempts;" >&2
-  echo " if you're seeing this, all 3 attempts failed for at least one" >&2
-  echo " lane, which is worth a closer look, not just a blind re-run)." >&2
-  echo "==================================================================" >&2
-  exit 1
+if [[ -n "$DATA_SCP_PID" ]]; then
+  echo ""
+  echo "Waiting for the data transfer to finish (if it hasn't already)..."
+  # NOT a bare `wait` -- under `set -euo pipefail`, a nonzero exit from
+  # scp_data_files.sh (e.g. a lane's retries all exhausted -- see
+  # lib_scp.sh's scp_lane_with_retry) would trip errexit RIGHT HERE and
+  # silently kill the entire pipeline before training ever launches, with
+  # no clearer diagnostic than whatever scp_data_files.sh itself printed.
+  # The pod still gets cleanly terminated either way (the EXIT trap fires
+  # regardless), so this isn't an orphaned-billing risk -- but a pod
+  # rental producing zero training results with no loud, unambiguous
+  # reason why is exactly the kind of failure worth naming explicitly.
+  if ! wait "$DATA_SCP_PID"; then
+    echo "" >&2
+    echo "==================================================================" >&2
+    echo " DATA TRANSFER FAILED -- see scp_data_files.sh's own output above" >&2
+    echo " for which file/lane. Training will NOT launch. This pod will" >&2
+    echo " still be terminated normally (nothing to pull back yet), but" >&2
+    echo " this run produced no results -- re-run once the underlying" >&2
+    echo " network/SSH issue is understood (a single transient failure" >&2
+    echo " should have been absorbed by scp_lane_with_retry's 3 attempts;" >&2
+    echo " if you're seeing this, all 3 attempts failed for at least one" >&2
+    echo " lane, which is worth a closer look, not just a blind re-run)." >&2
+    echo "==================================================================" >&2
+    exit 1
+  fi
 fi
 
 echo ""
@@ -778,7 +999,7 @@ fi
 #     --val-every 500 --no-wandb
 launch_training() {
   local arm="$1" round="$2" max_steps="$3" max_hours="$4" fresh="$5" outvar="$6" extra="${7:-}"
-  local fresh_flags="" group_flags="" tag="[${arm}/r${round}]"
+  local fresh_flags="" group_flags="" patience_flags="" tag="[${arm}/r${round}]"
   local num_slots="${#SLOT_ARMS[@]}"
   [[ "$fresh" == "1" ]] && fresh_flags="--fresh --no-warm-start"
   # Uses the trainer's own existing generic `--set KEY=VALUE` Config-
@@ -787,6 +1008,10 @@ launch_training() {
   # instead of adding a dedicated flag there -- one fewer thing to keep
   # in sync between the two scripts.
   [[ -n "$WANDB_GROUP" ]] && group_flags="--set WANDB_GROUP=$WANDB_GROUP"
+  # Defaults to 500 (see EARLY_STOP_PATIENCE_STEPS above) -- appended
+  # BEFORE $extra below, so a slot's own --extra="--early-stop-patience-
+  # steps N" still wins (argparse takes the last occurrence of a flag).
+  [[ -n "$EARLY_STOP_PATIENCE_STEPS" ]] && patience_flags="--early-stop-patience-steps $EARLY_STOP_PATIENCE_STEPS"
   # $extra is a raw, per-slot string appended verbatim to this slot's
   # python invocation -- e.g. "--set WEIGHT_DECAY=0.05 --set DROPOUT=0.05"
   # for an ad-hoc regularization experiment on ONE slot without needing
@@ -810,6 +1035,17 @@ cd /workspace/cgan/transformer_neurIPS
 # /workspace/cgan/.venv -- one level up from transformer_neurIPS/.
 source ../.venv/bin/activate
 $WANDB_SETUP
+# Force ANSI color even though this remote script's stdout is piped
+# through ssh into the local awk tagger below, not a real tty --
+# train_production_transformer_deep_dive.py's own _COLOR_ON check
+# (sys.stdout.isatty()) is False in exactly that situation, so the
+# per-epoch report's green/red Δ coloring was silently rendering as
+# plain text on every real run until this was added. The escape codes
+# survive the awk tagging (it only prepends "tag " to each line) and
+# render fine both in a real local terminal and in wandb's own console-
+# capture view (which supports ANSI), so this is safe to force
+# unconditionally here.
+export PFD_FORCE_COLOR=1
 # PyTorch (and numpy/h5py's own BLAS backend) default to grabbing a CPU
 # thread PER CORE for their intra-op thread pool, with no constraint --
 # confirmed nothing in this trainer ever calls torch.set_num_threads()
@@ -828,8 +1064,8 @@ _THREADS_PER_SLOT=\$(( _NPROC / $num_slots ))
 export OMP_NUM_THREADS="\$_THREADS_PER_SLOT"
 export MKL_NUM_THREADS="\$_THREADS_PER_SLOT"
 # SEPARATE from OMP/MKL above -- torch._inductor's own compile-worker
-# subprocess pool (the `compile_worker/__main__.py --workers=N`
-# processes visible in `ps aux` during "getting the model ready")
+# subprocess pool (the \`compile_worker/__main__.py --workers=N\`
+# processes visible in \`ps aux\` during "getting the model ready")
 # defaults to min(32, cpu_count) PER PROCESS via its own
 # TORCHINDUCTOR_COMPILE_THREADS knob (torch/_inductor/config.py,
 # decide_compile_threads()) -- confirmed reading that source directly:
@@ -842,9 +1078,22 @@ export MKL_NUM_THREADS="\$_THREADS_PER_SLOT"
 # "getting models ready" felt slower once concurrent batches became
 # routine even after the OMP/MKL fix above.
 export TORCHINDUCTOR_COMPILE_THREADS="\$_THREADS_PER_SLOT"
+# Persist this arm's own full stdout/stderr on the pod (sweep_logs/
+# already exists and is already rsync'd back by this script's own
+# pull-back step below) -- confirmed the hard way this session that a
+# crash's traceback was otherwise UNRECOVERABLE: this SSH pipe's
+# output only ever reached whichever local terminal launched it, and
+# once that process exits (crash, or the pod being torn down before
+# anyone thought to scroll back), the actual error is gone for good.
+# \`tee\` still forwards everything to this pipe's stdout too, so the
+# local \"[arm/rN] \"-tagged live view is unaffected; \`set -o pipefail\`
+# (already active) means a failing python still fails this pipeline
+# even though tee itself always exits 0.
+mkdir -p sweep_logs
 python train_production_transformer_deep_dive.py \\
   --arm $arm --round $round --max-steps $max_steps --max-hours $max_hours \\
-  --val-every 500 $WANDB_FLAG $fresh_flags $group_flags $extra
+  --val-every 500 $WANDB_FLAG $fresh_flags $group_flags $patience_flags $extra \\
+  2>&1 | tee -a "sweep_logs/r${round}_${arm}.log"
 REMOTE
   ) &
   eval "$outvar=\$!"

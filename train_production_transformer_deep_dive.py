@@ -978,10 +978,49 @@ class Config:
     RIDGE_DISTILL_WEIGHT = 0.0
     RIDGE_DISTILL_WARMUP_FRAC = 0.2   # same ramp convention as AR_WEIGHT_WARMUP_FRAC
 
+    # -- latent-consistency loss (docs/CHANGES_2026-11-05.md, fix 1) --------
+    # Every other loss term scores only the 3 decoded centroid velocities,
+    # i.e. a rank-3 projection of the 47-dim latent: 44 latent directions got
+    # no gradient at all, the model's predicted latents drifted ~80 sigma off
+    # the data manifold (val latent MSE 2.31 vs ~1e-5 for persistence), and
+    # those off-manifold latents are what the rollout feeds back as input.
+    # This adds  LATENT_LOSS_WEIGHT * mean(((pred - tgt) / latent_std)^2)
+    # to the teacher-forced loss AND to the frame_ar rollout loss, with
+    # latent_std = the model's own per-dim feature std (training split), so
+    # every latent direction is pinned to the data. 0.0 = the old objective.
+    LATENT_LOSS_WEIGHT = 1.0
+    # Output projection in fp32 under bf16 autocast (model_variants.py
+    # BaseTransformer._head). False = old bf16-output behaviour.
+    FP32_OUTPUT_HEAD = True
+    # The output head predicts the latent in STANDARDISED units and the model
+    # de-normalises it with its own feat_mean/feat_std (fix 7). Before this
+    # the head emitted raw latents (per-dim std 0.01-0.04) from unit-scale
+    # features, so one AdamW step at LR 1e-3 moved the prediction by many
+    # latent standard deviations -- in the 2026-11-05 log the pre-clip grad
+    # norm sat at 8-25x GRAD_CLIP for the whole run and the raw model's
+    # rollout score jumped between +1.8% and +44.8% from one eval to the
+    # next. Old checkpoints are converted EXACTLY on load (warm start and
+    # resume), see convert_head_to_normalized(). False = old raw-output head.
+    OUTPUT_NORMALIZED = True
+
     # -- evaluation ---------------------------------------------------------
     VAL_CONTEXT_STEPS = 12                      # frames fed as context
     VAL_ROLLOUT_STEPS = NUM_X * (NUM_TIME - VAL_CONTEXT_STEPS)   # 1768 tokens (v1.0: 728)
-    VAL_ROLLOUT_SEQS = 64      # fixed row set; model AND persistence both use it
+    # Rollout sequences per eval, drawn STRATIFIED by the `param` column
+    # (equal count per validation experiment, first rows of each in file
+    # order -- the HDF5 rows are shuffled at assembly) and fixed for the
+    # whole run. Was 64 (launcher: 16) first-rows-unstratified; 16 is ~5
+    # sequences per val experiment, far too few to separate 2-point effects.
+    VAL_ROLLOUT_SEQS = 256
+    # What `_rollout_best.pt` promotion (and therefore early stopping) is
+    # decided on:
+    #   'improvement_param_mean' (default) -- the UNWEIGHTED mean over val
+    #       experiments of each experiment's own improvement_pct vs
+    #       persistence (OVERVIEW.md §11.3's reporting convention). Without
+    #       this the pooled MSE is dominated by the fastest case (11p4).
+    #   'rollout_mse' -- the old rule: lowest pooled rollout MSE.
+    # Either way a promotion also requires beating persistence.
+    PROMOTE_METRIC = 'improvement_param_mean'
     VAL_EVERY_STEPS = 25
     LOG_EVERY_STEPS = 25
     # Real, MEASURED cadence on H100/H200 this session: 25 steps took
@@ -1052,6 +1091,15 @@ class Config:
     # of a lever that actually helps. This does not fix that underlying
     # problem; it stops paying for it automatically.
     EARLY_STOP_PATIENCE_STEPS = None
+    # Early stopping is never allowed to fire before this step. None (default)
+    # = auto: the step at which every warm-up ramp in effect has finished
+    # (AR loss weight, AR horizon curriculum, ridge-distill weight, LR
+    # warmup). A run that is stopped while its curricula are still ramping
+    # has not yet trained on the objective it is being judged on -- the
+    # 2026-11-05 warm-start run early-stopped at step 1750, before the AR
+    # horizon (1800-step ramp) had even reached its target. 0 disables the
+    # floor.
+    EARLY_STOP_MIN_STEPS = None
 
     # -- runtime ------------------------------------------------------------
     USE_TF32 = True
@@ -2520,6 +2568,62 @@ def centroid_per_dim_errors(pred_latent, tgt_latent, cfg=Config):
     return out
 
 
+def latent_consistency_loss(pred_latent, tgt_latent, latent_std):
+    """Mean squared error in per-dim STANDARDISED latent units.
+
+    `latent_std` broadcasts against the trailing latent axes: shape
+    `(LATENT_DIM,)` for token models, `(NUM_X, LATENT_DIM)` for frame models
+    (after `to_per_token_latent()`). Computed in fp32 regardless of autocast.
+
+    Why this exists (docs/CHANGES_2026-11-05.md, fix 1): the decoded-centroid
+    loss only sees a rank-3 projection of the 47-dim latent, so without this
+    term the model is free to emit latents far off the data manifold, which
+    the autoregressive rollout then feeds back as its own input.
+    """
+    with torch.autocast(device_type='cuda', enabled=False):
+        d = (pred_latent.float() - tgt_latent.float()) / latent_std.float()
+        return d.pow(2).mean()
+
+
+# parse_param()'s table in data_prep/prepare_data.py, inverted: the `param`
+# column stores the physical inlet speed, logs/wandb use the folder code.
+PARAM_CODE_BY_VALUE = {5.6: "3p6", 6.9: "4p4", 7.2: "4p6", 8.1: "5p2", 10.0: "6p4",
+                       10.3: "6p6", 11.3: "7p2", 12.2: "7p8", 13.1: "8p4",
+                       16.3: "10p4", 17.8: "11p4"}
+
+
+def param_label(value):
+    """`10.0 -> '6p4'`; unknown values fall back to `'U<value>'`."""
+    v = float(value)
+    for k, name in PARAM_CODE_BY_VALUE.items():
+        if abs(v - k) < 1e-3:
+            return name
+    return f"U{v:g}"
+
+
+def stratified_rollout_indices(val_data, cfg, n_total):
+    """Fixed, param-stratified row selection for the rollout eval.
+
+    Returns `(idx, labels)`: a LongTensor of row indices (on `val_data`'s
+    device) with `max(1, n_total // n_params)` rows per distinct `param`
+    value -- the FIRST such rows in file order (the HDF5 rows are shuffled at
+    assembly, see prepare_data.py) -- and the matching per-row param labels.
+    Deterministic, so every eval of a run (and every run on the same data)
+    scores exactly the same sequences.
+    """
+    pcol = cfg.LATENT_DIM + 4                       # [lat | x y z t param]
+    pvals = val_data[:, 0, pcol].detach().float().cpu()
+    uniq = torch.unique(pvals)
+    per = max(1, int(n_total) // max(1, len(uniq)))
+    chosen = []
+    for u in uniq.tolist():
+        rows = torch.nonzero(torch.isclose(pvals, torch.tensor(u)), as_tuple=False).flatten()
+        chosen.append(rows[:per])
+    idx = torch.cat(chosen).sort().values
+    labels = [param_label(v) for v in pvals[idx].tolist()]
+    return idx.to(val_data.device), labels
+
+
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
@@ -3269,7 +3373,7 @@ def rollout_frames(model, batch, cfg, ctx_frames=None, n_frames=None):
 
 
 def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
-                  ridge_A=None):
+                  ridge_A=None, latent_std=None):
     """Frame-aligned multi-step autoregressive loss.
 
     The context is a whole number of frames and the horizon is a whole number of
@@ -3293,8 +3397,15 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
     returns `(ground_truth_loss, ridge_rollout_loss)` instead of a single
     tensor. `None` (default) keeps today's scalar-tensor return exactly
     -- every other call site/test is unaffected.
+
+    `latent_std` (docs/CHANGES_2026-11-05.md, fix 1): if given and
+    `cfg.LATENT_LOSS_WEIGHT > 0`, the ground-truth term ALSO includes
+    `LATENT_LOSS_WEIGHT * latent_consistency_loss(...)` over the rolled-out
+    predictions -- these are exactly the latents that get fed back, so this
+    is where staying on the data manifold matters most.
     """
     NX, LD, NT = cfg.NUM_X, cfg.LATENT_DIM, cfg.NUM_TIME
+    lat_w = float(getattr(cfg, 'LATENT_LOSS_WEIGHT', 0.0)) if latent_std is not None else 0.0
     n_fr = int(n_frames_override) if n_frames_override is not None else int(cfg.AR_FRAMES)
     seqs = batch[:int(cfg.AR_SEQS)]
     if seqs.shape[0] == 0 or n_fr < 1:
@@ -3418,10 +3529,12 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
         # trailing width and crashed with a linear-layer shape mismatch
         # (confirmed: "mat1 and mat2 shapes cannot be multiplied (6x470
         # and 47x100)") on the very first training step.
-        return centroid_velocity_loss(
-            to_per_token_latent(torch.cat(preds, 1), cfg),
-            to_per_token_latent(
-                frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg), cfg)
+        p_lat = to_per_token_latent(torch.cat(preds, 1), cfg)
+        t_lat = to_per_token_latent(frames[:, ctx_frames:ctx_frames + n_fr, :width], cfg)
+        loss = centroid_velocity_loss(p_lat, t_lat, cfg)
+        if lat_w > 0:
+            loss = loss + lat_w * latent_consistency_loss(p_lat, t_lat, latent_std)
+        return loss
 
     ctx_len = ctx_frames * NX
     horizon = n_fr * NX
@@ -3447,8 +3560,10 @@ def frame_ar_loss(model, batch, cfg, generator=None, n_frames_override=None,
     # points. See OVERVIEW.md §10.9.7 for the rationale and centroid-
     # index derivation.
     network_preds = torch.cat(preds, 1)
-    gt_loss = centroid_velocity_loss(
-        network_preds, seqs[:, ctx_len:ctx_len + horizon, :LD], cfg)
+    gt_lat = seqs[:, ctx_len:ctx_len + horizon, :LD]
+    gt_loss = centroid_velocity_loss(network_preds, gt_lat, cfg)
+    if lat_w > 0:
+        gt_loss = gt_loss + lat_w * latent_consistency_loss(network_preds, gt_lat, latent_std)
     if ridge_A is None:
         return gt_loss
     # Menu item 2: the ridge map's OWN independent rollout from the same
@@ -3683,13 +3798,27 @@ def _run_with_oom_backoff(fn, batch, device, min_chunk=1):
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
 def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
-             tf_batch_size=None):
+             tf_batch_size=None, roll_idx=None, roll_labels=None,
+             ridge_A=None, latent_std=None):
     """Teacher-forced loss over all of val + rollout vs persistence.
 
-    The rollout scores the model AND persistence on the SAME fixed, unshuffled
-    first `VAL_ROLLOUT_SEQS` rows. The previous version compared 512 persistence
-    sequences against 8 model sequences, which made the headline improvement
-    number partly an artefact of sample size.
+    The rollout scores the model AND persistence on the SAME fixed rows:
+    `roll_idx` (see `stratified_rollout_indices()`, equal rows per val
+    experiment) when given, else the first `VAL_ROLLOUT_SEQS` rows (old
+    behaviour). The previous version compared 512 persistence sequences
+    against 8 model sequences, which made the headline improvement number
+    partly an artefact of sample size.
+
+    docs/CHANGES_2026-11-05.md additions:
+      * `roll_labels` (per-row param code) -> per-experiment
+        `improvement_pct/<code>` and their unweighted mean
+        `improvement_pct_param_mean` (OVERVIEW.md §11.3).
+      * `ridge_A` -> the ridge map's own rollout on the SAME rows
+        (`ridge_improvement_pct[...]`, `ceiling_captured_pct`), so the real
+        bar (+69% in the notebook) is measured on identical sequences.
+      * `latent_std` -> `val_tf_latent_nmse`, the teacher-forced latent error
+        in standardised units (~0.03 for persistence on this data; the old
+        recipe's checkpoint sat at ~1e4) -- the off-manifold health signal.
     """
     model.eval()
     NX, LD = cfg.NUM_X, cfg.LATENT_DIM
@@ -3707,7 +3836,7 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
     # costs proportionally large attention-score memory. On CUDA
     # cfg.EVAL_BATCH_SIZE (128) is used as-is.
     tf_bs = int(tf_batch_size) if tf_batch_size else int(cfg.EVAL_BATCH_SIZE)
-    tf_loss = tf_mse = 0.0
+    tf_loss = tf_mse = tf_nmse = 0.0
     tf_n = 0
     for start in range(0, val_data.shape[0], tf_bs):
         b = val_data[start:start + tf_bs]
@@ -3720,29 +3849,42 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         # val_tf_loss is the same centroid_velocity_loss quantity train() is
         # minimised on; val_tf_mse is kept as an informational latent-space
         # sanity check (see null_baselines docstring), not a training target.
-        tf_loss += centroid_velocity_loss(
-            to_per_token_latent(pred, cfg), to_per_token_latent(tgt, cfg), cfg
-        ).item() * b.shape[0]
+        p_lat, t_lat = to_per_token_latent(pred, cfg), to_per_token_latent(tgt, cfg)
+        tf_loss += centroid_velocity_loss(p_lat, t_lat, cfg).item() * b.shape[0]
         tf_mse += mse_loss(pred, tgt).item() * b.shape[0]
+        if latent_std is not None:
+            tf_nmse += latent_consistency_loss(p_lat, t_lat, latent_std).item() * b.shape[0]
         tf_n += b.shape[0]
 
-    # -- rollout vs persistence, matched populations ------------------------
-    # Both are accumulated over the SAME rows and the SAME frames, so the
-    # improvement percentage is a like-for-like comparison.
-    n_roll = min(int(cfg.VAL_ROLLOUT_SEQS), val_data.shape[0])
-    se_model = torch.zeros(n_frames, dtype=torch.float64)
-    se_pers = torch.zeros(n_frames, dtype=torch.float64)
+    # -- rollout vs persistence (vs ridge), matched populations -------------
+    # All accumulated over the SAME rows and the SAME frames, so the
+    # improvement percentages are like-for-like comparisons.
+    if roll_idx is None:
+        n_roll = min(int(cfg.VAL_ROLLOUT_SEQS), val_data.shape[0])
+        roll_rows = torch.arange(n_roll, device=val_data.device)
+    else:
+        roll_rows = roll_idx
+        n_roll = int(roll_rows.numel())
+    labels = list(roll_labels) if roll_labels is not None else ["all"] * n_roll
+    use_ridge = ridge_A is not None and not getattr(model, 'frame_native', False)
+
+    def _zeros():
+        return torch.zeros(n_frames, dtype=torch.float64)
+    se_model, se_pers, se_ridge = _zeros(), _zeros(), _zeros()
+    per = {lab: {"m": _zeros(), "p": _zeros(), "r": _zeros(), "n": 0}
+           for lab in dict.fromkeys(labels)}
     frames_scored = n_frames
     rolled = 0
     t0 = time.time()
     for start in range(0, n_roll, chunk):
-        b = val_data[start:min(start + chunk, n_roll)]
+        stop = min(start + chunk, n_roll)
+        b = val_data.index_select(0, roll_rows[start:stop])
         if b.device.type != device.split(':')[0]:
             b = b.to(device, non_blocking=True)
         B = b.shape[0]
         true_f = b[:, ctx * NX:, :LD].reshape(B, n_frames, NX, LD).float()
-        pers_f = b[:, (ctx - 1) * NX:ctx * NX, :LD].unsqueeze(1).float() \
-                  .expand(-1, n_frames, -1, -1)
+        last_f = b[:, (ctx - 1) * NX:ctx * NX, :LD].float()
+        pers_f = last_f.unsqueeze(1).expand(-1, n_frames, -1, -1)
         with _autocast():
             pred_f = _run_with_oom_backoff(
                 lambda bb: rollout_frames(model, bb, cfg), b, device)
@@ -3757,10 +3899,26 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
         true_v = decode_centroid(true_f, cfg)
         pers_v = decode_centroid(pers_f, cfg)
         pred_v = decode_centroid(pred_f, cfg)
-        # .cpu() BEFORE .double(): MPS has no float64, so the cast has to happen
-        # on the host or it raises.
-        se_model[:k] += ((pred_v - true_v[:, :k]) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
-        se_pers += ((pers_v - true_v) ** 2).mean(dim=(2, 3)).sum(0).cpu().double()
+        # per-sequence, per-frame squared error, (B, n_frames)
+        # .cpu() BEFORE .double(): MPS has no float64.
+        e_m = torch.zeros(B, n_frames, dtype=torch.float64)
+        e_m[:, :k] = ((pred_v - true_v[:, :k]) ** 2).mean(dim=(2, 3)).cpu().double()
+        e_p = ((pers_v - true_v) ** 2).mean(dim=(2, 3)).cpu().double()
+        if use_ridge:
+            ridge_f = ridge_rollout_targets(last_f.reshape(B, NX * LD), ridge_A, cfg,
+                                            n_frames).reshape(B, n_frames, NX, LD)
+            ridge_v = decode_centroid(ridge_f, cfg)
+            e_r = ((ridge_v - true_v) ** 2).mean(dim=(2, 3)).cpu().double()
+        else:
+            e_r = torch.zeros_like(e_p)
+        se_model += e_m.sum(0)
+        se_pers += e_p.sum(0)
+        se_ridge += e_r.sum(0)
+        for j, lab in enumerate(labels[start:stop]):
+            per[lab]["m"] += e_m[j]
+            per[lab]["p"] += e_p[j]
+            per[lab]["r"] += e_r[j]
+            per[lab]["n"] += 1
         rolled += B
     roll_secs = time.time() - t0
 
@@ -3771,7 +3929,38 @@ def evaluate(model, val_data, cfg, device, amp_dtype=None, chunk=32,
     imp_pf = (mse_pers_pf - mse_model_pf) / (mse_pers_pf + 1e-12) * 100
     m_all, p_all = float(mse_model_pf.mean()), float(mse_pers_pf.mean())
 
+    def _imp(m_, p_):
+        return (p_ - m_) / (p_ + 1e-12) * 100
+
+    extra = {}
+    per_imp, per_ridge = [], []
+    for lab, acc in per.items():
+        if acc["n"] == 0:
+            continue
+        pm = float((acc["m"] / acc["n"])[:frames_scored].mean())
+        pp = float((acc["p"] / acc["n"])[:frames_scored].mean())
+        extra[f"improvement_pct/{lab}"] = _imp(pm, pp)
+        extra[f"rollout_sequences/{lab}"] = acc["n"]
+        per_imp.append(extra[f"improvement_pct/{lab}"])
+        if use_ridge:
+            pr = float((acc["r"] / acc["n"])[:frames_scored].mean())
+            extra[f"ridge_improvement_pct/{lab}"] = _imp(pr, pp)
+            per_ridge.append(extra[f"ridge_improvement_pct/{lab}"])
+    if per_imp:
+        extra["improvement_pct_param_mean"] = sum(per_imp) / len(per_imp)
+    if use_ridge:
+        r_all = float((se_ridge / max(rolled, 1))[:frames_scored].mean())
+        extra["ridge_rollout_mse"] = r_all
+        extra["ridge_improvement_pct"] = _imp(r_all, p_all)
+        if per_ridge:
+            extra["ridge_improvement_pct_param_mean"] = sum(per_ridge) / len(per_ridge)
+        # share of the persistence->ridge gap the model has closed
+        extra["ceiling_captured_pct"] = (p_all - m_all) / (p_all - r_all + 1e-12) * 100
+    if latent_std is not None:
+        extra["val_tf_latent_nmse"] = tf_nmse / max(tf_n, 1)
+
     return {
+        **extra,
         "val_tf_loss": tf_loss / max(tf_n, 1),
         "val_tf_mse": tf_mse / max(tf_n, 1),
         "val_sequences_tf": tf_n,
@@ -4443,7 +4632,7 @@ def average_state_dicts(state_dicts):
 
 def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
                     save_scripted=None, cfg=Config, log=print, tel=None,
-                    ema_model=None):
+                    ema_model=None, weights_from_ema=False):
     """Write a state-dict checkpoint (atomically) and, if enabled, a
     TorchScript companion at `<path without .pt>_scripted.pt`. If `tel` (a
     `_Telemetry` instance) is given, ALSO attempts to upload both files to
@@ -4471,11 +4660,25 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
     `f"r{SWEEP_ROUND}_{ARM}"` id with `resume="allow"` -- the combination
     that let an unrelated cold-started process silently append into a
     previous attempt's history (OVERVIEW.md v6.0).
+
+    `weights_from_ema` (docs/CHANGES_2026-11-05.md, fix 2): set by callers
+    whose save decision was made on the EMA model's metrics (`_rollout_best`,
+    `_best` when EMA_DECAY>0). Then `model_state_dict` -- the key warm-start,
+    eval tools and the scripted twin use -- holds the EMA weights that
+    actually earned the number, and the live weights move to
+    `raw_model_state_dict`. Previously the live weights were saved under the
+    EMA's score: in the 2026-11-05 run the step-250 `_rollout_best.pt` was
+    labelled +46.95% (EMA) but contained weights that scored +1.80% (raw).
+    `_latest.pt` keeps live weights in `model_state_dict` (resume needs
+    them) plus `ema_state_dict`.
     """
+    use_ema = bool(weights_from_ema) and ema_model is not None
+    live_sd = model.state_dict()
     payload = {
         'step': step,
         'epoch': step,          # back-compat: the leaderboard test reads 'epoch'
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': ema_model.state_dict() if use_ema else live_sd,
+        'weights_source': 'ema' if use_ema else 'live',
         'optimizer_state_dict': optimizer.state_dict() if optimizer is not None else None,
         'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'config': config_dict(),
@@ -4490,7 +4693,9 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
     # every other caller passes nothing here, so `ema_state_dict` simply
     # doesn't exist in their checkpoints, unchanged from before this field
     # was added.
-    if ema_model is not None:
+    if use_ema:
+        payload['raw_model_state_dict'] = live_sd
+    elif ema_model is not None:
         payload['ema_state_dict'] = ema_model.state_dict()
     payload.update(extra)
     tmp = path + ".tmp"
@@ -4505,7 +4710,8 @@ def save_checkpoint(path, model, optimizer, step, extra, scheduler=None,
         script_path = path[:-3] + "_scripted.pt" if path.endswith(".pt") \
             else path + "_scripted.pt"
         try:
-            save_scripted_model(script_path, model, cfg=cfg, log=log)
+            save_scripted_model(script_path, ema_model if use_ema else model,
+                                cfg=cfg, log=log)
         except Exception as e:
             log(_c(
                 f"  [scripted] save failed for {os.path.basename(script_path)}"
@@ -4578,6 +4784,42 @@ def _wsc(text, color):
     return f"{codes.get(color, '')}{text}\033[0m"
 
 
+def convert_head_to_normalized(state_dict, model, log=print):
+    """Rewrite a RAW-output checkpoint's `output_head` in place so it computes
+    the identical function inside an `OUTPUT_NORMALIZED=True` model
+    (docs/CHANGES_2026-11-05.md, fix 7).
+
+    Raw head:        y = W h + b                      (+ anchor if PREDICT_DELTA)
+    Normalised head: y = (W' h + b') * s + m          (m omitted under PREDICT_DELTA)
+    => W' = W / s[:, None],  b' = (b - m) / s   (b' = b / s under PREDICT_DELTA)
+
+    `s`, `m` = the first `out_width` entries of the checkpoint's own
+    feat_std / feat_mean (falling back to the model's buffers if the
+    checkpoint has none). Works on prefixed (`_orig_mod.`) and plain keys.
+    Returns True if a head was converted.
+    """
+    wkey = next((k for k in state_dict if k.endswith("output_head.weight")), None)
+    if wkey is None:
+        return False
+    prefix = wkey[:-len("output_head.weight")]
+    inner = getattr(model, "_orig_mod", model)
+    W = state_dict[wkey]
+    width = W.shape[0]
+    fs = state_dict.get(prefix + "feat_std", inner.feat_std)
+    fm = state_dict.get(prefix + "feat_mean", inner.feat_mean)
+    s = fs[:width].to(W.device, W.dtype)
+    m = fm[:width].to(W.device, W.dtype)
+    state_dict[wkey] = W / s[:, None]
+    bkey = prefix + "output_head.bias"
+    if bkey in state_dict and state_dict[bkey] is not None:
+        shift = torch.zeros_like(m) if getattr(inner, "predict_delta", False) else m
+        state_dict[bkey] = (state_dict[bkey] - shift) / s
+    log(_wsc("[output-head] converted a raw-output checkpoint head to the "
+             "standardised parameterisation (OUTPUT_NORMALIZED=True) -- "
+             "exact, same function", "cyan"))
+    return True
+
+
 def load_warm_start(model, ckpt_path, device, log=print,
                      extra_benign_missing=frozenset()):
     """Warm-start `model` from a v1.0 checkpoint under the v2.0 (NUM_TIME=80)
@@ -4648,6 +4890,12 @@ def load_warm_start(model, ckpt_path, device, log=print,
         (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
         for k, v in state_dict.items()
     }
+    ck_cfg = ck.get("config") if isinstance(ck, dict) else None
+    if (getattr(getattr(model, "_orig_mod", model), "output_normalized", False)
+            and not (ck_cfg or {}).get("OUTPUT_NORMALIZED", False)):
+        convert_head_to_normalized(state_dict, model, log=log)
+    if isinstance(ck, dict) and ck.get("weights_source"):
+        log(_wsc(f"[warm-start] checkpoint weights_source={ck['weights_source']}", "dim"))
 
     model_sd = model.state_dict()
 
@@ -4776,6 +5024,14 @@ def load_resume_checkpoint(model, optimizer, scheduler, latest_path, device,
     try:
         ck = torch.load(latest_path, map_location=device, weights_only=False)
         raw_sd = ck['model_state_dict']
+        # A `_latest.pt` written before OUTPUT_NORMALIZED existed has a raw-
+        # output head: convert it exactly, and don't reuse its optimizer
+        # moments (they were accumulated at the old parameter scale).
+        head_converted = False
+        if (getattr(getattr(model, "_orig_mod", model), "output_normalized", False)
+                and not ck.get('config', {}).get('OUTPUT_NORMALIZED', False)):
+            raw_sd = dict(raw_sd)
+            head_converted = convert_head_to_normalized(raw_sd, model, log=log)
         # Sanitize length-dependent tensors just like load_warm_start:
         # a `latest.pt` produced by a v1.0 (NUM_TIME=40) run has
         # `time_embeddings.weight` of shape (40, 256), which cannot be
@@ -4830,7 +5086,8 @@ def load_resume_checkpoint(model, optimizer, scheduler, latest_path, device,
         # weights are still perfectly good to warm-start from either way,
         # only the optimizer's own internal buffers are incompatible).
         ckpt_optimizer = str(ck.get('config', {}).get('OPTIMIZER', 'adamw')).lower()
-        optimizer_mismatch = ckpt_optimizer != str(Config.OPTIMIZER).lower()
+        optimizer_mismatch = (ckpt_optimizer != str(Config.OPTIMIZER).lower()
+                              or head_converted)
         if ck.get('optimizer_state_dict') and not cross_version and not optimizer_mismatch:
             optimizer.load_state_dict(ck['optimizer_state_dict'])
         elif ck.get('optimizer_state_dict') and cross_version:
@@ -5323,8 +5580,9 @@ def train(args, log=print):
         Config.CHECKPOINT_DIR, f"{run_name_for_resume}_latest.pt")
     will_resume = os.path.exists(latest_path_check) and not args.fresh
     warm_start_summary = None
-    if getattr(args, "no_warm_start", False):
-        log(_wsc("  [warm-start] disabled by --no-warm-start", "yellow"))
+    if getattr(args, "no_warm_start", False) or not getattr(args, "warm_start", None):
+        log(_wsc("  [warm-start] off -- cold start from random init "
+                 "(pass --warm-start CKPT to opt in)", "yellow"))
     elif will_resume:
         log(_wsc(
             f"  [warm-start] skipped: {latest_path_check} exists and "
@@ -5426,7 +5684,11 @@ def train(args, log=print):
             # regardless of gate outcome -- kept so the alert below can tell
             # "found a new self-relative low" apart from "promoted a new
             # checkpoint".
-            "promoted_rollout_mse": float('inf')}
+            "promoted_rollout_mse": float('inf'),
+            # 2026-11-05: the score promotion is decided on (higher=better,
+            # see Config.PROMOTE_METRIC) and the val_tf_loss `_best.pt`
+            # is now selected on.
+            "promoted_score": -float('inf'), "val_tf_loss": float('inf')}
     # Early-stopping state (see Config.EARLY_STOP_PATIENCE_STEPS) -- the
     # patience clock starts counting from THIS process's own resumed
     # `step`, NOT from 0: a resume is itself a fresh operator decision to
@@ -5454,6 +5716,60 @@ def train(args, log=print):
     step, best, did_resume, cross_version, resumed_wandb_run_id = (
         load_resume_checkpoint(model, optimizer, scheduler, latest_path,
                                device, args.fresh, best, log=log))
+    # Keys added 2026-11-05; absent from older checkpoints' `best` dicts.
+    best.setdefault("promoted_score", -float('inf'))
+    best.setdefault("val_tf_loss", float('inf'))
+
+    # EMA shadow on resume (docs/CHANGES_2026-11-05.md, fix 2b): the shadow
+    # was deep-copied ABOVE, before the resume load, i.e. from the freshly
+    # initialised (random) weights -- so after every resume the EMA used for
+    # promotion restarted from noise. Restore it from the checkpoint's
+    # `ema_state_dict`, or from the just-resumed live weights if absent.
+    if did_resume and ema_model is not None:
+        _ema_sd = None
+        try:
+            _ck = torch.load(latest_path, map_location=device, weights_only=False)
+            _ema_sd = _ck.get("ema_state_dict") if isinstance(_ck, dict) else None
+            del _ck
+        except Exception as e:
+            log(f"  [ema] could not re-read {latest_path} for ema_state_dict ({e})")
+        if _ema_sd is not None:
+            ema_model.load_state_dict(_ema_sd)
+            log(_wsc("  [ema] shadow restored from checkpoint ema_state_dict", "cyan"))
+        else:
+            ema_model.load_state_dict(getattr(model, "_orig_mod", model).state_dict())
+            log(_wsc("  [ema] no ema_state_dict in checkpoint -- shadow reset to "
+                     "the resumed live weights", "yellow"))
+
+    # Per-dim latent std for the latent-consistency loss / val_tf_latent_nmse
+    # (fix 1). Read from the model's own normaliser buffers AFTER warm-start/
+    # resume (those overwrite feat_std with the checkpoint's), so the loss
+    # uses exactly the scale the model's input normalisation uses.
+    _inner = getattr(model, "_orig_mod", model)
+    if Config.NORMALIZE_FEATURES:
+        _fstd = _inner.feat_std.detach().float()
+    else:
+        _fstd = compute_feature_stats(train_ds.data, Config, frame_level)[1].to(device)
+        _fstd = torch.where(_fstd < 1e-6, torch.ones_like(_fstd), _fstd)
+    if frame_level:
+        latent_std = _fstd[:Config.NUM_X * Config.LATENT_DIM].reshape(
+            Config.NUM_X, Config.LATENT_DIM).clone()
+    else:
+        latent_std = _fstd[:Config.LATENT_DIM].clone()
+    latent_w = float(Config.LATENT_LOSS_WEIGHT)
+    log(f"  [latent-loss] weight={latent_w}  latent std range "
+        f"[{latent_std.min():.4g}, {latent_std.max():.4g}]"
+        + ("" if latent_w > 0 else "  (DISABLED -- centroid-only objective)"))
+
+    # Fixed, param-stratified rollout-eval rows (fix 3).
+    roll_idx, roll_labels = stratified_rollout_indices(
+        val_ds.data, Config, int(Config.VAL_ROLLOUT_SEQS))
+    _cnt = {}
+    for _l in roll_labels:
+        _cnt[_l] = _cnt.get(_l, 0) + 1
+    log(f"  [eval-set] {len(roll_labels)} rollout sequences, stratified by param: "
+        + "  ".join(f"{k}={v}" for k, v in _cnt.items())
+        + f"  (promotion metric: {Config.PROMOTE_METRIC})")
 
     # Impossible-to-miss banner: is this run continuing real progress, or
     # starting over? Deliberately louder than the CUDA/MPS regime banner
@@ -5616,6 +5932,28 @@ def train(args, log=print):
         log(f"  [ridge-distill] loaded {ridge_path} "
             f"(A: {tuple(ridge_A.shape)}) -- weight ramps 0 -> "
             f"{ridge_distill_w_target} over {ridge_distill_warm} steps")
+    # Ridge map for evaluate()'s like-for-like linear-ceiling column (fix 3):
+    # same rows, same frames as the model -- independent of whether this arm
+    # trains against it. None (column omitted) if no map has been fitted.
+    ridge_eval_A = (ridge_A if ridge_A is not None
+                    else _load_ridge_map_for_report(Config, device, log=log))
+
+    # Early-stop floor (fix 6): never stop before every warm-up ramp in
+    # effect has finished -- see Config.EARLY_STOP_MIN_STEPS.
+    if Config.EARLY_STOP_MIN_STEPS is None:
+        _ramps = [max(1, int(Config.MAX_STEPS * float(Config.WARMUP_FRAC)))]
+        if Config.AR_MODE != 'none' and float(Config.AR_LOSS_WEIGHT) > 0:
+            _ramps.append(ar_warm)
+            if getattr(Config, 'AR_FRAMES_START', None) is not None:
+                _ramps.append(max(1, int(Config.MAX_STEPS * float(Config.AR_FRAMES_WARMUP_FRAC))))
+        if ridge_distill_w_target > 0:
+            _ramps.append(ridge_distill_warm)
+        early_stop_min_steps = max(_ramps)
+    else:
+        early_stop_min_steps = int(Config.EARLY_STOP_MIN_STEPS)
+    if Config.EARLY_STOP_PATIENCE_STEPS is not None:
+        log(f"  [early-stop] patience={Config.EARLY_STOP_PATIENCE_STEPS} steps, "
+            f"not before step {early_stop_min_steps} (curricula/warm-ups done)")
 
     if getattr(Config, 'AR_FRAMES_START', None) is not None:
         _ar_frames_warm = max(1, int(Config.MAX_STEPS * float(Config.AR_FRAMES_WARMUP_FRAC)))
@@ -5685,6 +6023,17 @@ def train(args, log=print):
     _mark("starting null_baselines (incl. first decoder load)")
     nulls = null_baselines(val_ds.data, Config, frame_level=frame_level)
     _mark("null_baselines done")
+    # Reference for val_tf_latent_nmse: copy-previous-frame in the same
+    # standardised latent units (fix 1 health signal).
+    with torch.no_grad():
+        _nv = min(256, val_ds.data.shape[0])
+        _fr = val_ds.data[:_nv, :, :Config.LATENT_DIM].float().reshape(
+            _nv, Config.NUM_TIME, Config.NUM_X, Config.LATENT_DIM)
+        nulls_latent_nmse_prev = float(latent_consistency_loss(
+            _fr[:, :-1], _fr[:, 1:], latent_std.to(_fr.device)))
+        del _fr
+    log(f"  [floor] latent nMSE of copy-previous-frame: {nulls_latent_nmse_prev:.4g} "
+        f"(standardised units; compare against the per-step latent_nmse)")
     # Floor = the best CONSTANT predictor, not specifically zeros. Which of the
     # two is lower depends on how far the latents are offset from zero, and using
     # only "zeros" would hand an easy pass to any data with a mean offset.
@@ -5723,6 +6072,7 @@ def train(args, log=print):
         primary_acc = ar_acc = distill_acc = ridge_ar_distill_acc = aux_head_acc = 0.0
         smooth_acc = 0.0
         moe_aux_acc = 0.0
+        latent_acc = 0.0
         last_pred = last_tgt = None
         ar_w = ar_target_w * min(1.0, (step + 1) / ar_warm) if ar_mode != 'none' else 0.0
         run_ar = (ar_mode != 'none' and ar_w > 0
@@ -5769,6 +6119,12 @@ def train(args, log=print):
                 # regardless of TF_LOSS_WEIGHT.
                 primary_acc = primary_acc + tf_loss.detach()
                 last_pred, last_tgt = pred_lat.detach(), tgt_lat.detach()
+                # Latent-consistency term (fix 1): pins all 47 latent
+                # directions, not just the 3 the decoded centroid sees.
+                if latent_w > 0:
+                    lat_loss = latent_consistency_loss(pred_lat, tgt_lat, latent_std)
+                    latent_acc = latent_acc + lat_loss.detach()
+                    loss = loss + latent_w * lat_loss
                 # Ridge-distillation term: one matmul against a frozen buffer,
                 # no sequential loop -- cheap enough to run on EVERY
                 # micro-batch, unlike the AR aux loss below. Computed from the
@@ -5789,7 +6145,8 @@ def train(args, log=print):
                 if run_ar and micro == 0:
                     aux = (frame_ar_loss(model, batch, Config, generator=cpu_gen,
                                          n_frames_override=current_ar_frames,
-                                         ridge_A=ridge_A if distill_w > 0 else None)
+                                         ridge_A=ridge_A if distill_w > 0 else None,
+                                         latent_std=latent_std if latent_w > 0 else None)
                            if ar_mode == 'frame_ar'
                            else sched_sampling_loss(model, batch, Config,
                                                     Config.SCHED_SAMPLING_P,
@@ -5974,6 +6331,10 @@ def train(args, log=print):
             if Config.MOE_NUM_EXPERTS > 0:
                 payload["moe_aux_loss"] = (
                     moe_aux_acc.item() if torch.is_tensor(moe_aux_acc) else moe_aux_acc)
+            if latent_w > 0:
+                payload["train/latent_nmse"] = (
+                    (latent_acc / accum_steps).item()
+                    if torch.is_tensor(latent_acc) else latent_acc / accum_steps)
             if torch.cuda.is_available():
                 payload["vram_gb"] = torch.cuda.max_memory_allocated() / 1e9
             # `step=step` EXPLICITLY -- without it, wandb auto-increments its
@@ -6027,8 +6388,10 @@ def train(args, log=print):
             if step >= 3:
                 per_step = elapsed / max(1, step - start_step_for_rate)
                 eta = f"  eta~{per_step * (Config.MAX_STEPS - step) / 3600:.1f}h"
-            log(f"  step {step:>6}/{Config.MAX_STEPS}  train(centroid_l2)={train_loss:.6f}  "
-                f"lr={lr:.2e}  gnorm={float(grad_norm):.3f}  "
+            lat_str = (f"  latent_nmse={payload['train/latent_nmse']:.4g}"
+                       if "train/latent_nmse" in payload else "")
+            log(f"  step {step:>6}/{Config.MAX_STEPS}  train(centroid_l2)={train_loss:.6f}"
+                f"{lat_str}  lr={lr:.2e}  gnorm={float(grad_norm):.3f}  "
                 f"{elapsed / 60:.1f}m{eta}{flag}")
             if last_pred is not None:
                 log(f"    [centroid] mae_vx={dim_err['mae_vx']:.4g} "
@@ -6078,10 +6441,11 @@ def train(args, log=print):
             # exact wall-clock moment without waiting for the eval to finish.
             log(f"  [eval] step {step}: starting rollout eval "
                 f"({Config.VAL_ROLLOUT_SEQS} seqs, sequential decode)...")
-            m = evaluate(model, val_ds.data, Config, device,
-                         amp_dtype=amp_dtype,
-                         chunk=regime.eval_micro_batch,
-                         tf_batch_size=regime.eval_micro_batch)
+            _eval_kw = dict(amp_dtype=amp_dtype, chunk=regime.eval_micro_batch,
+                            tf_batch_size=regime.eval_micro_batch,
+                            roll_idx=roll_idx, roll_labels=roll_labels,
+                            ridge_A=ridge_eval_A, latent_std=latent_std)
+            m = evaluate(model, val_ds.data, Config, device, **_eval_kw)
             if ema_model is not None:
                 # q1_sophia_ema exists specifically to test whether EMA'd
                 # weights roll out better than the raw trajectory -- so the
@@ -6091,18 +6455,18 @@ def train(args, log=print):
                 # side-by-side comparison, not used for any decision.
                 log(f"  [eval] step {step}: starting EMA rollout eval "
                     f"({Config.VAL_ROLLOUT_SEQS} seqs, sequential decode)...")
-                m_ema = evaluate(ema_model, val_ds.data, Config, device,
-                                 amp_dtype=amp_dtype,
-                                 chunk=regime.eval_micro_batch,
-                                 tf_batch_size=regime.eval_micro_batch)
+                m_ema = evaluate(ema_model, val_ds.data, Config, device, **_eval_kw)
                 for k in ("rollout_mse", "improvement_pct", "val_tf_mse",
                          "val_tf_loss", "improvement_pct_frame1",
-                         "improvement_pct_frame_last"):
-                    m[f"raw_{k}"] = m[k]
+                         "improvement_pct_frame_last", "improvement_pct_param_mean",
+                         "val_tf_latent_nmse"):
+                    if k in m:
+                        m[f"raw_{k}"] = m[k]
                 m.update(m_ema)
                 log(f"  [eval] step {step}: raw IMPROVEMENT="
                     f"{m['raw_improvement_pct']:+.2f}%  EMA IMPROVEMENT="
-                    f"{m['improvement_pct']:+.2f}%")
+                    f"{m['improvement_pct']:+.2f}%  (the EMA weights are what "
+                    f"gets saved on promotion)")
             m["step"] = step
             m["train_loss"] = train_loss
             m["lr"] = scheduler.get_last_lr()[0]
@@ -6140,6 +6504,27 @@ def train(args, log=print):
                 f"(frame1 {m['improvement_pct_frame1']:+.2f}%, "
                 f"last {m['improvement_pct_frame_last']:+.2f}%)  "
                 f"[{m['rollout_sequences']} seqs, {m['rollout_seconds']:.1f}s]")
+            # Per-experiment breakdown + ridge on the same rows (fix 3).
+            _pp = [k.split("/", 1)[1] for k in m if k.startswith("improvement_pct/")]
+            if _pp:
+                parts = []
+                for lab in _pp:
+                    s = f"{lab} {m[f'improvement_pct/{lab}']:+.2f}%"
+                    if f"ridge_improvement_pct/{lab}" in m:
+                        s += f" (ridge {m[f'ridge_improvement_pct/{lab}']:+.2f}%)"
+                    parts.append(s)
+                tail = ""
+                if "ridge_improvement_pct_param_mean" in m:
+                    tail = (f"  | ridge mean {m['ridge_improvement_pct_param_mean']:+.2f}%"
+                            f"  ceiling captured {m['ceiling_captured_pct']:.1f}%")
+                log(f"  [eval] step {step}: per-param  " + "  ".join(parts)
+                    + f"  | MEAN {m.get('improvement_pct_param_mean', float('nan')):+.2f}%"
+                    + tail)
+            if "val_tf_latent_nmse" in m:
+                log(f"  [eval] step {step}: val latent nMSE={m['val_tf_latent_nmse']:.4g} "
+                    f"(standardised units; copy-previous-frame is ~"
+                    f"{nulls_latent_nmse_prev:.3g} -- far above that means the "
+                    f"predicted latents are off the data manifold)")
 
             if m["improvement_pct"] > best["improvement_pct"]:
                 best["improvement_pct"] = m["improvement_pct"]
@@ -6150,26 +6535,40 @@ def train(args, log=print):
             # otherwise a diverging rollout can keep re-earning "best" just
             # by being marginally less catastrophic than its own history,
             # which is exactly what happened before this gate existed.
-            found_new_low = m["rollout_mse"] < best["rollout_mse"]
-            if found_new_low:
+            # Promotion score (fix 3): per-experiment mean improvement by
+            # default, or the old pooled rollout_mse -- higher is better.
+            if (Config.PROMOTE_METRIC == 'improvement_param_mean'
+                    and "improvement_pct_param_mean" in m):
+                score = m["improvement_pct_param_mean"]
+                beats_persistence = score > 0
+                score_desc = f"param-mean {score:+.2f}%"
+            else:
+                score = -m["rollout_mse"]
+                beats_persistence = m["improvement_pct"] > 0
+                score_desc = f"rollout_mse {m['rollout_mse']:.6f}"
+            found_new_low = score > best["promoted_score"]   # "new best score"
+            if m["rollout_mse"] < best["rollout_mse"]:
                 best["rollout_mse"] = m["rollout_mse"]
             rollout_rmse = m["rollout_mse"] ** 0.5
-            beats_persistence = m["improvement_pct"] > 0
             is_sane = rollout_rmse < Config.MAX_SANE_ROLLOUT_RMSE_MPS
             promotable = beats_persistence and is_sane
-            promoted_this_eval = (found_new_low and promotable
-                                   and m["rollout_mse"] < best["promoted_rollout_mse"])
+            promoted_this_eval = found_new_low and promotable
             if promoted_this_eval:
+                best["promoted_score"] = score
                 best["promoted_rollout_mse"] = m["rollout_mse"]
+                best["promoted_step"] = step
                 save_checkpoint(
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_rollout_best.pt"),
                     model, optimizer, step,
                     {'rollout_mse': m['rollout_mse'], 'val_l2': m['val_tf_loss'],
-                     'improvement': m['improvement_pct'], 'train_l2': train_loss,
-                     'best': dict(best)},
-                    scheduler=scheduler, tel=tel, ema_model=ema_model)
-                log(f"  --> new best rollout ({m['rollout_mse']:.6f}, "
-                    f"{m['improvement_pct']:+.2f}% vs persistence)")
+                     'improvement': m['improvement_pct'],
+                     'improvement_param_mean': m.get('improvement_pct_param_mean'),
+                     'train_l2': train_loss, 'best': dict(best)},
+                    scheduler=scheduler, tel=tel, ema_model=ema_model,
+                    weights_from_ema=ema_model is not None)
+                log(f"  --> new best rollout ({score_desc}; pooled "
+                    f"{m['improvement_pct']:+.2f}% vs persistence)"
+                    + ("  [EMA weights saved]" if ema_model is not None else ""))
             elif found_new_low and not promotable:
                 # Found a new low relative to this run's own history, but it
                 # would NOT have been a legitimate promotion -- this is
@@ -6198,21 +6597,29 @@ def train(args, log=print):
                 }, log=log)
             tel.set_summary("rollout_beats_persistence", bool(beats_persistence))
             tel.set_summary("latest_improvement_pct", m["improvement_pct"])
-            if m["val_tf_mse"] < best["val_tf_mse"]:
-                best["val_tf_mse"] = m["val_tf_mse"]
+            # `_best.pt` (fix 4): selected on val_tf_loss -- the quantity the
+            # model is actually trained on -- not val_tf_mse (raw latent MSE),
+            # which under the old centroid-only objective was dominated by
+            # untrained, off-manifold latent directions. val_tf_mse is still
+            # tracked for reference.
+            best["val_tf_mse"] = min(best["val_tf_mse"], m["val_tf_mse"])
+            if m["val_tf_loss"] < best["val_tf_loss"]:
+                best["val_tf_loss"] = m["val_tf_loss"]
                 save_checkpoint(
                     os.path.join(Config.CHECKPOINT_DIR, f"{run_name}_best.pt"),
                     model, optimizer, step,
                     {'val_l2': m['val_tf_loss'], 'rollout_mse': m['rollout_mse'],
                      'improvement': m['improvement_pct'], 'train_l2': train_loss,
                      'best': dict(best)},
-                    scheduler=scheduler, tel=tel)
+                    scheduler=scheduler, tel=tel, ema_model=ema_model,
+                    weights_from_ema=ema_model is not None)
             tel.set_summary("best_rollout_mse", best["rollout_mse"])
             tel.set_summary("best_improvement_pct", best["improvement_pct"])
 
             if promoted_this_eval:
                 last_promotion_step = step
             if (Config.EARLY_STOP_PATIENCE_STEPS is not None
+                    and step >= early_stop_min_steps
                     and (step - last_promotion_step) >= Config.EARLY_STOP_PATIENCE_STEPS):
                 stalled_steps = step - last_promotion_step
                 stop_reason = (
@@ -6241,7 +6648,11 @@ def train(args, log=print):
                              'val_l2': best['val_tf_mse'],
                              'rollout_mse': best['rollout_mse'],
                              'improvement': best['improvement_pct']},
-                            scheduler=scheduler, tel=tel)
+                            scheduler=scheduler, tel=tel,
+                            # live weights stay in model_state_dict (resume);
+                            # EMA shadow rides along as ema_state_dict so a
+                            # resumed run's EMA continues instead of resetting.
+                            ema_model=ema_model)
             last_checkpoint_wall = time.time()
             archive_latest_checkpoint(Config, run_name, latest_path, step, log=log)
             write_status_json(Config, run_name, step, train_loss, best,
@@ -6555,15 +6966,16 @@ def build_parser():
     p.add_argument("--fresh", action="store_true", help="ignore any existing checkpoint")
     p.add_argument("--allow-leak", action="store_true",
                    help="do not abort when the causality probe fails")
-    p.add_argument("--warm-start", default=DEFAULT_WARM_START_CKPT,
-                   metavar="CKPT",
-                   help="v1.0 checkpoint to warm-start the 80-frame model from "
-                        "(default: r1_a3b_delta_ar_rollout_best.pt). Loaded with "
+    p.add_argument("--warm-start", default=None, metavar="CKPT",
+                   help="OPT-IN (2026-11-05): checkpoint to warm-start from. "
+                        "Default is a COLD start (random init) -- see "
+                        "docs/CHANGES_2026-11-05.md for why. Loaded with "
                         "strict=False after sanitising length-dependent tensors; "
                         "any missing/unexpected keys outside the allowlist are a "
                         "hard failure. Ignored when a resume checkpoint exists.")
     p.add_argument("--no-warm-start", action="store_true",
-                   help="do NOT warm-start from any v1.0 checkpoint (cold start)")
+                   help="cold start (now the default; kept so old command lines "
+                        "still parse). Overrides --warm-start if both are given.")
     p.add_argument("--smoke-test", action="store_true",
                    help="v2.0 pinning smoke path: build the 80-frame model, prove "
                         "probe_causality(...)['causal'] is True, then run a handful of "

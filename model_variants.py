@@ -492,6 +492,20 @@ class BaseTransformer(nn.Module):
 
         self.ln_f = nn.LayerNorm(config.EMBED_SIZE)
         self.output_head = nn.Linear(config.EMBED_SIZE, config.LATENT_DIM, bias=bias)
+        # REVIEW_2026-11-05 #8: run the output projection in fp32 even under
+        # CUDA bf16 autocast. bf16 has ~3 significant digits; the predicted
+        # latent is fed straight back in as the next rollout input, so its
+        # rounding error compounds over 680 sequential tokens. No parameters
+        # change, so every checkpoint still loads. FP32_OUTPUT_HEAD=False
+        # restores the old (bf16-output) behaviour.
+        self.fp32_head = bool(getattr(config, 'FP32_OUTPUT_HEAD', True))
+        # Standardised-output head (docs/CHANGES_2026-11-05.md, fix 7): the
+        # head predicts (latent - feat_mean) / feat_std (or delta / feat_std
+        # under PREDICT_DELTA) and forward() de-normalises with the model's own
+        # buffers, so the head works at unit scale like every other layer.
+        # getattr default False keeps configs that predate the flag (e.g. a
+        # checkpoint's saved config) on the old raw-output behaviour.
+        self.output_normalized = bool(getattr(config, 'OUTPUT_NORMALIZED', False))
 
         if self.predict_delta:
             # Start the network exactly AT persistence rather than at random:
@@ -639,6 +653,16 @@ class BaseTransformer(nn.Module):
         out[:, start:end, :] = pred[:, :end - start, :]
         return out
 
+    def _head(self, h):
+        """Output projection; fp32 under autocast when `fp32_head` (eager /
+        torch.compile only -- TorchScript exports, which never run under
+        autocast, take the plain path)."""
+        if not torch.jit.is_scripting():
+            if self.fp32_head and torch.is_autocast_enabled(h.device.type):
+                with torch.autocast(device_type=h.device.type, enabled=False):
+                    return self.output_head(h.float())
+        return self.output_head(h)
+
     def forward(self, x, force_persistence_anchor: bool = False):
         """`force_persistence_anchor`, when True, uses `_delta_anchor()`
         (plain persistence) for THIS call regardless of
@@ -670,7 +694,13 @@ class BaseTransformer(nn.Module):
         for blk in self.blocks:
             h = blk(h)
 
-        out = self.output_head(self.ln_f(h))
+        out = self._head(self.ln_f(h))
+        if self.output_normalized:
+            ld = self.latent_dim
+            if self.predict_delta:
+                out = out * self.feat_std[:ld]
+            else:
+                out = out * self.feat_std[:ld] + self.feat_mean[:ld]
 
         if self.predict_delta:
             if self.delta_anchor_kind == 'ridge' and not force_persistence_anchor:
@@ -776,6 +806,8 @@ class FrameTransformer(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(config.EMBED_SIZE)
         self.output_head = nn.Linear(config.EMBED_SIZE, self.frame_dim, bias=bias)
+        self.fp32_head = bool(getattr(config, 'FP32_OUTPUT_HEAD', True))   # see BaseTransformer
+        self.output_normalized = bool(getattr(config, 'OUTPUT_NORMALIZED', False))  # ditto
 
         if self.predict_delta:
             nn.init.zeros_(self.output_head.weight)
@@ -832,9 +864,28 @@ class FrameTransformer(nn.Module):
         """
         anchor = frames[..., :self.frame_dim]
         h = self._encode(frames)
-        out = self.output_head(self.ln_f(h))
+        out = self._head(self.ln_f(h))
         if self.predict_delta:
             out = out + anchor
+        return out
+
+    def _proj(self, h):
+        if not torch.jit.is_scripting():
+            if self.fp32_head and torch.is_autocast_enabled(h.device.type):
+                with torch.autocast(device_type=h.device.type, enabled=False):
+                    return self.output_head(h.float())
+        return self.output_head(h)
+
+    def _head(self, h):
+        """fp32 output projection under autocast -- see BaseTransformer._head
+        -- followed by the standardised-output de-normalisation (fix 7)."""
+        out = self._proj(h)
+        if self.output_normalized:
+            fd = self.frame_dim
+            if self.predict_delta:
+                out = out * self.feat_std[:fd]
+            else:
+                out = out * self.feat_std[:fd] + self.feat_mean[:fd]
         return out
 
     def forward_aux(self, frames):
@@ -854,7 +905,7 @@ class FrameTransformer(nn.Module):
                 "Config.AUX_HEAD_FRAMES>0.")
         anchor = frames[..., :self.frame_dim]
         h = self._encode(frames)
-        out = self.output_head(self.ln_f(h))
+        out = self._head(self.ln_f(h))
         if self.predict_delta:
             out = out + anchor
         B = frames.shape[0]

@@ -43,7 +43,7 @@ Don't copy your Mac's `.venv/` to the server. It's git-ignored, so `git pull` wo
 
 1. **Data**: `train_80.h5` and `val_80.h5` in `/data/ptv-092026` (the launcher's default `--data-dir`).
 2. **Decoder** (always required): `assets/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt`.
-3. **Warm-start checkpoint** (needed by the default recipe): `assets/r2_h11_ridge_distill_rollout_best.pt`.
+3. **Warm-start checkpoint** (optional, only for `--warm-start`): `assets/r2_h11_ridge_distill_rollout_best.pt`.
 
 You can extract both asset files from the `LFM` git branch. [`assets/README.md`](assets/README.md) has the exact commands.
 
@@ -59,7 +59,9 @@ wandb is on by default: run `uv run wandb login` once, or set `WANDB_API_KEY`, o
 ./run_train.sh --gpu 1 --detach   # background (survives logout); prints the log path + stop command
 ```
 
-By default, `./run_train.sh` runs the current reference recipe from `docs/OVERVIEW.md` §81.6: arm `h11_ridge_distill`, preset `trial112` (`WEIGHT_DECAY=0.0966…`, `DROPOUT=0.0735…`, `EMA_DECAY=0.98`, `AR_LOSS_WEIGHT=0.683…`), warm-started from `r2_h11_ridge_distill_rollout_best.pt`. The budget is 6000 steps, with an eval every 250 steps on 16 rollout sequences and early stopping after 1500 steps without a new promoted checkpoint. That matches runs r330/r331, except the wall-clock safety net here is 3 h instead of 1 h.
+By default, `./run_train.sh` runs arm `h11_ridge_distill` with preset `trial112` (`WEIGHT_DECAY=0.0966…`, `DROPOUT=0.0735…`, `EMA_DECAY=0.98`, `AR_LOSS_WEIGHT=0.683…`) from a **cold start** (random init), with the 2026-11-05 fixes on: the latent-consistency loss, the standardised fp32 output head, and EMA-correct checkpoints. The budget is 20000 steps, with an eval every 500 steps on 256 param-stratified rollout sequences. Promotion uses the per-experiment mean improvement, and early stopping fires after 5000 steps without a new promoted checkpoint, but never before the curricula finish. See [`docs/CHANGES_2026-11-05.md`](docs/CHANGES_2026-11-05.md) for what changed and why, and for the `--set` line that reproduces the old recipe.
+
+Warm starting is opt-in. `--warm-start` uses `assets/r2_h11_ridge_distill_rollout_best.pt`, and `--warm-start PATH` uses any checkpoint. When warm starting, the launcher also applies a fine-tune schedule so the curricula don't restart (`AR_FRAMES_START=None AR_WEIGHT_WARMUP_FRAC=0 RIDGE_DISTILL_WARMUP_FRAC=0 LEARNING_RATE=3e-4 WARMUP_FRAC=0.01`). Your own `--set` values override it, and `--warm-start-keep-schedule` turns it off.
 
 If `saved_models/ridge_frame_map.pt` doesn't exist yet, the launcher first runs the trainer's `--diagnostics-only` pass on the same GPU to fit it. The `h11_ridge_distill` distillation loss needs that map.
 
@@ -67,11 +69,14 @@ More examples:
 
 ```bash
 # The #1 open research question (OVERVIEW.md §83): drop the (x,y,z,t,param) input columns.
-./run_train.sh --gpu 0 --round 330 --wandb-group metaAB --set USE_META_COLS=True
-./run_train.sh --gpu 1 --round 331 --wandb-group metaAB --set USE_META_COLS=False
+./run_train.sh --gpu 0 --round 500 --wandb-group metaAB --set USE_META_COLS=True
+./run_train.sh --gpu 1 --round 501 --wandb-group metaAB --set USE_META_COLS=False
 
-# Any other arm, without the trial-112 preset, cold start
-./run_train.sh --arm s7_h9_scaled --preset none --no-warm-start --round 5
+# Continue training from a checkpoint (opt-in warm start)
+./run_train.sh --gpu 0 --round 502 --warm-start saved_models/r500_h11_ridge_distill_rollout_best.pt
+
+# Any other arm, without the trial-112 preset
+./run_train.sh --arm s7_h9_scaled --preset none --round 5
 ./run_train.sh --list-arms
 
 # Extra trainer flags go after --
@@ -91,12 +96,14 @@ You can run two launches at the same time on different GPUs, as in the A/B examp
 | `--fresh` | off | Ignore an existing `_latest.pt` and start over. |
 | `--data-dir DIR` | `/data/ptv-092026` | Folder containing `train_80.h5` / `val_80.h5`. |
 | `--decoder PATH` | `assets/Model_GEN3_05_…_scripted.pt` | Frozen decoder. |
-| `--warm-start PATH` / `--no-warm-start` | `assets/r2_h11_ridge_distill_rollout_best.pt` | Initial weights. |
-| `--max-steps N` | `6000` | Optimizer steps. This also sizes the LR warmup/cosine schedule. |
-| `--max-hours H` | `3.0` | Wall-clock kill switch only. |
-| `--val-every N` | `250` | Eval cadence (steps). |
-| `--rollout-seqs N` | `16` | Validation rollout sequences per eval. |
-| `--patience N` | `1500` | Early-stop patience in steps. `0` disables it. |
+| `--warm-start [PATH]` | off (cold start) | Opt-in initial weights. With no PATH, uses `assets/r2_h11_ridge_distill_rollout_best.pt`. Also applies the warm-start fine-tune schedule. |
+| `--warm-start-keep-schedule` | off | Warm start without the fine-tune schedule. |
+| `--no-warm-start` | (default) | Cold start. Kept so old command lines still parse. |
+| `--max-steps N` | `20000` | Optimizer steps. This also sizes the LR warmup/cosine schedule and the curricula. |
+| `--max-hours H` | `6.0` | Wall-clock kill switch only. |
+| `--val-every N` | `500` | Eval cadence (steps). |
+| `--rollout-seqs N` | `256` | Validation rollout sequences per eval, stratified evenly across the val experiments. |
+| `--patience N` | `5000` | Early-stop patience in steps, never applied before the curricula finish (`EARLY_STOP_MIN_STEPS`). `0` disables it. |
 | `--set KEY=VALUE` | none | Any `Config` field (repeatable). |
 | `--wandb-group NAME` / `--no-wandb` | none | wandb grouping / disable wandb. |
 | `--smoke`, `--diagnostics`, `--list-arms` | none | Alternative modes. |
@@ -106,7 +113,9 @@ These environment variables pass straight through to the trainer: `PFD_DATA_LOAD
 
 ### Outputs
 
-The best checkpoint is `saved_models/r<round>_<arm>_rollout_best.pt`. It's promoted only when it beats persistence and its rollout RMS passes a sanity check. The trainer also writes `_best.pt` (best teacher-forced val), `_train_best.pt`, and `_latest.pt` (about every 10 minutes, with up to 5 archived copies). Each kind also gets a TorchScript `_scripted.pt` twin. Live status is in `saved_models/r<round>_<arm>_status.json`, and the console log is in `runs/<run_id>/train.log`.
+The best checkpoint is `saved_models/r<round>_<arm>_rollout_best.pt`. It's promoted when the per-experiment mean improvement over persistence (`PROMOTE_METRIC`) beats the previous best and is above 0. When EMA is on, its `model_state_dict` and scripted twin are the **EMA weights** that earned the score; the live weights are in `raw_model_state_dict`, and `weights_source` says which. The trainer also writes `_best.pt` (best teacher-forced `val_tf_loss`), `_train_best.pt`, and `_latest.pt` (live weights plus `ema_state_dict`, about every 10 minutes, with up to 5 archived copies).
+
+Each eval prints the pooled improvement, a per-experiment line with the ridge map's score on the same sequences and the "ceiling captured", and `val latent nMSE` (it should approach the copy-previous-frame reference printed at start-up). Each kind also gets a TorchScript `_scripted.pt` twin. Live status is in `saved_models/r<round>_<arm>_status.json`, and the console log is in `runs/<run_id>/train.log`.
 
 ### Optional: faster startup
 
@@ -133,6 +142,24 @@ PFD_DATA_DIR=/data/ptv-092026 uv run pytest -q
 | `saved_models/old/r1_a3b_delta_ar_rollout_best.pt` (v1.0 winner) | Only the trainer's built-in default `--warm-start` when it's run directly without the launcher. The launcher always passes an explicit path or `--no-warm-start`. |
 
 ## Changelog
+
+### 2026-11-05: review fixes, cold start by default
+
+Details and rationale are in [`docs/CHANGES_2026-11-05.md`](docs/CHANGES_2026-11-05.md).
+
+- Trainer and model:
+  - added a latent-consistency loss (`LATENT_LOSS_WEIGHT=1.0`);
+  - the output head is now standardised (`OUTPUT_NORMALIZED`, with exact conversion of old checkpoints) and runs in fp32 under autocast (`FP32_OUTPUT_HEAD`);
+  - EMA-promoted checkpoints now store the EMA weights, and the EMA is restored on resume;
+  - evals use 256 param-stratified sequences, report per-experiment and ridge scores, and promote on the per-experiment mean (`PROMOTE_METRIC`);
+  - `_best.pt` is selected on `val_tf_loss`;
+  - early stopping waits for the curricula to finish (`EARLY_STOP_MIN_STEPS`).
+- Warm start is opt-in in both the trainer and the launcher. The launcher applies a fine-tune schedule when warm starting, and its defaults are now 20000 steps / 6 h / eval every 500 / 256 sequences / patience 5000.
+- New `tests/test_review_fixes.py`.
+
+### 2026-11-05: code & research review
+
+- Added [`docs/REVIEW_2026-11-05.md`](docs/REVIEW_2026-11-05.md): findings on the code and recipe (off-manifold latent predictions, EMA checkpoint bug, val-param extrapolation, 16-sequence eval, warm-start curriculum reset) and a warm-start vs. cold-start recommendation. No code changed.
 
 ### 2026-11-05: server cleanup (branch `LFM-updated`)
 

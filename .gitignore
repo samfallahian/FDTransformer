@@ -138,7 +138,7 @@ saved_models/
 sweep_logs/
 runs/
 wandb/
-assets/*.pt
+#assets/*.pt
 *.h5
 *.raw
 *.raw.json

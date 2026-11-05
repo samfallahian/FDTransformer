@@ -6,17 +6,20 @@
 # change any training logic: it only picks the GPU, points the trainer at the
 # data/decoder/warm-start files, runs pre-flight checks, and logs to runs/.
 #
-# Default = the current reference recipe (docs/OVERVIEW.md §81.6 / §82-83):
-#   arm h11_ridge_distill + "trial112" hyper-parameters, warm-started from
-#   r2_h11_ridge_distill_rollout_best.pt, 6000 steps, eval every 250 steps on
-#   16 rollout sequences, early stop after 1500 steps without a new promoted
-#   rollout checkpoint.
+# Default (2026-11-05, see docs/CHANGES_2026-11-05.md):
+#   arm h11_ridge_distill + "trial112" hyper-parameters, COLD start (random
+#   init), latent-consistency loss on, 20000 steps, eval every 500 steps on
+#   256 param-stratified rollout sequences, early stop after 5000 steps
+#   without a new promoted checkpoint (never before the curricula finish).
+#   Warm starting is opt-in: --warm-start [PATH].
 #
 # Examples
-#   ./run_train.sh                                  # reference recipe on GPU 0
+#   ./run_train.sh                                  # default recipe on GPU 0
 #   ./run_train.sh --gpu 1                          # same, on GPU 1
 #   ./run_train.sh --gpu 1 --round 2 --set USE_META_COLS=False   # meta-cols ablation
-#   ./run_train.sh --arm s7_h9_scaled --preset none --no-warm-start --round 3
+#   ./run_train.sh --warm-start                     # opt-in warm start (assets/ ckpt)
+#   ./run_train.sh --warm-start saved_models/r400_h11_ridge_distill_rollout_best.pt
+#   ./run_train.sh --arm s7_h9_scaled --preset none --round 3
 #   ./run_train.sh --detach --wandb-group myexp     # background, survives logout
 #   ./run_train.sh --smoke                          # 1-min synthetic check, no data
 #   ./run_train.sh --dry-run                        # print checks + command only
@@ -34,13 +37,14 @@ PRESET="auto"                      # auto -> trial112 for h11_ridge_distill, els
 ROUND="1"
 DATA_DIR="${PFD_DATA_DIR:-/data/ptv-092026}"
 DECODER="${PFD_DECODER_PATH:-$HERE/assets/Model_GEN3_05_AttentionSE_absolute_best_scripted.pt}"
-WARM_START="$HERE/assets/r2_h11_ridge_distill_rollout_best.pt"
-NO_WARM_START=0
-MAX_STEPS=6000
-MAX_HOURS=3.0                      # wall-clock kill switch only; LR schedule uses MAX_STEPS
-VAL_EVERY=250
-ROLLOUT_SEQS=16
-PATIENCE=1500                      # 0 = no early stopping
+DEFAULT_WARM_START="$HERE/assets/r2_h11_ridge_distill_rollout_best.pt"
+WARM_START=""                      # empty = cold start (the default since 2026-11-05)
+KEEP_SCHEDULE=0                    # 1 = do not apply the warm-start fine-tune schedule
+MAX_STEPS=20000
+MAX_HOURS=6.0                      # wall-clock kill switch only; LR schedule uses MAX_STEPS
+VAL_EVERY=500
+ROLLOUT_SEQS=256
+PATIENCE=5000                      # 0 = no early stopping
 WANDB_GROUP=""
 NO_WANDB=0
 FRESH=0
@@ -58,8 +62,22 @@ TRIAL112=(
   "AR_LOSS_WEIGHT=0.6828481795652924"
 )
 
+# Applied (before any --set) only when warm starting, unless
+# --warm-start-keep-schedule. A warm start restarts the step counter at 0, so
+# without this every curriculum restarts too: LR re-warms to its 1e-3 peak,
+# the AR-loss weight drops to 0 and the AR horizon to 2 frames -- i.e. the
+# already-trained model is fine-tuned mostly teacher-forced at peak LR, which
+# is what produced the "peak at step 250, then decline" in the 2026-11-05 run.
+WARMSTART_SETS=(
+  "AR_FRAMES_START=None"
+  "AR_WEIGHT_WARMUP_FRAC=0.0"
+  "RIDGE_DISTILL_WARMUP_FRAC=0.0"
+  "LEARNING_RATE=3e-4"
+  "WARMUP_FRAC=0.01"
+)
+
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
   cat <<EOF
 
 Options
@@ -70,8 +88,11 @@ Options
                        Re-using a round RESUMES from r<N>_<arm>_latest.pt unless --fresh.
   --data-dir DIR       folder holding train_80.h5 / val_80.h5 (default: $DATA_DIR)
   --decoder PATH       frozen GEN3 scripted decoder (default: assets/Model_GEN3_05_..._scripted.pt)
-  --warm-start PATH    checkpoint to warm-start from (default: assets/r2_h11_ridge_distill_rollout_best.pt)
-  --no-warm-start      cold start (random init)
+  --warm-start [PATH]  OPT-IN warm start. Without PATH: assets/r2_h11_ridge_distill_rollout_best.pt.
+                       Also applies a fine-tune schedule (no curriculum restart, LR 3e-4,
+                       1% warmup) before your --set values; see WARMSTART_SETS.
+  --warm-start-keep-schedule   warm start WITHOUT that fine-tune schedule
+  --no-warm-start      cold start (the default; accepted for old command lines)
   --max-steps N        optimizer steps; also sizes the LR schedule (default: $MAX_STEPS)
   --max-hours H        wall-clock safety net (default: $MAX_HOURS)
   --val-every N        eval cadence in steps (default: $VAL_EVERY)
@@ -107,8 +128,11 @@ while [[ $# -gt 0 ]]; do
     --round)         ROUND="$2"; shift 2 ;;
     --data-dir)      DATA_DIR="$2"; shift 2 ;;
     --decoder)       DECODER="$2"; shift 2 ;;
-    --warm-start)    WARM_START="$2"; shift 2 ;;
-    --no-warm-start) NO_WARM_START=1; shift ;;
+    --warm-start)
+      if [[ $# -ge 2 && "$2" != -* ]]; then WARM_START="$2"; shift 2
+      else WARM_START="$DEFAULT_WARM_START"; shift; fi ;;
+    --warm-start-keep-schedule) KEEP_SCHEDULE=1; shift ;;
+    --no-warm-start) WARM_START=""; shift ;;
     --max-steps)     MAX_STEPS="$2"; shift 2 ;;
     --max-hours)     MAX_HOURS="$2"; shift 2 ;;
     --val-every)     VAL_EVERY="$2"; shift 2 ;;
@@ -163,7 +187,12 @@ case "$PRESET" in
   *)        die "unknown --preset '$PRESET' (trial112 | none)" ;;
 esac
 [[ -n "$WANDB_GROUP" ]] && SETS+=("WANDB_GROUP=$WANDB_GROUP")
-ALL_SETS=("${PRESET_SETS[@]+"${PRESET_SETS[@]}"}" "${SETS[@]+"${SETS[@]}"}")
+WS_SETS=()
+if [[ "$MODE" == "train" && -n "$WARM_START" && $KEEP_SCHEDULE -eq 0 ]]; then
+  WS_SETS=("${WARMSTART_SETS[@]}")
+fi
+# order matters: preset, then warm-start schedule, then the user's --set (last wins)
+ALL_SETS=("${PRESET_SETS[@]+"${PRESET_SETS[@]}"}" "${WS_SETS[@]+"${WS_SETS[@]}"}" "${SETS[@]+"${SETS[@]}"}")
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 case "$MODE" in
@@ -185,7 +214,7 @@ case "$MODE" in
           --max-steps "$MAX_STEPS" --max-hours "$MAX_HOURS"
           --val-every "$VAL_EVERY" --rollout-seqs "$ROLLOUT_SEQS")
     [[ "$PATIENCE" != "0" ]] && CMD+=(--early-stop-patience-steps "$PATIENCE")
-    if [[ $NO_WARM_START -eq 1 ]]; then CMD+=(--no-warm-start); else CMD+=(--warm-start "$WARM_START"); fi
+    if [[ -n "$WARM_START" ]]; then CMD+=(--warm-start "$WARM_START"); else CMD+=(--no-warm-start); fi
     [[ $NO_WANDB -eq 1 ]] && CMD+=(--no-wandb)
     [[ $FRESH -eq 1 ]] && CMD+=(--fresh)
     ;;
@@ -225,9 +254,12 @@ if [[ "$MODE" == "train" ]]; then
   LATEST="$HERE/saved_models/r${ROUND}_${ARM}_latest.pt"
   if [[ -f "$LATEST" && $FRESH -eq 0 ]]; then
     warn "RESUMING from $LATEST (pass --fresh or a new --round to start over)"
-  elif [[ $NO_WARM_START -eq 0 ]]; then
+  elif [[ -n "$WARM_START" ]]; then
     [[ -f "$WARM_START" ]] && ok "warm-start $WARM_START" \
-      || bad "warm-start $WARM_START  (see assets/README.md, or pass --no-warm-start)"
+      || bad "warm-start $WARM_START  (see assets/README.md, or drop --warm-start)"
+    [[ $KEEP_SCHEDULE -eq 0 ]] && warn "warm start: fine-tune schedule applied (${WARMSTART_SETS[*]})"
+  else
+    ok "cold start (random init) -- pass --warm-start [PATH] to opt in"
   fi
   LOCK="$HERE/saved_models/r${ROUND}_${ARM}.lock"
   [[ -f "$LOCK" ]] && warn "lock file $LOCK exists -- another run of r${ROUND}_${ARM} may be live (stale locks >300s are reclaimed)"

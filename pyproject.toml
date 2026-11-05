@@ -1,0 +1,51 @@
+[project]
+name = "fdtransformer"
+version = "0.1.0"
+description = "Latent-space transformer for turbulent-wake forecasting (beats-persistence rollout), trained on train_80.h5 / val_80.h5."
+readme = "README.md"
+# numpy 2.4 needs >=3.11; torch CUDA-13 wheels exist for 3.11-3.13.
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # On Linux this resolves from the PyTorch CUDA 13.0 wheel index (see
+    # [tool.uv.sources] below) -- works with the server's CUDA 13.1 driver.
+    # On macOS it falls back to the regular PyPI build (MPS/CPU).
+    "torch>=2.11.0",
+    "numpy==2.4.2",
+    "h5py==3.15.1",
+    "wandb>=0.29.0",
+    # Only imported when an arm sets OPTIMIZER='lion' / 'sophia'
+    # (the default recipe uses AdamW), kept here so every arm runs.
+    "lion-pytorch",
+    "sophia-opt",
+]
+
+[project.optional-dependencies]
+# Only needed to REBUILD the datasets (data_prep/). Not needed for training.
+data-prep = [
+    "pandas",
+    "pyarrow",
+    "tqdm",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+# This repo is a set of scripts, not an installable package.
+package = false
+default-groups = ["dev"]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

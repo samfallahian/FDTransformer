@@ -53,15 +53,17 @@ import pandas as pd
 # --------------------------------------------------------------------------
 SCHEMA_VER = 1
 
-DEFAULT_SOURCE_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data"
-DEFAULT_SHARDS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "wake_atlas_shards")
-DEFAULT_OUTPUT_CSV = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "wake_atlas.csv.gz")
-DEFAULT_SHA256 = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "wake_atlas.sha256")
-DEFAULT_MANIFEST = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "data", "wake_atlas.manifest.json")
+# Raw (no-latent) simulation tree lives OUTSIDE this repo -- override with
+# PFD_RAW_SOURCE_ROOT or --source-root. Atlas outputs go to the data dir
+# (PFD_DATA_DIR, default <repo>/data), where prepare_data.py looks for them.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DATA_DIR = os.environ.get("PFD_DATA_DIR") or os.path.join(_REPO_ROOT, "data")
+DEFAULT_SOURCE_ROOT = os.environ.get(
+    "PFD_RAW_SOURCE_ROOT", "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data")
+DEFAULT_SHARDS_DIR = os.path.join(_DATA_DIR, "wake_atlas_shards")
+DEFAULT_OUTPUT_CSV = os.path.join(_DATA_DIR, "wake_atlas.csv.gz")
+DEFAULT_SHA256 = os.path.join(_DATA_DIR, "wake_atlas.sha256")
+DEFAULT_MANIFEST = os.path.join(_DATA_DIR, "wake_atlas.manifest.json")
 
 ALL_PARAMS = ["3p6", "4p4", "4p6", "5p2", "6p4", "6p6",
               "7p2", "7p8", "8p4", "10p4", "11p4"]

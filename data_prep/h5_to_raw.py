@@ -19,18 +19,22 @@ Verified byte-for-byte against the source .h5 (streamed, batch_rows at a
 time, memory stays bounded) before the .raw file is left in place -- same
 convention as decompress_h5.py.
 
-Usage:
-    python h5_to_raw.py                      # converts val_80.h5, train_80.h5
-    python h5_to_raw.py train_80.h5          # just one
+The .raw/.raw.json files are written NEXT TO the .h5 files, so the data
+directory must be writable (~14 GB extra for train+val).
+
+Usage (from the repo root):
+    PFD_DATA_DIR=/data/ptv-092026 python data_prep/h5_to_raw.py              # val_80.h5 + train_80.h5
+    PFD_DATA_DIR=/data/ptv-092026 python data_prep/h5_to_raw.py train_80.h5  # just one
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 
 from train_production_transformer_deep_dive import convert_h5_to_raw  # noqa: E402
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = os.environ.get("PFD_DATA_DIR") or os.path.join(_REPO_ROOT, "data")
 
 
 if __name__ == "__main__":

@@ -14,9 +14,15 @@ from collections import Counter
 from typing import Dict, List, Tuple
 
 # Paths
-PROJECT_ROOT = "/Users/kkreth/PycharmProjects/cgan"
-SOURCE_ROOT = "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent"
-OUTPUT_DIR = os.path.join(PROJECT_ROOT, "transformer_neurIPS/data")
+# SOURCE_ROOT is the raw pickled per-frame dataframe tree (with latents) that
+# lives OUTSIDE this repo -- override with PFD_SOURCE_ROOT. OUTPUT_DIR is where
+# train_80.h5 / val_80.h5 / wake_atlas.csv.gz are read/written -- override with
+# PFD_DATA_DIR (defaults to <repo>/data, the trainer's default too).
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SOURCE_ROOT = os.environ.get(
+    "PFD_SOURCE_ROOT",
+    "/Users/kkreth/PycharmProjects/data/Final_Cubed_OG_Data_wLatent")
+OUTPUT_DIR = os.environ.get("PFD_DATA_DIR") or os.path.join(REPO_ROOT, "data")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configuration

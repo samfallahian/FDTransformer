@@ -24,7 +24,7 @@ if _MOD_DIR not in sys.path:
 
 import train_production_transformer_deep_dive as T  # noqa: E402
 
-OVERVIEW_PATH = os.path.join(_MOD_DIR, "OVERVIEW.md")
+OVERVIEW_PATH = os.path.join(_MOD_DIR, "docs", "OVERVIEW.md")
 
 # Matches headings like "## 20. v4.0 -- Mac shallow-sweep ..." -- the
 # section number is deliberately NOT captured; only the version matters.

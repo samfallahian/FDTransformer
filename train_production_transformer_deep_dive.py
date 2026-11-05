@@ -760,9 +760,15 @@ class Config:
     """
 
     # -- data ---------------------------------------------------------------
-    # v2.0 pinning: hard-coded 80-frame files. See top-of-file docstring.
-    TRAIN_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/train_80.h5")
-    VAL_H5 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/val_80.h5")
+    # v2.0 pinning: hard-coded 80-frame FILE NAMES. See top-of-file docstring.
+    # The DIRECTORY they live in can be pointed elsewhere with the env var
+    # PFD_DATA_DIR (e.g. PFD_DATA_DIR=/data/ptv-092026, set by run_train.sh);
+    # unset keeps the original `<this folder>/data/` location. The file names
+    # stay pinned and TRAIN_H5/VAL_H5 remain non-overridable via --set.
+    _DATA_DIR = os.environ.get("PFD_DATA_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "data")
+    TRAIN_H5 = os.path.join(_DATA_DIR, "train_80.h5")
+    VAL_H5 = os.path.join(_DATA_DIR, "val_80.h5")
     CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_models")
 
     LATENT_DIM = 47      # latent features per (t, x) location
@@ -1064,9 +1070,11 @@ class Config:
     # 47-dim latent output to a 375-dim reconstruction, of which the central
     # triplet (vx_62, vy_62, vz_62) is the training target. The env var
     # PFD_DECODER_PATH overrides this at load time (mirrors PFD_NO_COLOR).
+    # Default lives INSIDE this repo under assets/ (it used to point one level
+    # ABOVE the repo, at ../encoder/autoencoderGEN3/saved_models_production/).
     DECODER_SCRIPTED_PATH = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "encoder/autoencoderGEN3/saved_models_production",
+        os.path.dirname(os.path.abspath(__file__)),
+        "assets",
         "Model_GEN3_05_AttentionSE_absolute_best_scripted.pt")
     CENTROID_WEIGHTS = (1.0, 1.0, 1.0)   # (w_vx, w_vy, w_vz); future emphasis knob
     CENTROID_LOSS = 'l2'                  # 'l2' = mean of vector-L2-norms;

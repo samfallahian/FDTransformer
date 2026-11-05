@@ -124,13 +124,14 @@ V_LABELS = ("vx", "vy", "vz")
 # ``--decoder`` or the ``PFD_DECODER_PATH`` env var (matches the PFD_*
 # convention already in the trainer).
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_REPO_ROOT = os.path.dirname(_THIS_DIR)
+_REPO_ROOT = os.path.dirname(_THIS_DIR)          # this script lives in data_prep/
 DEFAULT_DECODER_PATH = os.path.join(
-    _REPO_ROOT, "encoder", "autoencoderGEN3", "saved_models_production",
+    _REPO_ROOT, "assets",
     "Model_GEN3_05_AttentionSE_absolute_best_scripted.pt",
 )
-DEFAULT_TRAIN_H5 = os.path.join(_THIS_DIR, "data", "train_80.h5")
-DEFAULT_VAL_H5 = os.path.join(_THIS_DIR, "data", "val_80.h5")
+_DATA_DIR = os.environ.get("PFD_DATA_DIR") or os.path.join(_REPO_ROOT, "data")
+DEFAULT_TRAIN_H5 = os.path.join(_DATA_DIR, "train_80.h5")
+DEFAULT_VAL_H5 = os.path.join(_DATA_DIR, "val_80.h5")
 
 
 # --------------------------------------------------------------------------- #

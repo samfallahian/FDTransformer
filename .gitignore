@@ -132,3 +132,15 @@ dmypy.json
 .DS_Store
 
 .DS_Store/
+# --- FDTransformer runtime outputs / large local files -----------------------
+data/
+saved_models/
+sweep_logs/
+runs/
+wandb/
+assets/*.pt
+*.h5
+*.raw
+*.raw.json
+# uv
+.venv/
